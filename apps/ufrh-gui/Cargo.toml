@@ -16,6 +16,7 @@ ufrh-store.workspace = true
 ufrh-tools.workspace = true
 ufrh-types.workspace = true
 anyhow.workspace = true
+serde_json.workspace = true
 # Clipboard images on X11; same crate and features egui-winit already uses (no new code).
 arboard = { version = "3.7", default-features = false, features = ["image-data"] }
 async-trait.workspace = true

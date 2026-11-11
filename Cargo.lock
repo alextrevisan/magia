@@ -3656,6 +3656,7 @@ dependencies = [
  "fastframe-graphics",
  "fastframe-notifications",
  "fastframe-text",
+ "serde_json",
  "tokio",
  "tokio-util",
  "ufrh-core",

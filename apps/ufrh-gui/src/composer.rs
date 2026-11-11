@@ -23,7 +23,18 @@ pub struct Composer {
     v_down: bool,
     /// egui delivered the clipboard as text during the current paste.
     pasted_text: bool,
+    /// Messages sent before, oldest first; ↑/↓ walk through them like a shell.
+    history: Vec<String>,
+    /// Index into `history` while browsing it; `None` while editing the draft.
+    hist_pos: Option<usize>,
+    /// What was typed when ↑ started browsing; ↓ past the newest message brings it back.
+    draft: String,
+    /// Changes made to recalled messages while browsing (kept until the next send).
+    edits: std::collections::HashMap<usize, String>,
 }
+
+/// Most messages kept for ↑/↓.
+const HISTORY_MAX: usize = 200;
 
 pub struct Attachment {
     pub image: Image,
@@ -87,6 +98,79 @@ impl Composer {
         });
     }
 
+    /// Record a sent message for ↑/↓ and stop browsing.
+    pub fn remember(&mut self, text: &str) {
+        let text = text.trim();
+        self.hist_pos = None;
+        self.draft.clear();
+        self.edits.clear();
+        if text.is_empty() || self.history.last().is_some_and(|l| l == text) {
+            return;
+        }
+        self.history.push(text.to_owned());
+        let extra = self.history.len().saturating_sub(HISTORY_MAX);
+        self.history.drain(..extra);
+    }
+
+    /// Add older messages (e.g. from a resumed session) before the ones sent in this window.
+    pub fn load_history(&mut self, older: Vec<String>) {
+        let mut merged: Vec<String> = Vec::with_capacity(older.len() + self.history.len());
+        for m in older.into_iter().chain(std::mem::take(&mut self.history)) {
+            if !m.trim().is_empty() && merged.last() != Some(&m) {
+                merged.push(m);
+            }
+        }
+        let extra = merged.len().saturating_sub(HISTORY_MAX);
+        merged.drain(..extra);
+        self.history = merged;
+        self.hist_pos = None;
+        self.edits.clear();
+    }
+
+    /// History entry `p` as last seen: with the user's edits, if any.
+    fn entry(&self, p: usize) -> &str {
+        self.edits.get(&p).unwrap_or(&self.history[p])
+    }
+
+    /// ↑: the previous sent message (saving the draft the first time).
+    fn history_up(&mut self, ctx: &egui::Context) {
+        let pos = match self.hist_pos {
+            None => {
+                self.draft = std::mem::take(&mut self.input);
+                self.history.len() - 1
+            }
+            Some(p) => p - 1,
+        };
+        self.show_entry(ctx, Some(pos), false);
+    }
+
+    /// ↓: the next sent message, or back to the draft after the newest one.
+    fn history_down(&mut self, ctx: &egui::Context) {
+        let next = self
+            .hist_pos
+            .and_then(|p| (p + 1 < self.history.len()).then_some(p + 1));
+        self.show_entry(ctx, next, true);
+    }
+
+    fn show_entry(&mut self, ctx: &egui::Context, pos: Option<usize>, caret_at_end: bool) {
+        self.hist_pos = pos;
+        self.input = match pos {
+            Some(p) => self.entry(p).to_owned(),
+            None => std::mem::take(&mut self.draft),
+        };
+        // A recalled `/command` should not pop the command list over the history walk.
+        if pos.is_some() {
+            self.dismissed = Some(self.input.clone());
+        }
+        // ↑ leaves the caret at the start, so another ↑ keeps going back; ↓ at the end.
+        let at = if caret_at_end {
+            self.input.chars().count()
+        } else {
+            0
+        };
+        set_cursor(ctx, Self::id(), at);
+    }
+
     /// Images to send with the message; clears the attachments.
     pub fn take_images(&mut self) -> Vec<Image> {
         self.attachments.drain(..).map(|a| a.image).collect()
@@ -120,6 +204,17 @@ impl Composer {
         // swallow Shift+Enter (the newline key below).
         let mut complete: Option<String> = None;
         let mut refocus = false;
+        // Editing a recalled message keeps the edit at that position, so walking away and back
+        // loses nothing; the draft stays untouched too.
+        if let Some(p) = self.hist_pos
+            && self.entry(p) != self.input
+        {
+            self.edits.insert(p, self.input.clone());
+        }
+        let (at_start, on_last_line) = caret_position(&ctx, id, &self.input);
+        let can_go_up = !self.history.is_empty() && self.hist_pos != Some(0) && at_start;
+        let can_go_down = self.hist_pos.is_some() && on_last_line;
+        let (mut hist_up, mut hist_down) = (false, false);
         let nobody_focused = ui.memory(|m| m.focused().is_none());
         if focused || self.had_focus || nobody_focused {
             self.paste_events(&ctx, &mut out);
@@ -146,6 +241,8 @@ impl Composer {
                         egui::Key::ArrowDown if popup && plain => down += 1,
                         egui::Key::Tab if popup && plain => tab = true,
                         egui::Key::Enter if plain => enter = true,
+                        egui::Key::ArrowUp if plain && can_go_up => hist_up = true,
+                        egui::Key::ArrowDown if plain && can_go_down => hist_down = true,
                         egui::Key::Backspace
                             if plain && self.input.is_empty() && !self.attachments.is_empty() =>
                         {
@@ -172,6 +269,11 @@ impl Composer {
                 out.send = true;
             }
         }
+        if hist_up {
+            self.history_up(&ctx);
+        } else if hist_down {
+            self.history_down(&ctx);
+        }
 
         self.attachment_row(ui);
         let resp = ui.add_sized(
@@ -182,9 +284,8 @@ impl Composer {
                     egui::Modifiers::SHIFT,
                     egui::Key::Enter,
                 ))
-                .hint_text(
-                    "Enter to send · Shift+Enter for a new line · / for commands · Ctrl+V to paste an image",
-                ),
+                .hint_text("Ask ufrh to read, change or explain code…")
+                .margin(egui::Margin::symmetric(10, 8)),
         );
 
         if popup
@@ -346,12 +447,30 @@ pub fn image_label(img: &Image) -> String {
 
 /// Put the caret after the last character (after an autocomplete).
 fn set_cursor_to_end(ctx: &egui::Context, id: egui::Id, text: &str) {
+    set_cursor(ctx, id, text.chars().count());
+}
+
+fn set_cursor(ctx: &egui::Context, id: egui::Id, char_index: usize) {
     let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
-    let end = egui::text::CCursor::new(text.chars().count());
+    let at = egui::text::CCursor::new(char_index);
     state
         .cursor
-        .set_char_range(Some(egui::text::CCursorRange::one(end)));
+        .set_char_range(Some(egui::text::CCursorRange::one(at)));
     state.store(ctx, id);
+}
+
+/// (caret at the very start, caret on the last line), with no selection. Before the box has
+/// ever been focused there is no caret: an empty box counts as both.
+fn caret_position(ctx: &egui::Context, id: egui::Id, text: &str) -> (bool, bool) {
+    let range = egui::text_edit::TextEditState::load(ctx, id).and_then(|s| s.cursor.char_range());
+    match range {
+        Some(r) if r.primary.index == r.secondary.index => {
+            let i = r.primary.index.0;
+            (i == 0, !text.chars().skip(i).any(|c| c == '\n'))
+        }
+        Some(_) => (false, false), // a selection: arrows only move it
+        None => (text.is_empty(), !text.contains('\n')),
+    }
 }
 
 #[cfg(test)]
@@ -407,6 +526,7 @@ mod tests {
                 if out.send {
                     let n = s.composer.take_images().len();
                     let text = std::mem::take(&mut s.composer.input);
+                    s.composer.remember(&text);
                     s.sent.push(if n > 0 {
                         format!("{text}+{n}img")
                     } else {
@@ -617,5 +737,112 @@ mod tests {
         press(&mut h, Key::Backspace, Modifiers::NONE);
         assert_eq!(h.state().composer.input, "a");
         assert_eq!(h.state().composer.attachments.len(), 1);
+    }
+
+    fn input(h: &Harness<'_, State>) -> String {
+        h.state().composer.input.clone()
+    }
+
+    fn send(h: &mut Harness<'_, State>, text: &str) {
+        type_text(h, text);
+        press(h, Key::Enter, Modifiers::NONE);
+    }
+
+    #[test]
+    fn up_recalls_sent_messages_and_down_returns_to_the_draft() {
+        let mut h = harness();
+        send(&mut h, "first message");
+        send(&mut h, "second message");
+        // The example: type, go to the start, ↑ shows the previous message, ↓ restores the text.
+        type_text(&mut h, "oi, pode implementar isso");
+        press(&mut h, Key::ArrowUp, Modifiers::NONE);
+        assert_eq!(
+            input(&h),
+            "oi, pode implementar isso",
+            "caret not at the start yet"
+        );
+        press(&mut h, Key::Home, Modifiers::NONE);
+        press(&mut h, Key::ArrowUp, Modifiers::NONE);
+        assert_eq!(input(&h), "second message");
+        press(&mut h, Key::ArrowUp, Modifiers::NONE);
+        assert_eq!(input(&h), "first message");
+        press(&mut h, Key::ArrowUp, Modifiers::NONE);
+        assert_eq!(input(&h), "first message", "stops at the oldest");
+        press(&mut h, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(input(&h), "second message");
+        press(&mut h, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(input(&h), "oi, pode implementar isso", "draft is back");
+        press(&mut h, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(
+            input(&h),
+            "oi, pode implementar isso",
+            "nothing after the draft"
+        );
+        // The caret is at the end of the restored draft: typing continues it.
+        type_text(&mut h, "!");
+        assert_eq!(input(&h), "oi, pode implementar isso!");
+    }
+
+    #[test]
+    fn empty_box_goes_straight_to_history_and_edits_are_kept() {
+        let mut h = harness();
+        send(&mut h, "/compact");
+        send(&mut h, "fix the parser");
+        press(&mut h, Key::ArrowUp, Modifiers::NONE);
+        assert_eq!(input(&h), "fix the parser");
+        type_text(&mut h, "please "); // caret is at the start after ↑
+        assert_eq!(input(&h), "please fix the parser");
+        press(&mut h, Key::Home, Modifiers::NONE);
+        press(&mut h, Key::ArrowUp, Modifiers::NONE);
+        assert_eq!(input(&h), "/compact");
+        assert!(
+            h.state().composer.suggestions(&catalog()).is_empty(),
+            "a recalled command does not open the list"
+        );
+        press(&mut h, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(input(&h), "please fix the parser", "the edit survived");
+        press(&mut h, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(input(&h), "", "empty draft");
+        // Sending the edited copy adds it; the original stays in history.
+        press(&mut h, Key::ArrowUp, Modifiers::NONE);
+        press(&mut h, Key::Enter, Modifiers::NONE);
+        assert_eq!(h.state().sent.last().unwrap(), "please fix the parser");
+        press(&mut h, Key::ArrowUp, Modifiers::NONE);
+        press(&mut h, Key::ArrowUp, Modifiers::NONE);
+        assert_eq!(input(&h), "fix the parser");
+    }
+
+    #[test]
+    fn arrows_move_inside_multiline_text_before_walking_history() {
+        let mut h = harness();
+        send(&mut h, "older");
+        type_text(&mut h, "line one");
+        press(&mut h, Key::Enter, Modifiers::SHIFT);
+        type_text(&mut h, "line two");
+        // ↓ on the last line while not browsing: nothing to go to.
+        press(&mut h, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(input(&h), "line one\nline two");
+        // ↑ from the second line only moves the caret up; at the start it recalls.
+        press(&mut h, Key::ArrowUp, Modifiers::NONE);
+        assert_eq!(input(&h), "line one\nline two");
+        press(&mut h, Key::Home, Modifiers::NONE);
+        press(&mut h, Key::ArrowUp, Modifiers::NONE);
+        assert_eq!(input(&h), "older");
+        press(&mut h, Key::ArrowDown, Modifiers::NONE);
+        assert_eq!(input(&h), "line one\nline two");
+    }
+
+    #[test]
+    fn older_sessions_are_loaded_before_this_windows_messages() {
+        let mut h = harness();
+        send(&mut h, "new");
+        h.state_mut()
+            .composer
+            .load_history(vec!["old 1".into(), "old 2".into(), "new".into()]);
+        for want in ["new", "old 2", "old 1"] {
+            press(&mut h, Key::Home, Modifiers::NONE);
+            press(&mut h, Key::ArrowUp, Modifiers::NONE);
+            assert_eq!(input(&h), want);
+        }
     }
 }
