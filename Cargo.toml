@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = ["crates/*", "apps/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+
+[workspace.dependencies]
+ufrh-types = { path = "crates/ufrh-types" }
+ufrh-providers = { path = "crates/ufrh-providers" }
+ufrh-tools = { path = "crates/ufrh-tools" }
+ufrh-core = { path = "crates/ufrh-core" }
+ufrh-store = { path = "crates/ufrh-store" }
+ufrh-mcp = { path = "crates/ufrh-mcp" }
+
+anyhow = "1"
+async-trait = "0.1"
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+globset = "0.4"
+ignore = "0.4"
+regex = "1"
+# rustls + ring (no OpenSSL, no aws-lc): works on old CPUs, no C toolchain needed for TLS.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "sync", "time", "fs", "io-util", "io-std", "signal"] }
+tokio-util = "0.7"
+toml = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = "s"

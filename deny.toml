@@ -1,0 +1,11 @@
+# Vulkan / wgpu are forbidden: the GUI must run on plain OpenGL (glow) and Mesa llvmpipe.
+[bans]
+deny = [
+  { crate = "wgpu" },
+  { crate = "wgpu-core" },
+  { crate = "wgpu-hal" },
+  { crate = "ash" },
+  { crate = "openssl" },
+  { crate = "aws-lc-rs" },
+  { crate = "rusqlite" },
+]

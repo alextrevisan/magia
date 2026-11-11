@@ -1,0 +1,35 @@
+# ~/.config/ufrh/config.toml
+provider = "zen"                 # zen | go | openrouter | any name defined under [providers.*]
+model = "big-pickle"             # see `ufrh models --provider zen`
+permission_mode = "ask"          # ask | accept_edits | plan | yolo
+compact_at_tokens = 100000       # summarize older history near this size (0 = never)
+sandbox = false                  # run `bash` in bubblewrap: read-only FS except the project dir
+
+# Override a preset or add an OpenAI-compatible endpoint.
+[providers.openrouter]
+api_key_env = "OPENROUTER_API_KEY"
+
+[providers.zen]
+# wire_overrides = { "some-model" = "messages" }   # chat_completions | responses | messages
+
+[providers.local]
+base_url = "http://localhost:8080/v1"
+api_key_env = "LOCAL_API_KEY"
+
+# Hooks: shell commands on events. JSON payload on stdin; exit code 2 blocks pre_tool / user_prompt.
+[[hooks]]
+event = "pre_tool"               # pre_tool | post_tool | user_prompt | stop
+matcher = "bash"
+command = "jq -e '.input.command | test(\"rm -rf /\") | not' >/dev/null || { echo 'refusing rm -rf /' >&2; exit 2; }"
+
+# MCP servers (stdio). Their tools appear as mcp__<name>__<tool> and always ask for approval.
+[[mcp]]
+name = "fs"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "."]
+
+# Project extras (no config needed):
+#   AGENTS.md (or CLAUDE.md)            instructions added to the system prompt
+#   .ufrh/skills/<name>/SKILL.md        skills: `name:` + `description:` frontmatter, loaded on demand
+#   .ufrh/commands/<name>.md            custom slash command; $ARGUMENTS is replaced
+#   @path/to/file in a prompt           inlines the file and marks it as read
