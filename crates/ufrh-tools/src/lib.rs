@@ -3,11 +3,13 @@
 mod builtin;
 mod checkpoint;
 mod permissions;
+mod web;
 
 pub use checkpoint::Checkpoints;
 
 pub use builtin::builtin_tools;
-pub use permissions::{Decision, PermissionMode, decide};
+pub use permissions::{Decision, Effect, PermissionMode, RuleSet, decide};
+pub use web::{html_to_text, parse_ddg_results};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -78,6 +80,11 @@ pub trait Tool: Send + Sync {
     fn is_edit(&self) -> bool {
         false
     }
+    /// Sends data off the machine (URL, query). Never auto-approved except in `Yolo`, because a
+    /// prompt-injected model could use it to exfiltrate what it has read.
+    fn network(&self) -> bool {
+        false
+    }
     async fn call(&self, input: Value, cx: &ToolCx) -> Result<String>;
 }
 
@@ -94,6 +101,10 @@ impl Registry {
 
     pub fn add(&mut self, tool: Box<dyn Tool>) {
         self.tools.push(tool);
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &dyn Tool> {
+        self.tools.iter().map(|b| b.as_ref())
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {

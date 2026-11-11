@@ -5,13 +5,13 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, FutureExt, join_all};
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 use ufrh_providers::Client;
 use ufrh_store::SessionFile;
-use ufrh_tools::{Decision, PermissionMode, Registry, ToolCx, decide};
-use ufrh_types::{ChatRequest, Message, StreamEvent, ToolCall, ToolSpec, Usage};
+use ufrh_tools::{Decision, Effect, PermissionMode, Registry, RuleSet, Tool, ToolCx, decide};
+use ufrh_types::{ChatRequest, Image, Message, StreamEvent, ToolCall, ToolSpec, Usage};
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -35,10 +35,18 @@ pub enum AgentEvent {
     TurnDone,
 }
 
-/// Asks the user whether a non-read-only tool call may run.
+/// The user side of a turn: approving tool calls and answering the model's questions.
 #[async_trait]
 pub trait Approver: Send + Sync {
     async fn approve(&self, call: &ToolCall) -> bool;
+    /// Ask the user a question (from the `question` tool). `None` = no answer / not interactive.
+    async fn ask(&self, _question: &str, _options: &[String]) -> Option<String> {
+        None
+    }
+    /// Whether `ask` can reach a person; the `question` tool is only offered when it can.
+    fn interactive(&self) -> bool {
+        false
+    }
 }
 
 pub struct AutoApprove(pub bool);
@@ -53,6 +61,28 @@ const MAX_STEPS: usize = 50;
 const CHILD_MAX_STEPS: usize = 25;
 const SUMMARY_PREFIX: &str = "[Summary of the earlier conversation]";
 
+/// What the user sends in one turn: text plus pasted/attached images.
+#[derive(Debug, Clone, Default)]
+pub struct UserInput {
+    pub text: String,
+    pub images: Vec<Image>,
+}
+
+impl From<String> for UserInput {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
+impl From<&str> for UserInput {
+    fn from(text: &str) -> Self {
+        text.to_owned().into()
+    }
+}
+
 pub struct Agent {
     pub client: Client,
     pub model: String,
@@ -64,10 +94,14 @@ pub struct Agent {
     pub store: Option<SessionFile>,
     pub system: String,
     pub hooks: Hooks,
+    /// OpenCode-style permission rules (last match wins); they refine `mode`.
+    pub rules: RuleSet,
     /// Compact when the context nears this many tokens (0 = never).
     pub compact_at_tokens: u64,
     last_input_tokens: u64,
     is_child: bool,
+    /// Used as the session id when there is no session file (tests, subagents).
+    fallback_session: String,
 }
 
 impl Agent {
@@ -93,9 +127,11 @@ impl Agent {
             store: None,
             system,
             hooks: Hooks::default(),
+            rules: RuleSet::default(),
             compact_at_tokens: 100_000,
             last_input_tokens: 0,
             is_child: false,
+            fallback_session: new_session_id(),
         }
     }
 
@@ -104,6 +140,58 @@ impl Agent {
         self.hooks = Hooks(cfg.hooks.clone());
         self.compact_at_tokens = cfg.compact_at_tokens;
         self.cx.sandbox = cfg.sandbox;
+        self.rules = cfg.rules.clone();
+        self.add_instructions(&cfg.instructions);
+    }
+
+    /// Append extra instruction files (`instructions` in the config; paths or globs relative to
+    /// the project, ≤ 64 KB each). URLs are not fetched.
+    fn add_instructions(&mut self, entries: &[String]) {
+        for e in entries {
+            if e.starts_with("http://") || e.starts_with("https://") {
+                continue;
+            }
+            let Ok(glob) = globset::Glob::new(e) else {
+                continue;
+            };
+            let m = glob.compile_matcher();
+            let mut files: Vec<PathBuf> = ignore::WalkBuilder::new(&self.cx.cwd)
+                .build()
+                .flatten()
+                .filter(|d| d.file_type().is_some_and(|t| t.is_file()))
+                .map(|d| d.into_path())
+                .filter(|p| p.strip_prefix(&self.cx.cwd).is_ok_and(|r| m.is_match(r)))
+                .collect();
+            files.sort();
+            for f in files {
+                if let Ok(text) = std::fs::read_to_string(&f)
+                    && text.len() <= 64 * 1024
+                {
+                    let rel = f
+                        .strip_prefix(&self.cx.cwd)
+                        .unwrap_or(&f)
+                        .display()
+                        .to_string();
+                    self.system
+                        .push_str(&format!("\n\n# Instructions ({rel})\n{text}"));
+                }
+            }
+        }
+    }
+
+    /// Final decision for a call: config rules override the mode, except that `plan` mode
+    /// never lets a modifying tool run.
+    fn decision(&self, call: &ToolCall, tool: &dyn Tool) -> Decision {
+        let base = decide(self.mode, tool);
+        if self.mode == PermissionMode::Plan && !tool.read_only() {
+            return base;
+        }
+        match self.rules.check(&call.name, &permission_key(call)) {
+            Some(Effect::Allow) => Decision::Allow,
+            Some(Effect::Ask) => Decision::Ask,
+            Some(Effect::Deny) => Decision::Deny,
+            None => base,
+        }
     }
 
     /// Start the configured MCP servers and register their tools. Returns error messages.
@@ -122,9 +210,48 @@ impl Agent {
         self.history.push(m);
     }
 
-    fn all_specs(&self) -> Vec<ToolSpec> {
-        let mut v = self.tools.specs();
-        if !self.is_child {
+    /// Whether the model is shown `tool` at all: hidden when no call to it could ever run
+    /// (plan mode for modifying tools, a catch-all `deny` rule, or a subagent that has nobody
+    /// to ask for approval). Calls are still checked again at execution time.
+    fn offered(&self, tool: &dyn Tool) -> bool {
+        let name = tool.name();
+        if self.mode == PermissionMode::Plan && !tool.read_only() {
+            return false;
+        }
+        if self.rules.fully_denied(name) {
+            return false;
+        }
+        if self.is_child {
+            // The subagent's approver always says no, so only auto-allowed tools are usable.
+            return decide(self.mode, tool) == Decision::Allow || self.rules.may_allow(name);
+        }
+        true
+    }
+
+    fn all_specs(&self, interactive: bool) -> Vec<ToolSpec> {
+        let mut v: Vec<ToolSpec> = self
+            .tools
+            .iter()
+            .filter(|t| self.offered(*t))
+            .map(|t| ToolSpec {
+                name: t.name().into(),
+                description: t.description().into(),
+                schema: t.schema(),
+            })
+            .collect();
+        if interactive && !self.is_child && !self.rules.fully_denied("question") {
+            v.push(ToolSpec {
+                name: "question".into(),
+                description: "Ask the user a question and wait for the answer. Use it when the request is ambiguous \
+or a decision is genuinely theirs; do not use it for things you can find out yourself."
+                    .into(),
+                schema: json!({"type":"object","properties":{
+                    "question":{"type":"string"},
+                    "options":{"type":"array","items":{"type":"string"},"description":"suggested answers (the user may also type their own)"}},
+                    "required":["question"]}),
+            });
+        }
+        if !self.is_child && !self.rules.fully_denied("task") {
             v.push(ToolSpec {
                 name: "task".into(),
                 description: "Delegate a self-contained research question to a read-only subagent with its own context. \
@@ -142,18 +269,22 @@ It can read/search the project but not modify it; it returns a concise report."
     /// Run one user turn: model → tools → model … until the model stops calling tools.
     pub async fn run_turn(
         &mut self,
-        prompt: String,
+        prompt: impl Into<UserInput>,
         events: UnboundedSender<AgentEvent>,
         cancel: CancellationToken,
         approver: &dyn Approver,
     ) {
+        let UserInput {
+            text: prompt,
+            mut images,
+        } = prompt.into();
         self.cx.cancel = cancel.clone();
         let hook = self
             .hooks
             .run(
                 "user_prompt",
                 None,
-                &json!({"prompt": prompt}),
+                &json!({"prompt": prompt, "images": images.len()}),
                 &self.cx.cwd,
             )
             .await;
@@ -164,12 +295,16 @@ It can read/search the project but not modify it; it returns a concise report."
             let _ = events.send(AgentEvent::TurnDone);
             return;
         }
-        let mut prompt = expand_mentions(&self.cx, &prompt);
+        let (mut prompt, mentioned) = expand_mentions(&self.cx, &prompt);
+        images.extend(mentioned);
         if !hook.output.trim().is_empty() {
             prompt.push_str(&format!("\n\n[hook output]\n{}", hook.output.trim()));
         }
         self.cx.checkpoints.begin_turn();
-        self.push(Message::User { text: prompt });
+        self.push(Message::User {
+            text: prompt,
+            images,
+        });
         if let Err(e) = self.run_loop(&events, &cancel, approver).await {
             let _ = events.send(AgentEvent::Error(format!("{e:#}")));
         }
@@ -194,8 +329,9 @@ It can read/search the project but not modify it; it returns a concise report."
                 model: self.model.clone(),
                 system: Some(self.system.clone()),
                 messages: self.history.clone(),
-                tools: self.all_specs(),
+                tools: self.all_specs(approver.interactive()),
                 max_tokens: None,
+                session_id: Some(self.session_id()),
             };
             let mut stream = tokio::select! {
                 s = self.client.stream(&req) => s?,
@@ -277,12 +413,15 @@ It can read/search the project but not modify it; it returns a concise report."
     }
 
     fn auto_allowed(&self, call: &ToolCall) -> bool {
+        if call.name == "question" {
+            return false; // interactive: never batched with other calls
+        }
         if call.name == "task" {
             return !self.is_child;
         }
         self.tools
             .get(&call.name)
-            .is_some_and(|t| decide(self.mode, t) == Decision::Allow)
+            .is_some_and(|t| self.decision(call, t) == Decision::Allow)
     }
 
     /// Keep the history valid after cancellation: every tool call needs a result.
@@ -328,7 +467,41 @@ It can read/search the project but not modify it; it returns a concise report."
             return (format!("blocked by hook: {reason}"), true);
         }
 
-        let result = if call.name == "task" && !self.is_child {
+        let result = if call.name == "question" && !self.is_child {
+            let question = call
+                .arguments
+                .get("question")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            let options: Vec<String> = call
+                .arguments
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|o| o.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if question.is_empty() {
+                Err(anyhow::anyhow!("missing `question`"))
+            } else if self.rules.check("question", &question) == Some(Effect::Deny) {
+                Err(anyhow::anyhow!(
+                    "asking the user is disabled by the permission rules"
+                ))
+            } else {
+                match approver.ask(&question, &options).await {
+                    Some(a) if !a.trim().is_empty() => {
+                        Ok(format!("The user answered: {}", a.trim()))
+                    }
+                    _ => Err(anyhow::anyhow!(
+                        "the user did not answer; continue with your best judgment and say what you assumed"
+                    )),
+                }
+            }
+        } else if call.name == "task" && !self.is_child {
             let prompt = call
                 .arguments
                 .get("prompt")
@@ -351,7 +524,7 @@ It can read/search the project but not modify it; it returns a concise report."
             let Some(tool) = self.tools.get(&call.name) else {
                 return (format!("unknown tool `{}`", call.name), true);
             };
-            match decide(self.mode, tool) {
+            match self.decision(call, tool) {
                 Decision::Deny => {
                     return (
                         format!("`{}` is not allowed in {:?} mode", call.name, self.mode),
@@ -421,12 +594,14 @@ It can read/search the project but not modify it; it returns a concise report."
             .await?;
         let mut tail = self.history.split_off(cut);
         let mut head = format!("{SUMMARY_PREFIX}\n{summary}");
+        let mut images = Vec::new();
         if matches!(tail.first(), Some(Message::User { .. }))
-            && let Message::User { text } = tail.remove(0)
+            && let Message::User { text, images: i } = tail.remove(0)
         {
             head.push_str(&format!("\n\n{text}")); // keep roles alternating
+            images = i;
         }
-        let mut new = vec![Message::User { text: head }];
+        let mut new = vec![Message::User { text: head, images }];
         new.append(&mut tail);
         self.history = new;
         self.last_input_tokens = 0;
@@ -445,9 +620,10 @@ goals, decisions, files read/changed (with paths), commands run and their outcom
 Do not call tools."
                     .into(),
             ),
-            messages: vec![Message::User { text: format!("Summarize this session transcript:\n\n{transcript}") }],
+            messages: vec![Message::user(format!("Summarize this session transcript:\n\n{transcript}"))],
             tools: vec![],
             max_tokens: Some(2048),
+            session_id: Some(self.session_id()),
         };
         let mut stream = self.client.stream(&req).await?;
         let mut out = String::new();
@@ -472,7 +648,7 @@ Do not call tools."
             .iter()
             .enumerate()
             .filter(
-                |(_, m)| matches!(m, Message::User { text } if !text.starts_with(SUMMARY_PREFIX)),
+                |(_, m)| matches!(m, Message::User { text, .. } if !text.starts_with(SUMMARY_PREFIX)),
             )
             .map(|(i, _)| i)
             .collect();
@@ -493,9 +669,37 @@ Do not call tools."
 
     /// Continue in a new session file that starts as a copy of the current history; the
     /// original file stays as the branch point.
+    /// Stable id of this conversation: derived from the session file, so it survives resume and
+    /// changes on fork / a new session.
+    pub fn session_id(&self) -> String {
+        match self.store.as_ref().and_then(|s| s.path().file_stem()) {
+            Some(stem) => format!("ufrh-{}", stem.to_string_lossy()),
+            None => self.fallback_session.clone(),
+        }
+    }
+
+    /// Start a fresh conversation (new history, new session file, new session id).
+    pub fn new_session(&mut self) -> Result<()> {
+        self.history.clear();
+        self.last_input_tokens = 0;
+        self.store = Some(SessionFile::create_for(
+            &ufrh_store::sessions_dir(),
+            &self.cx.cwd,
+        )?);
+        Ok(())
+    }
+
+    /// Continue a saved session (only one that belongs to this working folder).
+    pub fn resume(&mut self, path: &Path) -> Result<usize> {
+        let sf = SessionFile::resume(&ufrh_store::sessions_dir(), path, &self.cx.cwd)?;
+        self.history = sf.load()?;
+        self.last_input_tokens = 0;
+        self.store = Some(sf);
+        Ok(self.history.len())
+    }
+
     pub fn fork(&mut self) -> Result<PathBuf> {
-        let dir = ufrh_store::sessions_dir();
-        let new = SessionFile::create_in(&dir)?;
+        let new = SessionFile::create_for(&ufrh_store::sessions_dir(), &self.cx.cwd)?;
         for m in &self.history {
             new.append(m)?;
         }
@@ -505,11 +709,45 @@ Do not call tools."
     }
 }
 
+/// The string a permission pattern is matched against (command for `bash`, path for file tools).
+fn permission_key(call: &ToolCall) -> String {
+    let arg = |k: &str| {
+        call.arguments
+            .get(k)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    match call.name.as_str() {
+        "bash" => arg("command"),
+        "read" | "write" | "edit" => arg("file_path"),
+        "glob" | "grep" => arg("pattern"),
+        "ls" => arg("path"),
+        "webfetch" => arg("url"),
+        "websearch" => arg("query"),
+        _ => None,
+    }
+    .unwrap_or_else(|| "*".into())
+}
+
+/// Random-enough id without a `rand` dependency (std's per-process random hasher keys).
+fn new_session_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos()),
+    );
+    h.write_u32(std::process::id());
+    format!("ufrh-{:016x}", h.finish())
+}
+
 fn estimate_tokens(h: &[Message]) -> u64 {
     let bytes: usize = h
         .iter()
         .map(|m| match m {
-            Message::User { text } => text.len(),
+            // ≈1600 tokens for an image at MAX_EDGE (Anthropic: w·h/750).
+            Message::User { text, images } => text.len() + images.len() * 6400,
             Message::Assistant { text, tool_calls } => {
                 text.len()
                     + tool_calls
@@ -535,7 +773,12 @@ fn render_transcript(h: &[Message]) -> String {
     let mut out = String::new();
     for m in h {
         match m {
-            Message::User { text } => out.push_str(&format!("[user] {}\n", clip(text, 4000))),
+            Message::User { text, images } => {
+                out.push_str(&format!("[user] {}\n", clip(text, 4000)));
+                if !images.is_empty() {
+                    out.push_str(&format!("[user attached {} image(s)]\n", images.len()));
+                }
+            }
             Message::Assistant { text, tool_calls } => {
                 if !text.is_empty() {
                     out.push_str(&format!("[assistant] {}\n", clip(text, 4000)));
@@ -605,7 +848,8 @@ pub fn build_system_prompt(cwd: &std::path::Path) -> String {
     let mut s = format!(
         "You are ufrh, a coding agent running in the user's terminal/desktop. \
 Work in the project directory `{}`. Use the tools to inspect and change files; read a file before editing it. \
-Use `todo` to plan multi-step work. Be concise.",
+Use `todo` to plan multi-step work. Use `websearch`/`webfetch` for documentation you do not know, \
+and `question` only when the user must decide. Be concise.",
         cwd.display()
     );
     for name in ["AGENTS.md", "CLAUDE.md"] {

@@ -6,20 +6,40 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
-use ufrh_core::{Agent, AgentEvent, Approver, Config};
+mod clipboard;
+mod composer;
+mod resume;
+
+use ufrh_core::{Agent, AgentEvent, Approver, Config, SlashEntry, slash_catalog};
 use ufrh_providers::Client;
 use ufrh_store::{SessionFile, sessions_dir};
 use ufrh_tools::PermissionMode;
-use ufrh_types::{Message, ToolCall};
+use ufrh_types::{Image, Message, ToolCall};
 
 enum UiMsg {
     Agent(AgentEvent),
     Models(Result<Vec<String>, String>),
     Permission(ToolCall, tokio::sync::oneshot::Sender<bool>),
+    Question(Question),
+    Catalog(Vec<SlashEntry>),
+    /// Images read from the clipboard or from files, with their RGBA previews.
+    Attach(Result<Vec<(Image, Option<Thumb>)>, String>),
+    /// Results of a `/resume` search: (generation, hits).
+    Sessions(u64, Vec<ufrh_store::Hit>),
+}
+
+/// RGBA preview: width, height, pixels.
+type Thumb = (u32, u32, Vec<u8>);
+
+struct Question {
+    text: String,
+    options: Vec<String>,
+    reply: tokio::sync::oneshot::Sender<Option<String>>,
 }
 
 enum Item {
-    User(String),
+    /// Text and a label per attached image.
+    User(String, Vec<String>),
     Assistant {
         text: String,
         reasoning: String,
@@ -46,6 +66,22 @@ impl Approver for GuiApprover {
         self.ctx.request_repaint();
         answer.await.unwrap_or(false)
     }
+
+    async fn ask(&self, question: &str, options: &[String]) -> Option<String> {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let q = Question {
+            text: question.to_owned(),
+            options: options.to_vec(),
+            reply,
+        };
+        let _ = self.tx.send(UiMsg::Question(q));
+        self.ctx.request_repaint();
+        answer.await.ok().flatten()
+    }
+
+    fn interactive(&self) -> bool {
+        true
+    }
 }
 
 struct App {
@@ -56,10 +92,16 @@ struct App {
     tx: UnboundedSender<UiMsg>,
     rx: UnboundedReceiver<UiMsg>,
     items: Vec<Item>,
-    input: String,
+    composer: composer::Composer,
+    /// The `/resume` picker, while open.
+    resume: Option<resume::Picker>,
     running: bool,
     cancel: CancellationToken,
     pending: Option<(ToolCall, tokio::sync::oneshot::Sender<bool>)>,
+    /// Open question from the model and the user's typed answer.
+    question: Option<(Question, String)>,
+    /// `/` autocomplete: everything available (refreshed off the UI thread when the popup opens).
+    catalog: Vec<SlashEntry>,
     models: Vec<String>,
     status: String,
     tokens: (u64, u64),
@@ -98,7 +140,10 @@ impl App {
                 .expect("tokio runtime"),
         );
         let (cfg, status) = match Config::load() {
-            Ok(c) => (c, String::new()),
+            Ok(c) => {
+                let w = c.warnings.join("; ");
+                (c, w)
+            }
             Err(e) => (Config::default(), format!("config error: {e:#}")),
         };
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -110,7 +155,7 @@ impl App {
         .expect("http client");
         let mut agent = Agent::new(client, cfg.model.clone(), cfg.permission_mode, cwd.clone());
         agent.configure(&cfg);
-        agent.store = SessionFile::create_in(&sessions_dir()).ok();
+        agent.store = SessionFile::create_for(&sessions_dir(), &cwd).ok();
         let todos = agent.cx.todos.clone();
         let (tx, rx) = unbounded_channel();
         let mut app = Self {
@@ -121,10 +166,13 @@ impl App {
             tx,
             rx,
             items: vec![],
-            input: String::new(),
+            composer: composer::Composer::default(),
+            resume: None,
             running: false,
             cancel: CancellationToken::new(),
             pending: None,
+            question: None,
+            catalog: vec![],
             models: vec![],
             status,
             tokens: (0, 0),
@@ -135,6 +183,7 @@ impl App {
         };
         app.refresh_models(&cc.egui_ctx);
         app.start_mcp(&cc.egui_ctx);
+        app.refresh_catalog(&cc.egui_ctx);
         app
     }
 
@@ -153,11 +202,16 @@ impl App {
                     a.mode = self.cfg.permission_mode;
                 }
                 self.status = if missing_key {
-                    format!("no API key for `{}` in the environment", self.cfg.provider)
+                    format!(
+                        "no API key for `{0}`: set provider.{0}.options.apiKey in {1} or {2}",
+                        self.cfg.provider,
+                        ufrh_core::config_path().display(),
+                        ufrh_providers::default_key_env(&self.cfg.provider)
+                    )
                 } else {
                     String::new()
                 };
-                let _ = self.cfg.save();
+                let _ = self.cfg.save_state();
                 self.refresh_models(ctx);
             }
             Err(e) => self.status = format!("{e:#}"),
@@ -169,12 +223,22 @@ impl App {
         let client = a.client.clone();
         drop(a);
         let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        let declared = self.cfg.declared_models(&self.cfg.provider);
         self.rt.spawn(async move {
-            let r = client
-                .list_models()
-                .await
-                .map(|m| m.into_iter().map(|m| m.id).collect())
-                .map_err(|e| format!("{e:#}"));
+            // Models declared in the JSON config are always offered, even if `/models` fails.
+            let r = match client.list_models().await {
+                Ok(m) => {
+                    let mut ids: Vec<String> = m.into_iter().map(|m| m.id).collect();
+                    for d in declared {
+                        if !ids.contains(&d) {
+                            ids.push(d);
+                        }
+                    }
+                    Ok(ids)
+                }
+                Err(_) if !declared.is_empty() => Ok(declared),
+                Err(e) => Err(format!("{e:#}")),
+            };
             let _ = tx.send(UiMsg::Models(r));
             ctx.request_repaint();
         });
@@ -191,6 +255,97 @@ impl App {
         }
         if let Some(n) = &self.notifier {
             let _ = n.show(fastframe_notifications::Notification::new(title).body(body));
+        }
+    }
+
+    /// Rebuild the `/` catalog on a blocking thread (it reads command files and skills).
+    fn refresh_catalog(&self, ctx: &egui::Context) {
+        let (cwd, cfg, tx, ctx) = (
+            self.cwd.clone(),
+            self.cfg.clone(),
+            self.tx.clone(),
+            ctx.clone(),
+        );
+        self.rt.spawn_blocking(move || {
+            let _ = tx.send(UiMsg::Catalog(slash_catalog(&cwd, BUILTINS, &cfg)));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Read clipboard images (`files` empty) or load image files, off the UI thread.
+    fn attach_images(&self, ctx: &egui::Context, files: Vec<PathBuf>) {
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        self.rt.spawn(async move {
+            let res = if files.is_empty() {
+                clipboard::read_images().await
+            } else {
+                clipboard::load_paths(files).await
+            };
+            let res = match res {
+                Ok(images) => tokio::task::spawn_blocking(move || {
+                    images
+                        .into_iter()
+                        .map(|i| {
+                            let t = ufrh_core::media::thumbnail(&i, composer::THUMB);
+                            (i, t)
+                        })
+                        .collect()
+                })
+                .await
+                .map_err(|e| e.to_string()),
+                Err(e) => Err(format!("{e:#}")),
+            };
+            let _ = tx.send(UiMsg::Attach(res));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Draw the `/resume` picker and carry out what it asks for.
+    fn resume_picker(&mut self, ctx: &egui::Context) {
+        let Some(p) = &mut self.resume else { return };
+        for action in p.show(ctx) {
+            match action {
+                resume::Action::Search {
+                    generation,
+                    query,
+                    all,
+                } => {
+                    let (tx, ctx, cwd) = (self.tx.clone(), ctx.clone(), self.cwd.clone());
+                    self.rt.spawn_blocking(move || {
+                        let scope = if all {
+                            ufrh_store::Scope::All
+                        } else {
+                            ufrh_store::Scope::Folder(&cwd)
+                        };
+                        let hits = ufrh_store::search(&sessions_dir(), scope, &query);
+                        let _ = tx.send(UiMsg::Sessions(generation, hits));
+                        ctx.request_repaint();
+                    });
+                }
+                resume::Action::Open(path) => {
+                    let Ok(mut a) = self.agent.try_lock() else {
+                        self.status = "busy — wait for the current turn to finish".into();
+                        continue;
+                    };
+                    match a.resume(&path) {
+                        Ok(n) => {
+                            let history = a.history.clone();
+                            drop(a);
+                            self.reset_items(&history);
+                            self.status = format!("resumed ({n} messages)");
+                            self.resume = None;
+                            ctx.memory_mut(|m| m.request_focus(composer::Composer::id()));
+                            return;
+                        }
+                        Err(e) => self.status = format!("{e:#}"),
+                    }
+                }
+                resume::Action::Close => {
+                    self.resume = None;
+                    ctx.memory_mut(|m| m.request_focus(composer::Composer::id()));
+                    return;
+                }
+            }
         }
     }
 
@@ -228,7 +383,12 @@ impl App {
         let busy = "agent busy; try again in a moment";
         match cmd {
             "help" => {
-                self.status = "/clear /compact /rewind [n] /fork /resume — plus custom commands in .ufrh/commands/*.md".into();
+                let names: Vec<String> = self
+                    .catalog
+                    .iter()
+                    .map(|e| format!("/{}", e.name))
+                    .collect();
+                self.status = format!("{} — type / to browse", names.join(" "));
             }
             "compact" => {
                 let (agent, tx, ctx) = (self.agent.clone(), self.tx.clone(), ctx.clone());
@@ -244,30 +404,26 @@ impl App {
                     ctx.request_repaint();
                 });
             }
-            "clear" | "rewind" | "fork" | "resume" => {
+            "resume" => {
+                let Ok(a) = self.agent.try_lock() else {
+                    self.status = busy.into();
+                    return true;
+                };
+                let current = a.store.as_ref().map(|s| s.path().to_path_buf());
+                drop(a);
+                self.resume = Some(resume::Picker::new(&self.cwd, arg.unwrap_or(""), current));
+            }
+            "clear" | "rewind" | "fork" => {
                 let Ok(mut a) = self.agent.try_lock() else {
                     self.status = busy.into();
                     return true;
                 };
                 let res: anyhow::Result<String> = match cmd {
-                    "clear" => {
-                        a.history.clear();
-                        a.store = SessionFile::create_in(&sessions_dir()).ok();
-                        Ok("new session".into())
-                    }
+                    "clear" => a.new_session().map(|_| "new session".into()),
                     "rewind" => a
                         .rewind(arg.and_then(|n| n.parse().ok()).unwrap_or(1))
                         .map(|f| format!("rewound; {} file(s) restored", f.len())),
-                    "fork" => a.fork().map(|p| format!("forked into {}", p.display())),
-                    _ => match SessionFile::latest_in(&sessions_dir()) {
-                        Some(sf) => sf.load().map(|h| {
-                            let n = h.len();
-                            a.history = h;
-                            a.store = Some(sf);
-                            format!("resumed ({n} messages)")
-                        }),
-                        None => Err(anyhow::anyhow!("no saved session")),
-                    },
+                    _ => a.fork().map(|p| format!("forked into {}", p.display())),
                 };
                 let history = a.history.clone();
                 drop(a);
@@ -287,25 +443,38 @@ impl App {
     }
 
     fn send(&mut self, ctx: &egui::Context) {
-        let mut prompt = self.input.trim().to_owned();
-        if prompt.is_empty() || self.running {
+        let mut prompt = self.composer.input.trim().to_owned();
+        if (prompt.is_empty() && self.composer.attachments.is_empty()) || self.running {
             return;
         }
         if prompt.starts_with('/') {
             if self.slash(&prompt, ctx) {
-                self.input.clear();
+                self.composer.input.clear();
                 return;
             }
-            if let Some(expanded) = ufrh_core::expand_command(&self.cwd, &prompt) {
+            if let Some(expanded) =
+                ufrh_core::expand_command(&self.cwd, &prompt, &self.cfg.commands)
+            {
                 prompt = expanded;
+            } else {
+                // `/word` with no such command is a typo, not a message; `/etc/hosts …` is a path.
+                let first = prompt.split_whitespace().next().unwrap_or("");
+                if !first[1..].contains('/') {
+                    self.status = format!("unknown command `{first}` — type / to see the list");
+                    return;
+                }
             }
         }
         if self.cfg.model.trim().is_empty() {
             self.status = "pick or type a model first".into();
             return;
         }
-        self.input.clear();
-        self.items.push(Item::User(prompt.clone()));
+        self.composer.input.clear();
+        let images = self.composer.take_images();
+        self.items.push(Item::User(
+            prompt.clone(),
+            images.iter().map(composer::image_label).collect(),
+        ));
         self.running = true;
         self.status.clear();
         self.cancel = CancellationToken::new();
@@ -333,7 +502,15 @@ impl App {
             agent
                 .lock()
                 .await
-                .run_turn(prompt, ev_tx, cancel, &approver)
+                .run_turn(
+                    ufrh_core::UserInput {
+                        text: prompt,
+                        images,
+                    },
+                    ev_tx,
+                    cancel,
+                    &approver,
+                )
                 .await;
             let _ = fwd.await;
         });
@@ -344,6 +521,27 @@ impl App {
             match msg {
                 UiMsg::Models(Ok(m)) => self.models = m,
                 UiMsg::Models(Err(e)) => self.status = format!("models: {e}"),
+                UiMsg::Catalog(c) => self.catalog = c,
+                UiMsg::Sessions(generation, hits) => {
+                    if let Some(p) = &mut self.resume {
+                        p.set_results(generation, hits);
+                    }
+                }
+                UiMsg::Attach(Ok(v)) if v.is_empty() => {
+                    self.status = "the clipboard has no image".into();
+                }
+                UiMsg::Attach(Ok(v)) => {
+                    for (img, thumb) in v {
+                        self.composer.attach(ctx, img, thumb);
+                    }
+                    self.status.clear();
+                }
+                UiMsg::Attach(Err(e)) => self.status = format!("could not attach the image: {e}"),
+                UiMsg::Question(q) => {
+                    let body = q.text.chars().take(120).collect::<String>();
+                    self.question = Some((q, String::new()));
+                    self.notify(ctx, "ufrh has a question", &body);
+                }
                 UiMsg::Permission(call, reply) => {
                     let body = format!("run `{}`?", call.name);
                     self.pending = Some((call, reply));
@@ -395,6 +593,7 @@ impl App {
                     AgentEvent::TurnDone => {
                         self.running = false;
                         self.pending = None;
+                        self.question = None;
                         self.notify(ctx, "ufrh", "finished");
                     }
                 },
@@ -407,9 +606,15 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain(&ctx);
-        if self.running && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        if self.running
+            && !self.composer.input.starts_with('/')
+            && ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        {
             self.cancel.cancel();
         }
+
+        // Before the panels: the picker takes ↑↓/Enter/Esc ahead of the composer.
+        self.resume_picker(&ctx);
 
         egui::Panel::top("top").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -483,13 +688,20 @@ impl eframe::App for App {
                     self.tokens.1
                 ));
             });
-            let resp = ui.add_sized(
-                [ui.available_width(), 64.0],
-                egui::TextEdit::multiline(&mut self.input).hint_text("Ctrl+Enter to send"),
-            );
-            let ctrl_enter = resp.has_focus()
-                && ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
-            if ctrl_enter {
+            // Enter sends, Shift+Enter inserts a newline. The plain-Enter event is removed before
+            // the TextEdit sees it (egui's consume_key would also swallow Shift+Enter, since it
+            // ignores extra Shift), and the TextEdit's own newline key becomes Shift+Enter.
+            let out = self.composer.show(ui, &self.catalog);
+            if out.opened {
+                self.refresh_catalog(&ctx); // pick up commands/skills added since last time
+            }
+            if out.paste_image {
+                self.attach_images(&ctx, vec![]);
+            }
+            if !out.files.is_empty() {
+                self.attach_images(&ctx, out.files);
+            }
+            if out.send {
                 self.send(&ctx);
             }
         });
@@ -553,6 +765,48 @@ impl eframe::App for App {
                 });
         });
 
+        if let Some((q, typed)) = &mut self.question {
+            let mut answer: Option<Option<String>> = None;
+            egui::Window::new("Question from the agent")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(&ctx, |ui| {
+                    ui.label(&q.text);
+                    ui.add_space(4.0);
+                    for o in &q.options {
+                        if ui.button(o).clicked() {
+                            answer = Some(Some(o.clone()));
+                        }
+                    }
+                    let r =
+                        ui.add(egui::TextEdit::singleline(typed).hint_text("or type an answer"));
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    ui.horizontal(|ui| {
+                        if (ui
+                            .add_enabled(!typed.trim().is_empty(), egui::Button::new("Answer"))
+                            .clicked()
+                            || enter)
+                            && !typed.trim().is_empty()
+                        {
+                            answer = Some(Some(typed.trim().to_owned()));
+                        }
+                        if ui.button("Skip").clicked() {
+                            answer = Some(None);
+                        }
+                    });
+                });
+            if let Some(a) = answer
+                && let Some((q, _)) = self.question.take()
+            {
+                if let Some(text) = &a {
+                    self.items
+                        .push(Item::User(format!("(answer) {text}"), vec![]));
+                }
+                let _ = q.reply.send(a);
+            }
+        }
+
         if let Some((call, _)) = &self.pending {
             let mut answer = None;
             egui::Window::new("Permission required")
@@ -586,12 +840,35 @@ impl eframe::App for App {
     }
 }
 
+/// Built-in commands handled by `App::slash` (name, description, argument hint).
+const BUILTINS: &[(&str, &str, &str)] = &[
+    ("help", "List the available commands", ""),
+    ("clear", "Start a new session", ""),
+    ("compact", "Summarize older history to free context", ""),
+    (
+        "rewind",
+        "Undo the last turn(s): messages and file edits",
+        "[n]",
+    ),
+    ("fork", "Continue in a copy of this session", ""),
+    (
+        "resume",
+        "Pick a saved session of this folder (search every folder)",
+        "[search]",
+    ),
+];
+
 fn render_item(ui: &mut egui::Ui, n: usize, it: &Item) {
     match it {
-        Item::User(t) => {
+        Item::User(t, images) => {
             ui.add_space(6.0);
             ui.strong("you");
-            ui.label(t);
+            for l in images {
+                ui.weak(format!("[image {l}]"));
+            }
+            if !t.is_empty() {
+                ui.label(t);
+            }
         }
         Item::Assistant { text, reasoning } => {
             ui.add_space(6.0);
@@ -637,7 +914,10 @@ fn items_from_history(history: &[Message]) -> Vec<Item> {
     let mut items = Vec::new();
     for m in history {
         match m {
-            Message::User { text } => items.push(Item::User(text.clone())),
+            Message::User { text, images } => items.push(Item::User(
+                text.clone(),
+                images.iter().map(composer::image_label).collect(),
+            )),
             Message::Assistant { text, tool_calls } => {
                 if !text.is_empty() {
                     items.push(Item::Assistant {

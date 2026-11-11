@@ -1,0 +1,56 @@
+// ~/.config/ufrh/ufrh.jsonc   (also: <project>/ufrh.json[c], <project>/.ufrh/ufrh.json[c], $UFRH_CONFIG)
+// Layers merge key by key; later ones win. The format is a superset of OpenCode's opencode.json,
+// so you can point $UFRH_CONFIG at an existing opencode.json (unknown keys are ignored).
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // "provider/model". OpenRouter ids contain a slash, so: "openrouter/anthropic/claude-sonnet-4"
+  "model": "zen/big-pickle",
+
+  "provider": {
+    // zen, go and openrouter are built in; override only what you need.
+    "openrouter": {
+      "options": { "apiKey": "{env:OPENROUTER_API_KEY}" }
+    },
+    // Any OpenAI-compatible endpoint:
+    "local": {
+      "npm": "@ai-sdk/openai-compatible",   // @ai-sdk/anthropic → Messages, @ai-sdk/openai → Responses
+      "options": {
+        "baseURL": "http://localhost:8080/v1",
+        "apiKey": "{file:~/.secrets/local-key}",
+        "headers": { "X-Team": "me" }
+      },
+      "models": { "my-model": {} }          // shown in the model picker
+    }
+  },
+
+  // MCP servers (stdio). Tools appear as mcp__<name>__<tool> and always ask for approval.
+  "mcp": {
+    "servers": {
+      "fs": { "type": "local", "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."] }
+    }
+  },
+
+  // Last matching rule wins. Values: allow | ask | deny. `plan` mode still blocks all writes.
+  "permission": {
+    "bash": { "*": "ask", "git status*": "allow", "git diff*": "allow", "rm *": "deny" },
+    "edit": "ask"
+  },
+
+  "instructions": ["CONTRIBUTING.md", "docs/guidelines/*.md"],
+
+  "command": {
+    "review": { "description": "Review changes", "template": "Review the current diff. $ARGUMENTS" }
+  },
+
+  // ufrh-only settings
+  "ufrh": {
+    "permission_mode": "ask",          // ask | accept_edits | plan | yolo
+    "compact_at_tokens": 100000,       // 0 = never
+    "sandbox": false,                  // bash inside bubblewrap
+    "wire_overrides": { "zen/some-model": "messages" },   // chat_completions | responses | messages
+    "hooks": [
+      { "event": "pre_tool", "matcher": "bash", "command": "jq -e '.input.command | test(\"rm -rf /\") | not' >/dev/null || { echo 'refusing' >&2; exit 2; }" }
+    ]
+  }
+}

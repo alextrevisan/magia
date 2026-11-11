@@ -18,6 +18,8 @@ pub fn builtin_tools() -> Vec<Box<dyn Tool>> {
         Box::new(Glob),
         Box::new(Grep),
         Box::new(TodoTool),
+        Box::new(crate::web::WebFetch),
+        Box::new(crate::web::WebSearch),
     ]
 }
 

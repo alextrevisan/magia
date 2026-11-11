@@ -158,7 +158,7 @@ trait Tool: Send + Sync {
 
 Evitar dependências C: `reqwest` com `rustls` + provider `ring` (sem OpenSSL), sessões em **JSONL append-only** (um arquivo por sessão, eventos imutáveis — fork = novo arquivo apontando para pai+offset) ou `redb` para índice. Sem SQLite/rusqlite. Caminhos via `fastframe-dirs`, escrita atômica via `fastframe-file`.
 
-Config em TOML: `~/.config/ufrh/config.toml` (usuário) + `.ufrh/config.toml` (projeto). Chaves de API via env ou keyring do sistema (`keyring` crate), nunca no TOML do projeto.
+Config em **JSON/JSONC compatível com OpenCode** (`ufrh.json[c]`: `~/.config/ufrh/`, projeto, `.ufrh/`, `$UFRH_CONFIG`; camadas fundidas chave a chave; `{env:X}`/`{file:p}`). Configurações só do ufrh ficam sob `"ufrh"`. Chaves de API via env/`{env:}`; keyring do sistema não implementado.
 
 ### 2.5 GUI (eframe + fastframe)
 
@@ -191,7 +191,7 @@ Requisitos: **Rust 1.98+** e **egui/eframe 0.36.2** (exigidos pelo fastframe), e
 
 | Fase | Entrega | Critério de pronto |
 |---|---|---|
-| **F0 — Esqueleto** | Workspace, `ufrh-types`, janela eframe (`glow`) com fastframe-fonts/text/theme, config TOML, CI (fmt, clippy `-D warnings`, test, **testes sob `qemu -cpu core2duo`**, **benchmark de RSS**) | `cargo run -p ufrh-gui` abre janela temada; GUI ociosa ≤ 50 MB; roda em llvmpipe |
+| **F0 — Esqueleto** | Workspace, `ufrh-types`, janela eframe (`glow`) com fastframe-fonts/text/theme, config JSON/JSONC (compatível com OpenCode), CI (fmt, clippy `-D warnings`, test, **testes sob `qemu -cpu core2duo`**, **benchmark de RSS**) | `cargo run -p ufrh-gui` abre janela temada; GUI ociosa ≤ 50 MB; roda em llvmpipe |
 | **F1 — Chat** | `ufrh-providers` com os 3 wires + SSE, presets Zen/Go/OpenRouter, listagem de modelos, chat com streaming e cancelamento na GUI | Conversa streaming com um modelo de cada provedor; testes de parsing SSE com fixtures gravadas |
 | **F2 — Agente** | `ufrh-tools` (read/write/edit/bash/grep/glob/ls/todo), loop agêntico, tool calls paralelas, diálogo de permissão, modo plan | Agente edita arquivos de um projeto de teste com aprovação na UI |
 | **F3 — Contexto** | Sessões JSONL com histórico paginado do disco (retomar/fork), UI virtualizada, `AGENTS.md`, `@arquivo`, compactação automática, contagem de tokens/custo, prompt caching | Sessão longa sobrevive a reinício e a estouro de contexto |
@@ -213,12 +213,16 @@ Requisitos: **Rust 1.98+** e **egui/eframe 0.36.2** (exigidos pelo fastframe), e
 
 | Fase | Estado |
 |---|---|
-| F0 Esqueleto | ✅ workspace, config TOML, eframe `glow` + fastframe-fonts/text/graphics/notifications (sem wgpu), CI em `.github/workflows/ci.yml` |
+| F0 Esqueleto | ✅ workspace, config JSON/JSONC (compatível com OpenCode), eframe `glow` + fastframe-fonts/text/graphics/notifications (sem wgpu), CI em `.github/workflows/ci.yml` |
 | F1 Chat | ✅ 3 wires + SSE + retry + prompt caching (Messages); `/models` validado contra Zen, Go e OpenRouter reais; **chat real não testado (sem API key)** — coberto por fixtures e servidor falso |
 | F2 Agente | ✅ read/write/edit/bash/ls/glob/grep/todo, modos ask/accept_edits/plan/yolo, aprovação na GUI/CLI, cancelamento, leituras em paralelo |
-| F3 Contexto | ✅ sessões JSONL + resume/fork, `AGENTS.md`/`CLAUDE.md`, `@arquivo`, compactação automática e `/compact`, GUI virtualizada. Fora: custo em $ (Zen não publica preços em `/models`), histórico paginado do disco (a GUI ainda mantém o transcript em RAM; só o desenho é virtualizado) |
-| F4 Extensões | ✅ MCP stdio, skills, slash commands, hooks |
+| F3 Contexto | ✅ sessões JSONL por pasta + `/resume` com seletor e busca (todas as pastas; só restaura na própria) + fork, `AGENTS.md`/`CLAUDE.md`, `@arquivo`, imagens (Ctrl+V, arrastar, `@foto.png`; testado no Go com kimi-k3, claude-haiku-5-5, gpt-5.6-luna), compactação automática e `/compact`, GUI virtualizada. Fora: custo em $ (Zen não publica preços em `/models`), histórico paginado do disco (a GUI ainda mantém o transcript em RAM; só o desenho é virtualizado) |
+| F4 Extensões | ✅ MCP stdio, skills, slash commands (com autocomplete `/` na GUI e `ufrh commands` no CLI), hooks |
 | F5 Avançado | ✅ subagente `task`, checkpoints + `/rewind` (só `write`/`edit`; `bash` não é rastreado), sandbox `bwrap`, CLI headless. Fora: diff visual antes de aplicar edição |
 | F6 Polimento | 🟡 notificações desktop (lazy, só com a janela sem foco). Fora: abas, tray, LSP, auto-update, MCP via HTTP |
 
 Medições (release, x86-64 baseline = sse2): CLI 4,5 MB / 8 MB RSS; GUI ≈20 MB anon (+≈49 MB de bibliotecas do sistema) com GPU, ≈43 MB anon sob llvmpipe. CPU antiga: `scripts/check-baseline.sh` passa no CLI (85 funções pós-SSE2, todas em ring/memchr/aho-corasick com detecção em runtime); qemu não pôde ser instalado (sem sudo), então não houve execução real em CPU sem AVX.
+
+Config JSON: implementados `model`, `provider(s)` (baseURL/apiKey/headers/npm/env/models), `mcp` local, `permission(s)` com padrões, `instructions` (arquivos/globs), `command(s)`. Ignorados: `agent(s)`, `lsp`, `formatter`, `plugin`, `mcp` remoto (aviso), `skills.urls`, URLs em `instructions`.
+
+Ferramentas (2026-11-11): adicionadas `webfetch` (HTML→texto próprio, corpo limitado a 2 MB), `websearch` (página HTML do DuckDuckGo; pode exigir captcha sob uso intenso) e `question`; a lista enviada ao modelo agora é filtrada pelo modo, pelas regras e por ser subagente.

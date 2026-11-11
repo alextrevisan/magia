@@ -15,6 +15,9 @@ pub struct ToolCall {
 pub enum Message {
     User {
         text: String,
+        /// Attached images, sent to the model with the text.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<Image>,
     },
     Assistant {
         text: String,
@@ -25,6 +28,34 @@ pub enum Message {
         content: String,
         is_error: bool,
     },
+}
+
+/// An image attached to a user message: base64 (standard alphabet, no `data:` prefix).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Image {
+    /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
+    pub media_type: String,
+    pub data: String,
+}
+
+impl Image {
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.media_type, self.data)
+    }
+
+    /// Decoded size in bytes (approximate, from the base64 length).
+    pub fn byte_len(&self) -> usize {
+        self.data.len() / 4 * 3
+    }
+}
+
+impl Message {
+    pub fn user(text: impl Into<String>) -> Self {
+        Message::User {
+            text: text.into(),
+            images: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +73,9 @@ pub struct ChatRequest {
     pub messages: Vec<Message>,
     pub tools: Vec<ToolSpec>,
     pub max_tokens: Option<u32>,
+    /// Stable id of the conversation (same for every request of one session). Sent to
+    /// providers that route/cache by session, e.g. OpenCode Go's `x-opencode-session`.
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

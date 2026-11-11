@@ -4,7 +4,7 @@
 use crate::sse::SseEvent;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use ufrh_types::{ChatRequest, Message, StreamEvent, ToolCall, Usage, parse_arguments};
+use ufrh_types::{ChatRequest, Image, Message, StreamEvent, ToolCall, Usage, parse_arguments};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,6 +44,56 @@ fn args_string(v: &Value) -> String {
     }
 }
 
+// ───────────────────────── user content with images ─────────────────────────
+// Text-only messages keep the plain-string form every server accepts; with images the
+// content becomes an array of parts. Empty text parts are left out (Anthropic rejects them).
+
+fn chat_user_content(text: &str, images: &[Image]) -> Value {
+    if images.is_empty() {
+        return json!(text);
+    }
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(json!({"type": "text", "text": text}));
+    }
+    for i in images {
+        parts.push(json!({"type": "image_url", "image_url": {"url": i.data_url()}}));
+    }
+    Value::Array(parts)
+}
+
+fn responses_user_content(text: &str, images: &[Image]) -> Value {
+    if images.is_empty() {
+        return json!(text);
+    }
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(json!({"type": "input_text", "text": text}));
+    }
+    for i in images {
+        parts.push(json!({"type": "input_image", "image_url": i.data_url()}));
+    }
+    Value::Array(parts)
+}
+
+fn messages_user_content(text: &str, images: &[Image]) -> Value {
+    if images.is_empty() {
+        return json!(text);
+    }
+    // Anthropic recommends images before the text that refers to them.
+    let mut parts: Vec<Value> = images
+        .iter()
+        .map(|i| {
+            json!({"type": "image", "source":
+                {"type": "base64", "media_type": i.media_type, "data": i.data}})
+        })
+        .collect();
+    if !text.is_empty() {
+        parts.push(json!({"type": "text", "text": text}));
+    }
+    Value::Array(parts)
+}
+
 // ───────────────────────── Chat Completions ─────────────────────────
 
 fn chat_body(req: &ChatRequest) -> Value {
@@ -53,7 +103,9 @@ fn chat_body(req: &ChatRequest) -> Value {
     }
     for m in &req.messages {
         match m {
-            Message::User { text } => msgs.push(json!({"role": "user", "content": text})),
+            Message::User { text, images } => {
+                msgs.push(json!({"role": "user", "content": chat_user_content(text, images)}))
+            }
             Message::Assistant { text, tool_calls } => {
                 let mut o = json!({"role": "assistant", "content": if text.is_empty() { Value::Null } else { json!(text) }});
                 if !tool_calls.is_empty() {
@@ -198,7 +250,9 @@ fn responses_body(req: &ChatRequest) -> Value {
     let mut input = Vec::new();
     for m in &req.messages {
         match m {
-            Message::User { text } => input.push(json!({"role": "user", "content": text})),
+            Message::User { text, images } => {
+                input.push(json!({"role": "user", "content": responses_user_content(text, images)}))
+            }
             Message::Assistant { text, tool_calls } => {
                 if !text.is_empty() {
                     input.push(json!({"role": "assistant", "content": text}));
@@ -315,7 +369,9 @@ fn messages_body(req: &ChatRequest) -> Value {
     let mut msgs: Vec<Value> = Vec::new();
     for m in &req.messages {
         match m {
-            Message::User { text } => msgs.push(json!({"role": "user", "content": text})),
+            Message::User { text, images } => {
+                msgs.push(json!({"role": "user", "content": messages_user_content(text, images)}))
+            }
             Message::Assistant { text, tool_calls } => {
                 let mut blocks = Vec::new();
                 if !text.is_empty() {
@@ -581,11 +637,58 @@ mod tests {
     }
 
     #[test]
+    fn user_images_in_every_wire() {
+        let img = Image {
+            media_type: "image/png".into(),
+            data: "QUJD".into(),
+        };
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![
+                Message::User {
+                    text: "what is this?".into(),
+                    images: vec![img.clone()],
+                },
+                Message::User {
+                    text: String::new(),
+                    images: vec![img],
+                },
+                Message::user("plain"),
+            ],
+            ..Default::default()
+        };
+        let chat = build_body(Wire::ChatCompletions, &req);
+        let c = &chat["messages"][0]["content"];
+        assert_eq!(c[0], json!({"type": "text", "text": "what is this?"}));
+        assert_eq!(c[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+        assert_eq!(chat["messages"][1]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(chat["messages"][2]["content"], "plain");
+
+        let resp = build_body(Wire::Responses, &req);
+        let c = &resp["input"][0]["content"];
+        assert_eq!(c[0]["type"], "input_text");
+        assert_eq!(
+            c[1],
+            json!({"type": "input_image", "image_url": "data:image/png;base64,QUJD"})
+        );
+
+        let msg = build_body(Wire::Messages, &req);
+        let c = &msg["messages"][0]["content"];
+        assert_eq!(
+            c[0],
+            json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}})
+        );
+        assert_eq!(c[1]["type"], "text");
+        // No empty text block next to an image-only message.
+        assert_eq!(msg["messages"][1]["content"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
     fn messages_body_merges_tool_results() {
         let req = ChatRequest {
             model: "m".into(),
             messages: vec![
-                Message::User { text: "go".into() },
+                Message::user("go"),
                 Message::Assistant {
                     text: String::new(),
                     tool_calls: vec![

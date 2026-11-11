@@ -16,6 +16,8 @@ ufrh-store.workspace = true
 ufrh-tools.workspace = true
 ufrh-types.workspace = true
 anyhow.workspace = true
+# Clipboard images on X11; same crate and features egui-winit already uses (no new code).
+arboard = { version = "3.7", default-features = false, features = ["image-data"] }
 async-trait.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -27,3 +29,7 @@ fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.17.0" 
 fastframe-text = { git = "https://github.com/crmne/fastframe", tag = "v0.17.0" }
 fastframe-graphics = { git = "https://github.com/crmne/fastframe", tag = "v0.17.0" }
 fastframe-notifications = { git = "https://github.com/crmne/fastframe", tag = "v0.17.0" }
+
+[dev-dependencies]
+# Headless UI tests (no renderer, no wgpu: default features only).
+egui_kittest = "0.36.2"

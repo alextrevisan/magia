@@ -29,6 +29,8 @@ pub struct ProviderConfig {
     /// Exact model id → wire override.
     pub wire_overrides: HashMap<String, Wire>,
     pub default_wire: fn(&str) -> Wire,
+    /// Header carrying `ChatRequest::session_id`, for providers that require one.
+    pub session_header: Option<String>,
 }
 
 /// Built-in presets. `name` is one of `zen`, `go`, `openrouter`.
@@ -51,6 +53,8 @@ pub fn preset(name: &str) -> Option<ProviderConfig> {
         extra_headers: headers,
         wire_overrides: HashMap::new(),
         default_wire: wire_fn,
+        // OpenCode Go rejects requests without it (`MissingSessionID`); Zen uses it for caching.
+        session_header: matches!(name, "zen" | "go").then(|| "x-opencode-session".to_owned()),
     })
 }
 
@@ -109,6 +113,8 @@ pub struct Client {
 impl Client {
     pub fn new(config: ProviderConfig) -> Result<Self> {
         let http = reqwest::Client::builder()
+            // Go requires a client-specific user agent (not a generic HTTP-library one).
+            .user_agent(concat!("ufrh/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(20))
             .pool_idle_timeout(Duration::from_secs(30))
             .pool_max_idle_per_host(1)
@@ -174,11 +180,11 @@ impl Client {
 
         let mut attempt = 0u32;
         let resp = loop {
-            let sent = self
-                .request(reqwest::Method::POST, &url, auth)
-                .json(&body)
-                .send()
-                .await;
+            let mut rb = self.request(reqwest::Method::POST, &url, auth).json(&body);
+            if let (Some(h), Some(id)) = (&self.config.session_header, &req.session_id) {
+                rb = rb.header(h, id);
+            }
+            let sent = rb.send().await;
             match sent {
                 Ok(r) if r.status().is_success() => break r,
                 Ok(r) => {
@@ -188,14 +194,16 @@ impl Client {
                         .get("retry-after")
                         .and_then(|h| h.to_str().ok())
                         .and_then(|s| s.parse::<u64>().ok());
-                    let transient = status.as_u16() == 429 || status.is_server_error();
+                    let text = r.text().await.unwrap_or_default();
+                    // A 429 for an exhausted quota/plan will not clear by waiting: fail at once.
+                    let quota = is_quota_error(&text);
+                    let transient = (status.as_u16() == 429 && !quota) || status.is_server_error();
                     if transient && attempt < 3 {
                         let wait = retry_after.unwrap_or(1 << attempt).min(30);
                         tokio::time::sleep(Duration::from_secs(wait)).await;
                         attempt += 1;
                         continue;
                     }
-                    let text = r.text().await.unwrap_or_default();
                     bail!("{} → {status}: {}", url, truncate(&text, 800));
                 }
                 Err(e) if (e.is_connect() || e.is_timeout()) && attempt < 3 => {
@@ -255,6 +263,21 @@ where
     .boxed()
 }
 
+/// Error bodies that mean "out of credit / limit reached" rather than "slow down".
+fn is_quota_error(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    [
+        "usagelimit",
+        "insufficient_quota",
+        "quota exceeded",
+        "insufficient credits",
+        "out of credits",
+        "limit reached",
+    ]
+    .iter()
+    .any(|k| b.contains(k))
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         s.to_owned()
@@ -266,6 +289,17 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quota_errors_are_not_retried() {
+        assert!(is_quota_error(
+            r#"{"error":{"type":"FreeUsageLimitError","message":"Free usage limit reached."}}"#
+        ));
+        assert!(is_quota_error(r#"{"error":{"code":"insufficient_quota"}}"#));
+        assert!(!is_quota_error(
+            r#"{"error":{"message":"Rate limit, slow down"}}"#
+        ));
+    }
 
     #[test]
     fn wire_selection_and_urls() {
