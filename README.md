@@ -53,8 +53,8 @@ Sessions are append-only JSONL files, one folder per project…
 
 **Packages** for x86-64 are attached to each
 [release](https://github.com/alextrevisan/magia/releases) as separate files; pick the one for
-your system. Every CI run also uploads them as three artifacts (`magia-deb`, `magia-rpm`,
-`magia-windows-installer`):
+your system. Every CI run also uploads them as three artifacts (`magia-deb-amd64`,
+`magia-rpm-x86_64`, `magia-windows-x86_64-installer`):
 
 | System | File | Install |
 |---|---|---|

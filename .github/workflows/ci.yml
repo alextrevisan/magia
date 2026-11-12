@@ -108,19 +108,19 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: runner.os == 'Linux'
         with:
-          name: magia-deb
+          name: magia-deb-amd64
           path: dist/magia_*.deb
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
         if: runner.os == 'Linux'
         with:
-          name: magia-rpm
+          name: magia-rpm-x86_64
           path: dist/magia-*.rpm
           if-no-files-found: error
       - uses: actions/upload-artifact@v7
         if: runner.os == 'Windows'
         with:
-          name: magia-windows-installer
+          name: magia-windows-x86_64-installer
           path: dist/magia-*-setup.exe
           if-no-files-found: error
 
