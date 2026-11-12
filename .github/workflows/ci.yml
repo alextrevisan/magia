@@ -45,8 +45,7 @@ jobs:
         run: test -z "$(grep -rE 'target-cpu|target-feature|x86-64-v' .cargo Cargo.toml 2>/dev/null)"
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # Release binaries and packages, uploaded as workflow artifacts: a .tar.gz, .deb and .rpm for
-  # Linux, a .zip and an installer for Windows.
+  # Packages, uploaded as three separate workflow artifacts: .deb, .rpm and the Windows installer.
   build:
     name: build (${{ matrix.name }})
     strategy:
@@ -85,24 +84,18 @@ jobs:
         run: |
           scripts/check-baseline.sh target/release/magia
           scripts/check-baseline.sh target/release/magia-gui
-      - name: Package
+      # Stripped copies of the binaries the packages are made from (not published on their own).
+      - name: Collect binaries
         shell: bash
         run: |
-          dir="magia-${{ matrix.name }}"
-          mkdir -p "$dir"
-          cp "target/release/magia${{ matrix.exe }}" "target/release/magia-gui${{ matrix.exe }}" "$dir/"
-          if [ "$RUNNER_OS" = Linux ]; then strip "$dir"/magia "$dir"/magia-gui; fi
-          cp README.md LICENSE docs/magia.example.jsonc "$dir/"
-          if [ "$RUNNER_OS" = Windows ]; then
-            7z a "$dir.zip" "$dir" >/dev/null
-          else
-            tar czf "$dir.tar.gz" "$dir"
-          fi
+          mkdir -p bin
+          cp "target/release/magia${{ matrix.exe }}" "target/release/magia-gui${{ matrix.exe }}" bin/
+          if [ "$RUNNER_OS" = Linux ]; then strip bin/magia bin/magia-gui; fi
       - name: .deb and .rpm
         if: runner.os == 'Linux'
         run: |
           sudo apt-get install -y rpm
-          packaging/linux-packages.sh magia-${{ matrix.name }} .
+          packaging/linux-packages.sh bin dist
       - name: Windows installer (Inno Setup)
         if: runner.os == 'Windows'
         shell: bash
@@ -110,19 +103,28 @@ jobs:
           choco install innosetup -y --no-progress
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" -Q "-DVersion=$version" \
-            "-DSrc=..\magia-${{ matrix.name }}" "-O.." packaging/magia.iss
+            "-DSrc=..\bin" "-O..\dist" packaging/magia.iss
+      # One artifact per package, so each user downloads only the one they need.
       - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
         with:
-          name: magia-${{ matrix.name }}
-          path: |
-            magia-${{ matrix.name }}.zip
-            magia-${{ matrix.name }}.tar.gz
-            magia_*.deb
-            magia-*.rpm
-            magia-*-setup.exe
+          name: magia-deb
+          path: dist/magia_*.deb
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: magia-rpm
+          path: dist/magia-*.rpm
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: magia-windows-installer
+          path: dist/magia-*-setup.exe
           if-no-files-found: error
 
-  # Pushing a tag like v0.1.0 publishes a GitHub release with both packages.
+  # Pushing a tag like v0.1.0 publishes a GitHub release with the three packages as separate files.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [check, build]

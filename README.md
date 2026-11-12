@@ -52,15 +52,15 @@ Sessions are append-only JSONL files, one folder per project…
 ## Install
 
 **Packages** for x86-64 are attached to each
-[release](https://github.com/alextrevisan/magia/releases), and every CI run uploads them as
-workflow artifacts:
+[release](https://github.com/alextrevisan/magia/releases) as separate files; pick the one for
+your system. Every CI run also uploads them as three artifacts (`magia-deb`, `magia-rpm`,
+`magia-windows-installer`):
 
 | System | File | Install |
 |---|---|---|
 | Debian, Ubuntu, Mint… | `magia_<version>_amd64.deb` | `sudo apt install ./magia_<version>_amd64.deb` |
 | Fedora, RHEL, openSUSE… | `magia-<version>-1.x86_64.rpm` | `sudo dnf install ./magia-<version>-1.x86_64.rpm` |
 | Windows | `magia-<version>-windows-x86_64-setup.exe` | run it (no admin rights needed) |
-| Any Linux / Windows | `magia-linux-x86_64.tar.gz`, `magia-windows-x86_64.zip` | unpack and run |
 
 The Linux packages install `magia` and `magia-gui` in `/usr/bin`, plus a menu entry and an
 icon. The Windows installer adds Magia to the Start menu, can put the `magia` command on your
