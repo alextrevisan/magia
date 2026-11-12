@@ -24,7 +24,7 @@ jobs:
     name: check (linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with: { components: "clippy, rustfmt" }
       - uses: Swatinem/rust-cache@v2
@@ -61,7 +61,7 @@ jobs:
             exe: ".exe"
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with: { key: "${{ matrix.name }}" }
@@ -105,19 +105,19 @@ jobs:
           "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" -Q "-DVersion=$version" \
             "-DSrc=..\bin" "-O..\dist" packaging/magia.iss
       # One artifact per package, so each user downloads only the one they need.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: runner.os == 'Linux'
         with:
           name: magia-deb
           path: dist/magia_*.deb
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: runner.os == 'Linux'
         with:
           name: magia-rpm
           path: dist/magia-*.rpm
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: runner.os == 'Windows'
         with:
           name: magia-windows-installer
@@ -132,15 +132,15 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # Package names carry the Cargo.toml version, so the tag has to match it.
       - name: Tag matches the version in Cargo.toml
         run: |
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           test "${GITHUB_REF_NAME}" = "v$version" || { echo "tag ${GITHUB_REF_NAME} != v$version (Cargo.toml)"; exit 1; }
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with: { path: dist, merge-multiple: true }
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
