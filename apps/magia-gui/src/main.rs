@@ -99,6 +99,10 @@ struct App {
     rx: UnboundedReceiver<UiMsg>,
     items: Vec<Item>,
     composer: composer::Composer,
+    /// Name of the open session (its first message), shown in the window title.
+    session_title: String,
+    /// Title last sent to the window, so it is only changed when it differs.
+    shown_title: String,
     /// The `/resume` picker, while open.
     resume: Option<resume::Picker>,
     running: bool,
@@ -182,6 +186,8 @@ impl App {
             items: vec![],
             composer: composer::Composer::default(),
             resume: None,
+            session_title: String::new(),
+            shown_title: APP_NAME.to_owned(),
             running: false,
             cancel: CancellationToken::new(),
             pending: None,
@@ -409,6 +415,11 @@ impl App {
     }
 
     fn reset_items(&mut self, history: &[Message]) {
+        // Resume, rewind and /clear all change which session (or how much of it) is open.
+        self.session_title = sent_messages(history)
+            .first()
+            .map(|t| magia_store::title_of(t))
+            .unwrap_or_default();
         self.items = items_from_history(history, &self.cwd);
         self.heights.clear();
         self.composer.load_history(sent_messages(history));
@@ -489,6 +500,7 @@ impl App {
             return;
         }
         self.composer.remember(&prompt);
+        let typed = prompt.clone();
         if prompt.starts_with('/') {
             if self.slash(&prompt, ctx) {
                 self.composer.input.clear();
@@ -512,6 +524,9 @@ impl App {
             return;
         }
         self.composer.input.clear();
+        if self.session_title.is_empty() {
+            self.session_title = magia_store::title_of(&typed);
+        }
         let images = self.composer.take_images();
         self.items.push(Item::User(
             prompt.clone(),
@@ -650,6 +665,11 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.drain(&ctx);
+        let title = window_title(&self.session_title);
+        if title != self.shown_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.shown_title = title;
+        }
         if self.running
             && self.pending.is_none()
             && self.question.is_none()
@@ -684,7 +704,7 @@ impl App {
                 ui.spacing_mut().interact_size.y = BAR_H;
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new("magia")
+                        egui::RichText::new(APP_NAME)
                             .font(theme::semibold(15.0))
                             .color(t.fg),
                     );
@@ -1068,6 +1088,25 @@ fn column<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     .inner
 }
 
+const APP_NAME: &str = "Magia";
+
+/// `Magia - <session>`, or just `Magia` before the first message.
+fn window_title(session: &str) -> String {
+    const MAX: usize = 60;
+    if session.is_empty() {
+        return APP_NAME.to_owned();
+    }
+    let name = if session.chars().count() > MAX {
+        format!(
+            "{}…",
+            session.chars().take(MAX).collect::<String>().trim_end()
+        )
+    } else {
+        session.to_owned()
+    };
+    format!("{APP_NAME} - {name}")
+}
+
 /// Height of the controls in the top bar.
 const BAR_H: f32 = 28.0;
 
@@ -1434,7 +1473,7 @@ fn main() {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 760.0])
             .with_min_inner_size([520.0, 420.0])
-            .with_title("magia"),
+            .with_title(APP_NAME),
         ..Default::default()
     };
     let result = fastframe_graphics::Graphics::new("magia").run_native(
@@ -1450,6 +1489,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_title_names_the_session() {
+        assert_eq!(window_title(""), "Magia");
+        assert_eq!(window_title("fix the parser"), "Magia - fix the parser");
+        let long = "a".repeat(100);
+        let t = window_title(&long);
+        assert!(
+            t.ends_with('…') && t.chars().count() == "Magia - ".len() + 61,
+            "{t}"
+        );
+    }
 
     #[test]
     fn sent_messages_are_what_the_user_typed() {

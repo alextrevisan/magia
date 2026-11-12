@@ -79,7 +79,8 @@ pub struct SessionMeta {
 
 const TITLE_CHARS: usize = 80;
 
-fn title_of(text: &str) -> String {
+/// One-line, truncated form of a first message: how sessions are named in lists.
+pub fn title_of(text: &str) -> String {
     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     if line.chars().count() > TITLE_CHARS {
         format!("{}…", line.chars().take(TITLE_CHARS).collect::<String>())
