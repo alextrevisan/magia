@@ -7,6 +7,10 @@
   // "provider/model". OpenRouter ids contain a slash, so: "openrouter/anthropic/claude-sonnet-4"
   "model": "zen/big-pickle",
 
+  // Agent to start with: "build" (default), "plan" (read-only) or a .md file in the project root
+  // (e.g. "FABLE.md"), whose text is added to the instructions. The GUI remembers its last pick.
+  "default_agent": "build",
+
   "provider": {
     // zen, go and openrouter are built in; override only what you need.
     "openrouter": {

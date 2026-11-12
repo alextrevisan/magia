@@ -15,6 +15,7 @@ mod markdown;
 mod resume;
 mod theme;
 
+use magia_core::agents::{self, FileAgent};
 use magia_core::{Agent, AgentEvent, Approver, Config, SlashEntry, slash_catalog};
 use magia_providers::Client;
 use magia_store::{SessionFile, sessions_dir};
@@ -28,6 +29,10 @@ enum UiMsg {
     Permission(ToolCall, Option<String>, tokio::sync::oneshot::Sender<bool>),
     Question(Question),
     Catalog(Vec<SlashEntry>),
+    /// Root `.md` files that can be picked as the agent.
+    Agents(Vec<FileAgent>),
+    /// A line for the status bar from a background task.
+    Status(String),
     /// Project files for the `@` autocomplete.
     Files(Vec<String>),
     /// Images read from the clipboard or from files, with their RGBA previews.
@@ -140,6 +145,10 @@ struct App {
     /// Created lazily (it starts a background runtime): only when the window is unfocused.
     notifier: Option<fastframe_notifications::Client>,
     todos: Arc<std::sync::Mutex<Vec<magia_tools::Todo>>>,
+    /// File agents of this folder (refreshed with the `/` catalog and when the picker opens).
+    agents: Vec<FileAgent>,
+    /// Mode to go back to when leaving the `plan` agent.
+    mode_before_plan: PermissionMode,
 }
 
 const PROVIDERS: [&str; 3] = ["zen", "go", "openrouter"];
@@ -194,6 +203,29 @@ impl App {
         let mut agent = Agent::new(client, cfg.model.clone(), cfg.permission_mode, cwd.clone());
         agent.configure(&cfg);
         agent.store = SessionFile::create_for(&sessions_dir(), &cwd).ok();
+        let mut status = status;
+        let mut cfg = cfg;
+        // Before the first frame, so reading the file here does not stall `update()`.
+        let file_agents = agents::discover_agents(&cwd);
+        match cfg.agent.as_str() {
+            agents::BUILD => {}
+            agents::PLAN => agent.mode = PermissionMode::Plan,
+            name => match file_agents.iter().find(|a| a.name == name) {
+                Some(fa) => match agents::load_agent(fa) {
+                    Ok(text) => agent.persona = Some((fa.name.clone(), text)),
+                    Err(e) => status = format!("{e:#}"),
+                },
+                // Last used in another folder: this one has no such file.
+                None => cfg.agent = agents::BUILD.into(),
+            },
+        }
+        let mode_before_plan = match cfg.permission_mode {
+            PermissionMode::Plan => PermissionMode::Ask,
+            m => m,
+        };
+        if cfg.agent == agents::PLAN {
+            cfg.permission_mode = PermissionMode::Plan;
+        }
         let todos = agent.cx.todos.clone();
         let (tx, rx) = unbounded_channel();
         let mut app = Self {
@@ -221,6 +253,8 @@ impl App {
             last_width: 0.0,
             notifier: None,
             todos,
+            agents: file_agents,
+            mode_before_plan,
         };
         app.refresh_models(&cc.egui_ctx);
         app.start_mcp(&cc.egui_ctx);
@@ -285,6 +319,42 @@ impl App {
         }
     }
 
+    /// Switch the primary agent. `plan` also switches the mode; a file agent's text is read off
+    /// the UI thread and handed to the agent.
+    fn select_agent(&mut self, name: String, ctx: &egui::Context) {
+        if name == agents::PLAN {
+            if self.cfg.permission_mode != PermissionMode::Plan {
+                self.mode_before_plan = self.cfg.permission_mode;
+            }
+            self.cfg.permission_mode = PermissionMode::Plan;
+        } else if self.cfg.agent == agents::PLAN && self.cfg.permission_mode == PermissionMode::Plan
+        {
+            self.cfg.permission_mode = self.mode_before_plan;
+        }
+        let file = self.agents.iter().find(|a| a.name == name).cloned();
+        self.cfg.agent = name;
+        // First: it takes the agent lock with `try_lock`, which the task below would hold.
+        self.apply_settings(ctx);
+        let (agent, tx, ctx2) = (self.agent.clone(), self.tx.clone(), ctx.clone());
+        self.rt.spawn(async move {
+            let persona = match file {
+                None => Ok(None),
+                Some(fa) => tokio::task::spawn_blocking(move || {
+                    agents::load_agent(&fa).map(|text| Some((fa.name, text)))
+                })
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!("{e}"))),
+            };
+            match persona {
+                Ok(p) => agent.lock().await.persona = p,
+                Err(e) => {
+                    let _ = tx.send(UiMsg::Status(format!("{e:#}")));
+                    ctx2.request_repaint();
+                }
+            }
+        });
+    }
+
     fn refresh_models(&mut self, ctx: &egui::Context) {
         let Ok(a) = self.agent.try_lock() else { return };
         let client = a.client.clone();
@@ -335,6 +405,7 @@ impl App {
         );
         self.rt.spawn_blocking(move || {
             let _ = tx.send(UiMsg::Catalog(slash_catalog(&cwd, BUILTINS, &cfg)));
+            let _ = tx.send(UiMsg::Agents(agents::discover_agents(&cwd)));
             ctx.request_repaint();
         });
     }
@@ -609,6 +680,8 @@ impl App {
                 UiMsg::Models(Ok(m)) => self.models = m,
                 UiMsg::Models(Err(e)) => self.status = format!("models: {e}"),
                 UiMsg::Catalog(c) => self.catalog = c,
+                UiMsg::Agents(a) => self.agents = a,
+                UiMsg::Status(s) => self.status = s,
                 UiMsg::Files(f) => self.files = f,
                 UiMsg::History(h) => self.composer.load_history(h),
                 UiMsg::Sessions(generation, hits) => {
@@ -802,6 +875,57 @@ impl App {
                             })
                             .0
                             .on_hover_text("Models offered by the provider");
+                        let mut picked = None;
+                        let opened = egui::ComboBox::from_id_salt("agent")
+                            .selected_text(
+                                egui::RichText::new(agent_label(&self.cfg.agent))
+                                    .font(theme::semibold(theme::SMALL + 1.0)),
+                            )
+                            .width(130.0)
+                            .show_ui(ui, |ui| {
+                                ui.set_min_width(220.0);
+                                for (name, help) in [
+                                    (agents::BUILD, "magia's own instructions"),
+                                    (agents::PLAN, "Read-only: switches the mode to Plan"),
+                                ] {
+                                    if ui
+                                        .selectable_label(self.cfg.agent == name, agent_label(name))
+                                        .on_hover_text(help)
+                                        .clicked()
+                                    {
+                                        picked = Some(name.to_owned());
+                                    }
+                                }
+                                if !self.agents.is_empty() {
+                                    ui.separator();
+                                }
+                                for a in &self.agents {
+                                    let label =
+                                        egui::RichText::new(&a.name).font(theme::mono(theme::MONO));
+                                    if ui
+                                        .selectable_label(self.cfg.agent == a.name, label)
+                                        .on_hover_text(file_agent_help(a))
+                                        .clicked()
+                                    {
+                                        picked = Some(a.name.clone());
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Agent: Build, Plan, or a .md file from the project root whose \
+                                 text is added to the instructions",
+                            )
+                            .clicked();
+                        if opened {
+                            self.refresh_catalog(ctx); // pick up .md files added since
+                        }
+                        if let Some(name) = picked
+                            && name != self.cfg.agent
+                        {
+                            self.select_agent(name, ctx);
+                        }
+                        let before = self.cfg.permission_mode;
                         let (mode_name, mode_color) = mode_style(self.cfg.permission_mode, &t);
                         egui::ComboBox::from_id_salt("mode")
                             .selected_text(
@@ -822,6 +946,17 @@ impl App {
                             })
                             .response
                             .on_hover_text(mode_help(self.cfg.permission_mode));
+                        if self.cfg.permission_mode != before {
+                            // The mode picker and the `plan` agent stay in step.
+                            if before == PermissionMode::Plan && self.cfg.agent == agents::PLAN {
+                                self.cfg.agent = agents::BUILD.into();
+                            } else if self.cfg.permission_mode == PermissionMode::Plan {
+                                self.mode_before_plan = before;
+                                if self.cfg.agent == agents::BUILD {
+                                    self.cfg.agent = agents::PLAN.into();
+                                }
+                            }
+                        }
                         if changed {
                             self.apply_settings(ctx);
                         }
@@ -1200,6 +1335,27 @@ fn mode_style(m: PermissionMode, t: &theme::Tokens) -> (&'static str, egui::Colo
         PermissionMode::Plan => ("Plan · read-only", t.accent),
         PermissionMode::Auto => ("Auto · reviewed", t.ok),
         PermissionMode::Yolo => ("Yolo · no prompts", t.danger),
+    }
+}
+
+fn agent_label(name: &str) -> &str {
+    match name {
+        agents::BUILD => "Build",
+        agents::PLAN => "Plan",
+        file => file,
+    }
+}
+
+fn file_agent_help(a: &FileAgent) -> String {
+    let size = format!(
+        "Adds {} to every request (≈ {} tokens)",
+        a.name,
+        theme::count(a.approx_tokens())
+    );
+    if a.description.is_empty() {
+        size
+    } else {
+        format!("{}\n{size}", a.description)
     }
 }
 

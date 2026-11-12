@@ -105,6 +105,12 @@ pub struct Agent {
     pub compact_at_tokens: u64,
     /// `auto` mode reviewer model (None = the session's model).
     pub auto_model: Option<String>,
+    /// Instructions of the selected file agent (`crate::agents`): (file name, text). They are
+    /// added after the base prompt; the subagent (`task`) does not get them.
+    pub persona: Option<(String, String)>,
+    /// The root file already added as project instructions (`AGENTS.md`/`CLAUDE.md`), so picking
+    /// it as the agent does not add it twice.
+    project_instructions: Option<&'static str>,
     /// `auto` mode: calls the reviewer already allowed in this session (tool + key).
     reviewed: std::sync::Mutex<std::collections::HashSet<String>>,
     last_input_tokens: u64,
@@ -117,6 +123,7 @@ impl Agent {
     pub fn new(client: Client, model: String, mode: PermissionMode, cwd: PathBuf) -> Self {
         let skills = discover_skills(&cwd);
         let mut system = build_system_prompt(&cwd);
+        let project_instructions = project_instructions_file(&cwd);
         let mut tools = Registry::builtin();
         if !skills.is_empty() {
             system.push_str("\n\n# Skills (load one with the `skill` tool when relevant)\n");
@@ -139,6 +146,8 @@ impl Agent {
             rules: RuleSet::default(),
             compact_at_tokens: 100_000,
             auto_model: None,
+            persona: None,
+            project_instructions,
             reviewed: Default::default(),
             last_input_tokens: 0,
             is_child: false,
@@ -243,8 +252,14 @@ impl Agent {
     /// The system prompt plus what the model cannot know on its own: which model it is and how
     /// it is being run. Built per request, since provider, model and mode can change mid-session.
     fn system_prompt(&self) -> String {
+        let persona = match &self.persona {
+            Some((name, text)) if Some(name.as_str()) != self.project_instructions => {
+                format!("\n\n# Agent instructions ({name})\n{text}")
+            }
+            _ => String::new(),
+        };
         format!(
-            "{}\n\n# This session\n- You are running in magia, a coding agent. It has two programs: the `magia` CLI and the desktop app `magia-gui`. When the user asks to open \"the GUI\", \"the app\" or magia itself, they mean `magia-gui`: start it detached in the working folder with `{}`, and do not look for other programs.\n- Model: `{}` via the `{}` provider. When asked which model you are, answer with this id.\n- Permission mode: `{}`.\n- Working folder: {}",
+            "{}{persona}\n\n# This session\n- You are running in magia, a coding agent. It has two programs: the `magia` CLI and the desktop app `magia-gui`. When the user asks to open \"the GUI\", \"the app\" or magia itself, they mean `magia-gui`: start it detached in the working folder with `{}`, and do not look for other programs.\n- Model: `{}` via the `{}` provider. When asked which model you are, answer with this id.\n- Permission mode: `{}`.\n- Working folder: {}",
             self.system,
             if cfg!(windows) {
                 "magia-gui &"
@@ -961,11 +976,17 @@ Use `todo` to plan multi-step work. Use `websearch`/`webfetch` for documentation
 and `question` only when the user must decide. Be concise.",
         cwd.display()
     );
-    for name in ["AGENTS.md", "CLAUDE.md"] {
-        if let Ok(text) = std::fs::read_to_string(cwd.join(name)) {
-            s.push_str(&format!("\n\n# Project instructions ({name})\n{text}"));
-            break;
-        }
+    if let Some(name) = project_instructions_file(cwd)
+        && let Ok(text) = std::fs::read_to_string(cwd.join(name))
+    {
+        s.push_str(&format!("\n\n# Project instructions ({name})\n{text}"));
     }
     s
+}
+
+/// `AGENTS.md`, else `CLAUDE.md`, if the project has one.
+fn project_instructions_file(cwd: &std::path::Path) -> Option<&'static str> {
+    ["AGENTS.md", "CLAUDE.md"]
+        .into_iter()
+        .find(|n| cwd.join(n).is_file())
 }

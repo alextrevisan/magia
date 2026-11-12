@@ -134,6 +134,7 @@ Options go anywhere in the line, as `--opt value` or `--opt=value`:
 | `--provider NAME` | `zen`, `go`, `openrouter`, or a provider from your config |
 | `--model ID` | model id (see `--models`) |
 | `--mode MODE` | `ask`, `accept_edits`, `auto`, `plan` or `yolo` |
+| `--agent NAME` | `build`, `plan` or a `.md` file in the project root (see [Agents](#agents)) |
 | `--resume` | continue this folder's most recent session |
 | `--session ID` | continue a session of this folder (id from `--sessions`) |
 | `--all` | with `--sessions`: every folder |
@@ -155,7 +156,7 @@ Tips:
   Tab or Enter to complete and Esc to close.
 - **Ctrl+V** pastes an image (or the path of a copied image file). You can also drop image files
   on the window.
-- The top bar sets the provider, model and permission mode. Approval requests and the model's
+- The top bar sets the provider, model, [agent](#agents) and permission mode. Approval requests and the model's
   questions open as dialogs, and you get a desktop notification when the window is not
   focused.
 - `magia-gui --resume` opens the folder's last session. The window title shows the session
@@ -284,6 +285,20 @@ in `~/.local/state/magia/state.json` and take precedence over the config's `mode
 If a model needs a different format, override it under `magia.wire_overrides`, for example
 `{"zen/some-model": "messages"}`. For custom providers, the `npm` package name picks the format
 the way OpenCode does: `@ai-sdk/anthropic` uses Messages and `@ai-sdk/openai` uses Responses.
+
+### Agents
+
+As in OpenCode, you switch between primary agents: **Build** (the default), **Plan** (read-only;
+it switches the mode to Plan) and one agent per Markdown file in the project root, such as
+`AGENTS.md` or `FABLE.md`. README, CHANGELOG, LICENSE, CONTRIBUTING and similar files are left
+out. Pick one in the GUI's top bar, with `--agent FABLE` in the CLI or with `default_agent` in
+the config; the GUI remembers the last choice.
+
+A file agent's text is **added** to magia's own instructions, so tool use and the session details
+keep working. A leading `---` frontmatter is dropped, and its `description` shows in the picker.
+The text goes into every request: the picker shows its size in tokens, and auto compaction counts
+only the conversation, never the fixed instructions. `AGENTS.md` (or `CLAUDE.md`) is always
+included as project instructions, so picking it as the agent adds nothing twice.
 
 ### Commands, skills and hooks
 

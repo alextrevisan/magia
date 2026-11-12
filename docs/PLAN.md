@@ -66,6 +66,7 @@ Agrupadas por prioridade para o magia:
 
 **Contexto e sessões**
 - Arquivo de instruções do projeto (`AGENTS.md`, com fallback para `CLAUDE.md`) injetado no system prompt.
+- Agentes primários estilo OpenCode: *Build*, *Plan* e um por `.md` da raiz do projeto (menos README/LICENSE/…), cujo texto é **acrescentado** ao prompt base; seletor na GUI, `--agent` no CLI, `default_agent` na config. A compactação automática desconta o prompt fixo.
 - Persistência de sessões, retomar, bifurcar (fork) a partir de qualquer mensagem.
 - Compactação automática (resumo do histórico ao se aproximar do limite de contexto) + compactação manual.
 - Prompt caching (`cache_control` no formato Anthropic; OpenRouter repassa).

@@ -820,3 +820,30 @@ async fn the_model_is_told_which_model_and_mode_it_runs_as() {
         "the model knows what \"the GUI\" is"
     );
 }
+
+#[tokio::test]
+async fn a_file_agent_is_added_to_the_instructions_once() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("AGENTS.md"), "PROJECT RULES").unwrap();
+    let (url, server) = serve(vec![text_reply("a"), text_reply("b"), text_reply("c")]).await;
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Ask,
+        dir.path().into(),
+    );
+    agent.persona = Some(("FABLE.md".into(), "YOU ARE FABLE".into()));
+    run(&mut agent, "one").await;
+    // Picking the file that already is the project instructions adds nothing more.
+    agent.persona = Some(("AGENTS.md".into(), "PROJECT RULES".into()));
+    run(&mut agent, "two").await;
+    agent.persona = None;
+    run(&mut agent, "three").await;
+    let bodies = server.await.unwrap();
+    let base = bodies[0].find("You are magia").expect("base prompt kept");
+    let fable = bodies[0].find("YOU ARE FABLE").expect("agent text sent");
+    assert!(base < fable, "added after magia's own prompt");
+    assert!(bodies[0].contains("Agent instructions (FABLE.md)"));
+    assert_eq!(bodies[1].matches("PROJECT RULES").count(), 1);
+    assert!(!bodies[2].contains("YOU ARE FABLE") && bodies[2].contains("PROJECT RULES"));
+}

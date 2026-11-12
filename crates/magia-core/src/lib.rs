@@ -1,6 +1,7 @@
 //! Agent loop, configuration, hooks, skills and sessions. Must not depend on any UI crate.
 
 mod agent;
+pub mod agents;
 mod config;
 mod ext;
 mod hooks;

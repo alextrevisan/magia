@@ -1942,6 +1942,7 @@ dependencies = [
  "magia-tools",
  "magia-types",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
 ]

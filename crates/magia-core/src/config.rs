@@ -40,6 +40,9 @@ pub struct Config {
     pub provider: String,
     pub model: String,
     pub permission_mode: PermissionMode,
+    /// Primary agent: `build`, `plan` or a root `.md` file name (`crate::agents`).
+    /// From OpenCode's `default_agent`, then the last GUI choice.
+    pub agent: String,
     pub providers: HashMap<String, ProviderOverride>,
     /// Compact the conversation when it nears this many tokens (0 = never). Default 100k.
     pub compact_at_tokens: u64,
@@ -66,6 +69,7 @@ impl Default for Config {
             provider: "zen".into(),
             model: String::new(),
             permission_mode: PermissionMode::Ask,
+            agent: crate::agents::BUILD.into(),
             providers: HashMap::new(),
             compact_at_tokens: 100_000,
             sandbox: false,
@@ -169,6 +173,10 @@ impl Config {
                 }
             }
             _ => {}
+        }
+
+        if let Some(a) = str_of(v.get("default_agent")) {
+            cfg.agent = a;
         }
 
         // providers (new key `providers`, legacy `provider`)
@@ -392,6 +400,9 @@ impl Config {
         {
             self.permission_mode = m;
         }
+        if let Some(a) = v.get("agent").and_then(Value::as_str) {
+            self.agent = a.to_owned();
+        }
     }
 
     pub fn save_state(&self) -> Result<()> {
@@ -399,7 +410,12 @@ impl Config {
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p)?;
         }
-        let v = serde_json::json!({"provider": self.provider, "model": self.model, "permission_mode": self.permission_mode});
+        let v = serde_json::json!({
+            "provider": self.provider,
+            "model": self.model,
+            "permission_mode": self.permission_mode,
+            "agent": self.agent,
+        });
         std::fs::write(path, serde_json::to_string_pretty(&v)?)?;
         Ok(())
     }

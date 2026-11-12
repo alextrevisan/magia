@@ -2,7 +2,7 @@
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
-use magia_core::{Agent, AgentEvent, Approver, Config};
+use magia_core::{Agent, AgentEvent, Approver, Config, agents};
 use magia_providers::Client;
 use magia_store::{SessionFile, sessions_dir};
 use magia_types::ToolCall;
@@ -51,6 +51,8 @@ OPTIONS (anywhere, --opt value or --opt=value):
   --model ID        model id                                       (default: config)
   --mode MODE       ask | accept_edits | auto | plan | yolo        (default: config / ask)
                     auto: routine work runs, a reviewer model checks the rest, risky asks
+  --agent NAME      build | plan | a .md file in the project root, e.g. FABLE.md: its text is
+                    added to the instructions                      (default: config / build)
   --resume          continue this folder's most recent session
   --session ID      continue a session of this folder (id from --sessions)
   --all             with --sessions: every folder
@@ -189,6 +191,7 @@ async fn real_main() -> Result<()> {
             return Ok(());
         }
     }
+    let persona = pick_agent(&mut cfg, args.agent.as_deref(), args.mode.is_some(), &cwd)?;
     let client = Client::new(cfg.provider_config(&cfg.provider)?)?;
     if let Some(expanded) = magia_core::expand_command(&cwd, &prompt, &cfg.commands) {
         prompt = expanded; // custom slash command from .magia/commands
@@ -229,6 +232,7 @@ async fn real_main() -> Result<()> {
         None
     };
     agent.configure(&cfg);
+    agent.persona = persona;
     for e in agent.connect_mcp(&cfg.mcp).await {
         eprintln!("mcp: {e}");
     }
@@ -364,6 +368,38 @@ impl Cmd {
     }
 }
 
+/// Resolve the agent (`--agent`, else the config/GUI choice). `plan` switches to the Plan mode
+/// unless only the saved choice asks for it and `--mode` says otherwise; a file agent returns
+/// its instructions. An unknown `--agent` is an error; an unknown saved one (picked in another
+/// folder) falls back to `build`.
+fn pick_agent(
+    cfg: &mut Config,
+    flag: Option<&str>,
+    mode_flag: bool,
+    cwd: &std::path::Path,
+) -> Result<Option<(String, String)>> {
+    let name = flag.unwrap_or(&cfg.agent).trim().to_owned();
+    match name.to_ascii_lowercase().as_str() {
+        agents::BUILD => return Ok(None),
+        agents::PLAN => {
+            if flag.is_some() || !mode_flag {
+                cfg.permission_mode = magia_tools::PermissionMode::Plan;
+            }
+            return Ok(None);
+        }
+        _ => {}
+    }
+    match agents::find_agent(cwd, &name) {
+        Some(fa) => Ok(Some((fa.name.clone(), agents::load_agent(&fa)?))),
+        None if flag.is_some() => {
+            let mut names = vec![agents::BUILD.to_owned(), agents::PLAN.to_owned()];
+            names.extend(agents::discover_agents(cwd).into_iter().map(|a| a.name));
+            bail!("no agent `{name}` here; available: {}", names.join(", "))
+        }
+        None => Ok(None),
+    }
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Args {
     cmd: Cmd,
@@ -372,6 +408,7 @@ struct Args {
     provider: Option<String>,
     model: Option<String>,
     mode: Option<String>,
+    agent: Option<String>,
     resume: bool,
     session: Option<String>,
     all: bool,
@@ -407,7 +444,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
                 a.all = true;
                 None
             }
-            "--provider" | "--model" | "--mode" | "--session" => {
+            "--provider" | "--model" | "--mode" | "--agent" | "--session" => {
                 let v = match inline {
                     Some(v) => v,
                     None => it
@@ -418,6 +455,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args> {
                     "--provider" => &mut a.provider,
                     "--model" => &mut a.model,
                     "--mode" => &mut a.mode,
+                    "--agent" => &mut a.agent,
                     _ => &mut a.session,
                 };
                 *slot = Some(v);
@@ -448,6 +486,35 @@ mod tests {
 
     fn parse(s: &[&str]) -> Result<Args> {
         parse_args(s.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn agent_flag_picks_a_root_file_or_plan() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("FABLE.md"),
+            "---\ndescription: x\n---\nbe fable",
+        )
+        .unwrap();
+        let mut cfg = Config::default();
+        let p = pick_agent(&mut cfg, Some("fable"), false, d.path()).unwrap();
+        assert_eq!(p, Some(("FABLE.md".into(), "be fable".into())));
+        let err = pick_agent(&mut cfg, Some("nope"), false, d.path()).unwrap_err();
+        assert!(err.to_string().contains("FABLE.md"), "{err}");
+        // A saved choice from another folder is ignored.
+        cfg.agent = "OTHER.md".into();
+        assert_eq!(pick_agent(&mut cfg, None, false, d.path()).unwrap(), None);
+        // plan switches the mode, unless --mode was given for a saved plan choice.
+        cfg.agent = "plan".into();
+        cfg.permission_mode = magia_tools::PermissionMode::Yolo;
+        pick_agent(&mut cfg, None, true, d.path()).unwrap();
+        assert_eq!(cfg.permission_mode, magia_tools::PermissionMode::Yolo);
+        pick_agent(&mut cfg, None, false, d.path()).unwrap();
+        assert_eq!(cfg.permission_mode, magia_tools::PermissionMode::Plan);
+        assert_eq!(
+            parse(&["--agent=plan", "x"]).unwrap().agent.as_deref(),
+            Some("plan")
+        );
     }
 
     #[test]
