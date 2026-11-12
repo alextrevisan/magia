@@ -1932,7 +1932,7 @@ dependencies = [
 
 [[package]]
 name = "magia-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1949,7 +1949,7 @@ dependencies = [
 
 [[package]]
 name = "magia-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1972,7 +1972,7 @@ dependencies = [
 
 [[package]]
 name = "magia-gui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1997,7 +1997,7 @@ dependencies = [
 
 [[package]]
 name = "magia-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2009,7 +2009,7 @@ dependencies = [
 
 [[package]]
 name = "magia-providers"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2023,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "magia-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "magia-types",
@@ -2034,7 +2034,7 @@ dependencies = [
 
 [[package]]
 name = "magia-tools"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2052,7 +2052,7 @@ dependencies = [
 
 [[package]]
 name = "magia-types"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
