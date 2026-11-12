@@ -102,8 +102,11 @@ jobs:
         run: |
           choco install innosetup -y --no-progress
           version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          # Absolute paths: ISCC resolves -O against the current directory, not the script's.
+          mkdir -p dist
           "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" -Q "-DVersion=$version" \
-            "-DSrc=..\bin" "-O..\dist" packaging/magia.iss
+            "-DSrc=$(cygpath -w "$PWD/bin")" "-O$(cygpath -w "$PWD/dist")" packaging/magia.iss
+          ls -la dist
       # One artifact per package, so each user downloads only the one they need.
       - uses: actions/upload-artifact@v7
         if: runner.os == 'Linux'
