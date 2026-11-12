@@ -6,6 +6,7 @@ mod ext;
 mod hooks;
 mod jsonc;
 pub mod media;
+pub mod review;
 
 pub use agent::{Agent, AgentEvent, Approver, AutoApprove, UserInput, build_system_prompt};
 pub use config::{Config, ProviderOverride, config_dir, config_path};

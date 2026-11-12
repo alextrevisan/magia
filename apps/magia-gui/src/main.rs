@@ -21,7 +21,8 @@ use magia_types::{Image, Message, ToolCall};
 enum UiMsg {
     Agent(AgentEvent),
     Models(Result<Vec<String>, String>),
-    Permission(ToolCall, tokio::sync::oneshot::Sender<bool>),
+    /// A call to approve, with the reason when `auto` mode flagged it.
+    Permission(ToolCall, Option<String>, tokio::sync::oneshot::Sender<bool>),
     Question(Question),
     Catalog(Vec<SlashEntry>),
     /// Images read from the clipboard or from files, with their RGBA previews.
@@ -68,7 +69,18 @@ struct GuiApprover {
 impl Approver for GuiApprover {
     async fn approve(&self, call: &ToolCall) -> bool {
         let (reply, answer) = tokio::sync::oneshot::channel();
-        let _ = self.tx.send(UiMsg::Permission(call.clone(), reply));
+        let _ = self.tx.send(UiMsg::Permission(call.clone(), None, reply));
+        self.ctx.request_repaint();
+        answer.await.unwrap_or(false)
+    }
+
+    async fn approve_because(&self, call: &ToolCall, reason: &str) -> bool {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let _ = self.tx.send(UiMsg::Permission(
+            call.clone(),
+            Some(reason.to_owned()),
+            reply,
+        ));
         self.ctx.request_repaint();
         answer.await.unwrap_or(false)
     }
@@ -107,7 +119,7 @@ struct App {
     resume: Option<resume::Picker>,
     running: bool,
     cancel: CancellationToken,
-    pending: Option<(ToolCall, tokio::sync::oneshot::Sender<bool>)>,
+    pending: Option<(ToolCall, Option<String>, tokio::sync::oneshot::Sender<bool>)>,
     /// Open question from the model and the user's typed answer.
     question: Option<(Question, String)>,
     /// `/` autocomplete: everything available (refreshed off the UI thread when the popup opens).
@@ -124,9 +136,10 @@ struct App {
 }
 
 const PROVIDERS: [&str; 3] = ["zen", "go", "openrouter"];
-const MODES: [(PermissionMode, &str); 4] = [
+const MODES: [(PermissionMode, &str); 5] = [
     (PermissionMode::Ask, "ask"),
     (PermissionMode::AcceptEdits, "accept edits"),
+    (PermissionMode::Auto, "auto (reviewed)"),
     (PermissionMode::Plan, "plan (read-only)"),
     (PermissionMode::Yolo, "yolo"),
 ];
@@ -600,9 +613,9 @@ impl App {
                     self.question = Some((q, String::new()));
                     self.notify(ctx, "magia has a question", &body);
                 }
-                UiMsg::Permission(call, reply) => {
+                UiMsg::Permission(call, reason, reply) => {
                     let body = format!("run `{}`?", call.name);
-                    self.pending = Some((call, reply));
+                    self.pending = Some((call, reason, reply));
                     self.notify(ctx, "magia needs your approval", &body);
                 }
                 UiMsg::Agent(ev) => match ev {
@@ -1012,7 +1025,7 @@ impl App {
     }
 
     fn permission_modal(&mut self, ctx: &egui::Context) {
-        let Some((call, _)) = &self.pending else {
+        let Some((call, reason, _)) = &self.pending else {
             return;
         };
         let mut answer = None;
@@ -1036,6 +1049,14 @@ impl App {
                     egui::RichText::new(&summary)
                         .font(theme::mono(theme::MONO))
                         .color(t.muted),
+                );
+            }
+            if let Some(reason) = reason {
+                ui.add_space(2.0);
+                ui.label(
+                    egui::RichText::new(format!("Auto mode: {reason}"))
+                        .size(theme::SMALL)
+                        .color(t.warn),
                 );
             }
             ui.add_space(4.0);
@@ -1064,7 +1085,7 @@ impl App {
             });
         });
         if let Some(a) = answer
-            && let Some((_, reply)) = self.pending.take()
+            && let Some((_, _, reply)) = self.pending.take()
         {
             let _ = reply.send(a);
         }
@@ -1115,6 +1136,7 @@ fn mode_style(m: PermissionMode, t: &theme::Tokens) -> (&'static str, egui::Colo
         PermissionMode::Ask => ("Ask first", t.fg),
         PermissionMode::AcceptEdits => ("Accept edits", t.warn),
         PermissionMode::Plan => ("Plan · read-only", t.accent),
+        PermissionMode::Auto => ("Auto · reviewed", t.ok),
         PermissionMode::Yolo => ("Yolo · no prompts", t.danger),
     }
 }
@@ -1126,6 +1148,9 @@ fn mode_help(m: PermissionMode) -> &'static str {
             "Edits files without asking; still asks for commands and web access"
         }
         PermissionMode::Plan => "Reads and plans only: no edits or commands",
+        PermissionMode::Auto => {
+            "Runs routine work on its own; a reviewer checks the rest and asks you when something looks risky"
+        }
         PermissionMode::Yolo => "Runs everything without asking",
     }
 }

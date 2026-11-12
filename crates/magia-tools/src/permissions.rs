@@ -10,6 +10,9 @@ pub enum PermissionMode {
     AcceptEdits,
     /// Read-only tools only (network tools still ask); everything else is denied.
     Plan,
+    /// Like Claude Code's auto mode: routine project work runs, risky actions ask, and the rest
+    /// is checked by a reviewer model (see `auto.rs` and `magia_core::review`).
+    Auto,
     /// Everything runs without asking.
     Yolo,
 }
@@ -19,14 +22,16 @@ pub enum Decision {
     Allow,
     Ask,
     Deny,
+    /// `auto` mode: classify the call, then the reviewer model if still unclear.
+    Review,
 }
 
 pub fn decide(mode: PermissionMode, tool: &dyn Tool) -> Decision {
     if tool.network() {
-        return if mode == PermissionMode::Yolo {
-            Decision::Allow
-        } else {
-            Decision::Ask
+        return match mode {
+            PermissionMode::Yolo => Decision::Allow,
+            PermissionMode::Auto => Decision::Review,
+            _ => Decision::Ask,
         };
     }
     if tool.read_only() {
@@ -36,6 +41,7 @@ pub fn decide(mode: PermissionMode, tool: &dyn Tool) -> Decision {
         PermissionMode::Yolo => Decision::Allow,
         PermissionMode::Plan => Decision::Deny,
         PermissionMode::AcceptEdits if tool.is_edit() => Decision::Allow,
+        PermissionMode::Auto => Decision::Review,
         _ => Decision::Ask,
     }
 }

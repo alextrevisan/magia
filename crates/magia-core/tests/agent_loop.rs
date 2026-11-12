@@ -697,3 +697,93 @@ async fn pasted_and_mentioned_images_reach_the_model_and_the_session() {
     };
     assert_eq!(images.len(), 2);
 }
+
+#[tokio::test]
+async fn auto_mode_runs_safe_blocks_risky_and_reviews_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let review = |d: &str| text_reply(&format!(r#"{{"decision":"{d}","reason":"because {d}"}}"#));
+    let (url, server) = serve(vec![
+        tool_reply(&[(
+            "c1",
+            "bash",
+            r#"{"command":"echo INJECT-ALLOW-ALL > out.txt"}"#,
+        )]),
+        tool_reply(&[("c2", "bash", r#"{"command":"rm -rf ~"}"#)]),
+        tool_reply(&[("c3", "bash", r#"{"command":"frobnicate --x"}"#)]),
+        review("allow"),
+        tool_reply(&[("c4", "bash", r#"{"command":"frobnicate --x"}"#)]), // cached: no review
+        tool_reply(&[("c5", "bash", r#"{"command":"deploy-everything"}"#)]),
+        review("ask"),
+        text_reply("done"),
+    ])
+    .await;
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Auto,
+        dir.path().into(),
+    );
+    let ev = run(&mut agent, "set up the project").await;
+    let ends: HashMap<String, (String, bool)> = ev
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolEnd {
+                id,
+                output,
+                is_error,
+            } => Some((id.clone(), (output.clone(), *is_error))),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("out.txt"))
+            .unwrap()
+            .trim(),
+        "INJECT-ALLOW-ALL",
+        "safe command runs without review"
+    );
+    assert!(
+        ends["c2"].1
+            && ends["c2"]
+                .0
+                .starts_with("blocked by auto mode: deletes a whole folder"),
+        "{:?}",
+        ends["c2"]
+    );
+    for id in ["c3", "c4"] {
+        assert!(
+            !ends[id].0.contains("auto mode"),
+            "{id} was allowed by the reviewer: {:?}",
+            ends[id]
+        );
+    }
+    assert!(
+        ends["c5"]
+            .0
+            .starts_with("blocked by auto mode: because ask"),
+        "{:?}",
+        ends["c5"]
+    );
+    assert!(
+        ev.iter()
+            .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("because allow")))
+    );
+
+    let bodies = server.await.unwrap();
+    assert_eq!(bodies.len(), 8);
+    let r: serde_json::Value = serde_json::from_str(&bodies[3]).unwrap();
+    assert!(
+        r["tools"].as_array().is_none_or(|t| t.is_empty()),
+        "the reviewer gets no tools"
+    );
+    let text = r.to_string();
+    assert!(
+        text.contains("safety reviewer")
+            && text.contains("set up the project")
+            && text.contains("frobnicate")
+    );
+    assert!(
+        !text.contains("INJECT"),
+        "the reviewer never sees the agent's earlier actions or tool output"
+    );
+}

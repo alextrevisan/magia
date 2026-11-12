@@ -45,6 +45,8 @@ pub struct Config {
     pub compact_at_tokens: u64,
     /// Run `bash` inside bubblewrap (read-only FS except the project dir) when installed.
     pub sandbox: bool,
+    /// `auto` mode: model id that reviews unclear tool calls (default: the session's model).
+    pub auto_model: Option<String>,
     pub hooks: Vec<HookConfig>,
     pub mcp: Vec<McpServerConfig>,
     pub rules: RuleSet,
@@ -67,6 +69,7 @@ impl Default for Config {
             providers: HashMap::new(),
             compact_at_tokens: 100_000,
             sandbox: false,
+            auto_model: None,
             hooks: vec![],
             mcp: vec![],
             rules: RuleSet::default(),
@@ -314,6 +317,13 @@ impl Config {
             cfg.compact_at_tokens = n;
         }
         cfg.sandbox = u.get("sandbox").and_then(Value::as_bool).unwrap_or(false);
+        if let Some(m) = u
+            .get("auto_model")
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty())
+        {
+            cfg.auto_model = Some(m.to_owned());
+        }
         if let Some(h) = u
             .get("hooks")
             .and_then(|h| serde_json::from_value(h.clone()).ok())

@@ -6,6 +6,7 @@ use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, FutureExt, join_all};
 use magia_providers::Client;
 use magia_store::SessionFile;
+use magia_tools::auto::Verdict;
 use magia_tools::{Decision, Effect, PermissionMode, Registry, RuleSet, Tool, ToolCx, decide};
 use magia_types::{ChatRequest, Image, Message, StreamEvent, ToolCall, ToolSpec, Usage};
 use serde_json::{Value, json};
@@ -39,6 +40,10 @@ pub enum AgentEvent {
 #[async_trait]
 pub trait Approver: Send + Sync {
     async fn approve(&self, call: &ToolCall) -> bool;
+    /// Like `approve`, with the reason `auto` mode flagged the call (shown to the user).
+    async fn approve_because(&self, call: &ToolCall, _reason: &str) -> bool {
+        self.approve(call).await
+    }
     /// Ask the user a question (from the `question` tool). `None` = no answer / not interactive.
     async fn ask(&self, _question: &str, _options: &[String]) -> Option<String> {
         None
@@ -98,6 +103,10 @@ pub struct Agent {
     pub rules: RuleSet,
     /// Compact when the context nears this many tokens (0 = never).
     pub compact_at_tokens: u64,
+    /// `auto` mode reviewer model (None = the session's model).
+    pub auto_model: Option<String>,
+    /// `auto` mode: calls the reviewer already allowed in this session (tool + key).
+    reviewed: std::sync::Mutex<std::collections::HashSet<String>>,
     last_input_tokens: u64,
     is_child: bool,
     /// Used as the session id when there is no session file (tests, subagents).
@@ -129,6 +138,8 @@ impl Agent {
             hooks: Hooks::default(),
             rules: RuleSet::default(),
             compact_at_tokens: 100_000,
+            auto_model: None,
+            reviewed: Default::default(),
             last_input_tokens: 0,
             is_child: false,
             fallback_session: new_session_id(),
@@ -141,6 +152,7 @@ impl Agent {
         self.compact_at_tokens = cfg.compact_at_tokens;
         self.cx.sandbox = cfg.sandbox;
         self.rules = cfg.rules.clone();
+        self.auto_model = cfg.auto_model.clone();
         self.add_instructions(&cfg.instructions);
     }
 
@@ -421,7 +433,65 @@ It can read/search the project but not modify it; it returns a concise report."
         }
         self.tools
             .get(&call.name)
-            .is_some_and(|t| self.decision(call, t) == Decision::Allow)
+            .is_some_and(|t| match self.decision(call, t) {
+                Decision::Allow => true,
+                Decision::Review => {
+                    magia_tools::auto::classify(&call.name, &call.arguments, &self.cx.cwd)
+                        == Verdict::Safe
+                }
+                _ => false,
+            })
+    }
+
+    /// `auto` mode: run safe calls, ask about risky ones, let the reviewer settle the rest.
+    /// `Err` carries the message returned to the model when the call may not run.
+    async fn auto_check(
+        &self,
+        call: &ToolCall,
+        events: &UnboundedSender<AgentEvent>,
+        approver: &dyn Approver,
+    ) -> Result<(), String> {
+        let reason = match magia_tools::auto::classify(&call.name, &call.arguments, &self.cx.cwd) {
+            Verdict::Safe => return Ok(()),
+            Verdict::Risky(why) => why,
+            Verdict::Unsure => {
+                let key = format!("{}\u{0}{}", call.name, call.arguments);
+                if self.reviewed.lock().is_ok_and(|r| r.contains(&key)) {
+                    return Ok(());
+                }
+                let model = self.auto_model.as_deref().unwrap_or(&self.model);
+                let r = crate::review::review(
+                    &self.client,
+                    model,
+                    &crate::review::user_requests(&self.history),
+                    call,
+                    &self.cx.cwd,
+                    self.session_id(),
+                )
+                .await;
+                if r.allow {
+                    if let Ok(mut set) = self.reviewed.lock() {
+                        set.insert(key);
+                    }
+                    let _ =
+                        events.send(AgentEvent::Notice(format!("auto: allowed — {}", r.reason)));
+                    return Ok(());
+                }
+                r.reason
+            }
+        };
+        if !approver.interactive() {
+            return Err(format!(
+                "blocked by auto mode: {reason}. Do not retry it another way; tell the user what you wanted to run and why, so they can run it or switch mode."
+            ));
+        }
+        if approver.approve_because(call, &reason).await {
+            Ok(())
+        } else {
+            Err(format!(
+                "the user denied this tool call (auto mode flagged it: {reason})"
+            ))
+        }
     }
 
     /// Keep the history valid after cancellation: every tool call needs a result.
@@ -533,6 +603,11 @@ It can read/search the project but not modify it; it returns a concise report."
                 }
                 Decision::Ask if !approver.approve(call).await => {
                     return ("the user denied this tool call".into(), true);
+                }
+                Decision::Review => {
+                    if let Err(msg) = self.auto_check(call, events, approver).await {
+                        return (msg, true);
+                    }
                 }
                 _ => {}
             }

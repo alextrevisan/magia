@@ -49,7 +49,8 @@ USAGE:
 OPTIONS (anywhere, --opt value or --opt=value):
   --provider NAME   zen | go | openrouter | <custom from config>   (default: config / zen)
   --model ID        model id                                       (default: config)
-  --mode MODE       ask | accept_edits | plan | yolo               (default: config / ask)
+  --mode MODE       ask | accept_edits | auto | plan | yolo        (default: config / ask)
+                    auto: routine work runs, a reviewer model checks the rest, risky asks
   --resume          continue this folder's most recent session
   --session ID      continue a session of this folder (id from --sessions)
   --all             with --sessions: every folder
@@ -72,6 +73,11 @@ impl Approver for StdinApprover {
         })
         .await
         .unwrap_or(false)
+    }
+
+    async fn approve_because(&self, call: &ToolCall, reason: &str) -> bool {
+        eprint!("\n! auto mode: {reason}");
+        self.approve(call).await
     }
 
     async fn ask(&self, question: &str, options: &[String]) -> Option<String> {
@@ -136,7 +142,7 @@ async fn real_main() -> Result<()> {
     }
     if let Some(m) = &args.mode {
         cfg.permission_mode = serde_json::from_value(serde_json::Value::String(m.clone()))
-            .map_err(|_| anyhow::anyhow!("--mode must be ask, accept_edits, plan or yolo"))?;
+            .map_err(|_| anyhow::anyhow!("--mode must be ask, accept_edits, auto, plan or yolo"))?;
     }
     let cwd = std::env::current_dir()?;
     let words = args.words.join(" ");

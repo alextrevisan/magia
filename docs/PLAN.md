@@ -60,7 +60,7 @@ Agrupadas por prioridade para o magia:
 - Loop agêntico: modelo → tool calls (inclusive paralelas) → resultados → modelo, até `stop`.
 - Streaming token a token (SSE), com cancelamento (Esc/stop) a qualquer momento.
 - Ferramentas básicas: `read`, `write`, `edit` (substituição exata de string), `bash` (com timeout e saída truncada), `grep`, `glob`, `ls`, `webfetch`, `todo`.
-- Sistema de permissões: regras allow/ask/deny por ferramenta + padrão (ex.: `bash(git status*)`), modos *ask*, *auto-edit*, *plan* (somente leitura) e *yolo*.
+- Sistema de permissões: regras allow/ask/deny por ferramenta + padrão (ex.: `bash(git status*)`), modos *ask*, *auto-edit*, *auto* (estilo auto mode do Claude Code: classificador local + modelo revisor), *plan* (somente leitura) e *yolo*.
 - Troca de provedor/modelo no meio da sessão; seletor de esforço de raciocínio.
 - Contagem de tokens e custo por turno/sessão.
 
@@ -215,7 +215,7 @@ Requisitos: **Rust 1.98+** e **egui/eframe 0.36.2** (exigidos pelo fastframe), e
 |---|---|
 | F0 Esqueleto | ✅ workspace, config JSON/JSONC (compatível com OpenCode), eframe `glow` + fastframe-fonts/text/graphics/notifications (sem wgpu), CI em `.github/workflows/ci.yml` |
 | F1 Chat | ✅ 3 wires + SSE + retry + prompt caching (Messages); `/models` validado contra Zen, Go e OpenRouter reais; **chat real não testado (sem API key)** — coberto por fixtures e servidor falso |
-| F2 Agente | ✅ read/write/edit/bash/ls/glob/grep/todo, modos ask/accept_edits/plan/yolo, aprovação na GUI/CLI, cancelamento, leituras em paralelo |
+| F2 Agente | ✅ read/write/edit/bash/ls/glob/grep/todo, modos ask/accept_edits/auto/plan/yolo, aprovação na GUI/CLI, cancelamento, leituras em paralelo |
 | F3 Contexto | ✅ sessões JSONL por pasta + `/resume` com seletor e busca (todas as pastas; só restaura na própria) + fork, `AGENTS.md`/`CLAUDE.md`, `@arquivo`, imagens (Ctrl+V, arrastar, `@foto.png`; testado no Go com kimi-k3, claude-haiku-5-5, gpt-5.6-luna), compactação automática e `/compact`, GUI virtualizada. Fora: custo em $ (Zen não publica preços em `/models`), histórico paginado do disco (a GUI ainda mantém o transcript em RAM; só o desenho é virtualizado) |
 | F4 Extensões | ✅ MCP stdio, skills, slash commands (com autocomplete `/` na GUI e `magia --commands` no CLI), hooks |
 | F5 Avançado | ✅ subagente `task`, checkpoints + `/rewind` (só `write`/`edit`; `bash` não é rastreado), sandbox `bwrap`, CLI headless. Fora: diff visual antes de aplicar edição |

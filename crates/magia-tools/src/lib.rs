@@ -1,5 +1,6 @@
 //! Tool trait, built-in tools and the permission engine.
 
+pub mod auto;
 mod builtin;
 mod checkpoint;
 mod permissions;
