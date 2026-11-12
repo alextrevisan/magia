@@ -714,6 +714,7 @@ impl eframe::App for App {
         self.resume_picker(&ctx);
         self.top_bar(ui, &ctx);
         self.composer_panel(ui, &ctx);
+        self.tasks_panel(ui);
         self.transcript(ui);
         self.question_modal(&ctx);
         self.permission_modal(&ctx);
@@ -931,6 +932,44 @@ impl App {
             });
     }
 
+    fn tasks_on_side(&self, ctx: &egui::Context) -> bool {
+        ctx.content_rect().width() >= TASKS_SIDE_MIN_WIDTH
+    }
+
+    /// Wide windows: the task list lives in a resizable panel at the right of the transcript.
+    fn tasks_panel(&mut self, ui: &mut egui::Ui) {
+        if !self.tasks_on_side(ui.ctx()) {
+            return;
+        }
+        let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
+        if todos.is_empty() {
+            return;
+        }
+        let t = *theme::tokens(ui);
+        egui::Panel::right("tasks")
+            .resizable(true)
+            .default_size(300.0)
+            .size_range(220.0..=480.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(t.bg)
+                    .inner_margin(egui::Margin::symmetric(14, 12))
+                    .stroke(egui::Stroke::new(1.0, t.line)),
+            )
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(tasks_title(&todos))
+                        .font(theme::semibold(theme::SMALL + 1.0))
+                        .color(t.fg),
+                );
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("tasks_side")
+                    .auto_shrink(false)
+                    .show(ui, |ui| todo_list(ui, &todos));
+            });
+    }
+
     fn transcript(&mut self, ui: &mut egui::Ui) {
         let t = *theme::tokens(ui);
         egui::CentralPanel::default()
@@ -940,9 +979,11 @@ impl App {
                     .inner_margin(egui::Margin::symmetric(14, 0)),
             )
             .show(ui, |ui| {
-                let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
-                if !todos.is_empty() {
-                    column(ui, |ui| todo_card(ui, &todos));
+                if !self.tasks_on_side(ui.ctx()) {
+                    let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
+                    if !todos.is_empty() {
+                        column(ui, |ui| todo_card(ui, &todos));
+                    }
                 }
                 if self.items.is_empty() {
                     if let Some(cmd) = column(ui, |ui| empty_state(ui, &self.cwd)) {
@@ -1229,9 +1270,39 @@ fn empty_state(ui: &mut egui::Ui, cwd: &std::path::Path) -> Option<&'static str>
     cmd
 }
 
+/// Below this window width the task list is a short card above the transcript instead of a
+/// side panel, so the reading column keeps its width.
+const TASKS_SIDE_MIN_WIDTH: f32 = 1000.0;
+
+fn tasks_title(todos: &[magia_tools::Todo]) -> String {
+    let done = todos.iter().filter(|t| t.status == "completed").count();
+    format!("Tasks  {done}/{}", todos.len())
+}
+
+fn todo_list(ui: &mut egui::Ui, todos: &[magia_tools::Todo]) {
+    let t = *theme::tokens(ui);
+    for todo in todos {
+        let (mark, color, text_color) = match todo.status.as_str() {
+            "completed" => ("✓", t.ok, t.muted),
+            "in_progress" => ("▸", t.accent, t.fg),
+            _ => ("○", t.muted, t.fg),
+        };
+        ui.horizontal_top(|ui| {
+            ui.label(egui::RichText::new(mark).color(color));
+            let mut text = egui::RichText::new(&todo.content)
+                .color(text_color)
+                .size(theme::SMALL + 0.5);
+            if todo.status == "completed" {
+                text = text.strikethrough();
+            }
+            ui.add(egui::Label::new(text).wrap());
+        });
+    }
+}
+
+/// Narrow windows: a collapsible card with a few lines visible; the rest scrolls.
 fn todo_card(ui: &mut egui::Ui, todos: &[magia_tools::Todo]) {
     let t = *theme::tokens(ui);
-    let done = todos.iter().filter(|t| t.status == "completed").count();
     egui::Frame::new()
         .fill(t.surface)
         .stroke(egui::Stroke::new(1.0, t.line))
@@ -1241,27 +1312,15 @@ fn todo_card(ui: &mut egui::Ui, todos: &[magia_tools::Todo]) {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::CollapsingHeader::new(
-                egui::RichText::new(format!("Tasks  {done}/{}", todos.len()))
-                    .font(theme::semibold(theme::SMALL + 1.0)),
+                egui::RichText::new(tasks_title(todos)).font(theme::semibold(theme::SMALL + 1.0)),
             )
             .id_salt("todos")
             .default_open(true)
             .show(ui, |ui| {
-                for todo in todos {
-                    let (mark, color, text_color) = match todo.status.as_str() {
-                        "completed" => ("✓", t.ok, t.muted),
-                        "in_progress" => ("▸", t.accent, t.fg),
-                        _ => ("○", t.muted, t.fg),
-                    };
-                    ui.horizontal_top(|ui| {
-                        ui.label(egui::RichText::new(mark).color(color));
-                        let mut text = egui::RichText::new(&todo.content).color(text_color);
-                        if todo.status == "completed" {
-                            text = text.strikethrough();
-                        }
-                        ui.add(egui::Label::new(text).wrap());
-                    });
-                }
+                egui::ScrollArea::vertical()
+                    .id_salt("todos_scroll")
+                    .max_height(120.0)
+                    .show(ui, |ui| todo_list(ui, todos));
             });
         });
 }
