@@ -1514,12 +1514,31 @@ fn items_from_history(history: &[Message], cwd: &std::path::Path) -> Vec<Item> {
     items
 }
 
+/// The app icon (packaging/magia.png), for the title bar and the taskbar.
+fn window_icon() -> egui::IconData {
+    const PNG: &[u8] = include_bytes!("../../../packaging/magia.png");
+    match image::load_from_memory_with_format(PNG, image::ImageFormat::Png) {
+        Ok(img) => {
+            let img = img.into_rgba8();
+            egui::IconData {
+                width: img.width(),
+                height: img.height(),
+                rgba: img.into_raw(),
+            }
+        }
+        Err(_) => egui::IconData::default(),
+    }
+}
+
 fn main() {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([980.0, 760.0])
             .with_min_inner_size([520.0, 420.0])
-            .with_title(APP_NAME),
+            .with_title(APP_NAME)
+            // Matches magia.desktop (Wayland picks the icon from it) and the AppImage.
+            .with_app_id("magia")
+            .with_icon(window_icon()),
         ..Default::default()
     };
     let result = fastframe_graphics::Graphics::new("magia").run_native(

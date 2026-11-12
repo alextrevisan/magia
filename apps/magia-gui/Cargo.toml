@@ -18,6 +18,8 @@ magia-types.workspace = true
 anyhow.workspace = true
 serde_json.workspace = true
 # Clipboard images on X11; same crate and features egui-winit already uses (no new code).
+# Decodes the window icon (already in the tree through magia-core).
+image.workspace = true
 arboard = { version = "3.7", default-features = false, features = ["image-data"] }
 async-trait.workspace = true
 tokio.workspace = true

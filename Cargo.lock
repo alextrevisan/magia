@@ -1983,6 +1983,7 @@ dependencies = [
  "fastframe-graphics",
  "fastframe-notifications",
  "fastframe-text",
+ "image",
  "magia-core",
  "magia-providers",
  "magia-store",

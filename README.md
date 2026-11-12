@@ -51,9 +51,20 @@ Sessions are append-only JSONL files, one folder per project…
 
 ## Install
 
-**Prebuilt binaries** for Linux and Windows (x86-64) are attached to each
-[release](https://github.com/alextrevisan/magia/releases). Every CI run also uploads them as
-workflow artifacts.
+**Packages** for x86-64 are attached to each
+[release](https://github.com/alextrevisan/magia/releases), and every CI run uploads them as
+workflow artifacts:
+
+| System | File | Install |
+|---|---|---|
+| Debian, Ubuntu, Mint… | `magia_<version>_amd64.deb` | `sudo apt install ./magia_<version>_amd64.deb` |
+| Fedora, RHEL, openSUSE… | `magia-<version>-1.x86_64.rpm` | `sudo dnf install ./magia-<version>-1.x86_64.rpm` |
+| Windows | `magia-<version>-windows-x86_64-setup.exe` | run it (no admin rights needed) |
+| Any Linux / Windows | `magia-linux-x86_64.tar.gz`, `magia-windows-x86_64.zip` | unpack and run |
+
+The Linux packages install `magia` and `magia-gui` in `/usr/bin`, plus a menu entry and an
+icon. The Windows installer adds Magia to the Start menu, can put the `magia` command on your
+`PATH`, and comes with an uninstaller.
 
 **From source** you need **Rust 1.98 or newer** (`rustup` installs it in `~/.cargo/bin`):
 
@@ -329,7 +340,9 @@ cargo fmt --all
 ```
 
 CI (`.github/workflows/ci.yml`) runs all of the above on Linux, runs the tests on Windows too,
-builds release binaries for both and uploads them as artifacts. Pushing a `v*` tag publishes them as a GitHub
+and builds the packages: `packaging/linux-packages.sh` makes the `.deb` and `.rpm` (with
+`dpkg-deb` and `rpmbuild`), and `packaging/magia.iss` is the Inno Setup script for the Windows
+installer. Pushing a `v*` tag publishes them as a GitHub
 release.
 
 To try a Windows build on Linux, install `mingw64-gcc` and `wine`, then:

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Magia
+GenericName=Coding agent
+Comment=A coding agent that reads, edits and runs code in your project
+Exec=magia-gui %F
+Icon=magia
+Terminal=false
+Categories=Development;IDE;
+Keywords=ai;agent;code;llm;
+StartupWMClass=magia

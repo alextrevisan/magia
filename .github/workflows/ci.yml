@@ -42,15 +42,17 @@ jobs:
         run: test -z "$(grep -rE 'target-cpu|target-feature|x86-64-v' .cargo Cargo.toml 2>/dev/null)"
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # Release binaries for Linux and Windows, uploaded as workflow artifacts.
+  # Release binaries and packages, uploaded as workflow artifacts: a .tar.gz, .deb and .rpm for
+  # Linux, a .zip and an installer for Windows.
   build:
     name: build (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
         include:
+          # 22.04: binaries built against glibc 2.35 also run on older distros than 24.04's would.
           - name: linux-x86_64
-            os: ubuntu-latest
+            os: ubuntu-22.04
             exe: ""
           - name: windows-x86_64
             os: windows-latest
@@ -93,12 +95,28 @@ jobs:
           else
             tar czf "$dir.tar.gz" "$dir"
           fi
+      - name: .deb and .rpm
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y rpm
+          packaging/linux-packages.sh magia-${{ matrix.name }} .
+      - name: Windows installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          choco install innosetup -y --no-progress
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" -Q "-DVersion=$version" \
+            "-DSrc=..\magia-${{ matrix.name }}" "-O.." packaging/magia.iss
       - uses: actions/upload-artifact@v4
         with:
           name: magia-${{ matrix.name }}
           path: |
             magia-${{ matrix.name }}.zip
             magia-${{ matrix.name }}.tar.gz
+            magia_*.deb
+            magia-*.rpm
+            magia-*-setup.exe
           if-no-files-found: error
 
   # Pushing a tag like v0.1.0 publishes a GitHub release with both packages.
