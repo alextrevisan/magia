@@ -51,10 +51,14 @@ Sessions are append-only JSONL files, one folder per project…
 
 ## Install
 
-You need **Rust 1.98 or newer** (`rustup` installs it in `~/.cargo/bin`).
+**Prebuilt binaries** for Linux and Windows (x86-64) are attached to each
+[release](https://github.com/alextrevisan/magia/releases). Every CI run also uploads them as
+workflow artifacts.
+
+**From source** you need **Rust 1.98 or newer** (`rustup` installs it in `~/.cargo/bin`):
 
 ```bash
-git clone <this repository> magia
+git clone https://github.com/alextrevisan/magia.git
 cd magia
 cargo build --release
 ```
@@ -62,8 +66,15 @@ cargo build --release
 This produces `target/release/magia` (CLI) and `target/release/magia-gui` (desktop app). Copy
 them somewhere on your `PATH`, or run them in place.
 
-On Linux the GUI runs on Wayland or X11. Pasting images on Wayland uses `wl-paste` (from
-`wl-clipboard`), and the sandbox uses `bwrap` (from `bubblewrap`). Both are optional.
+On Linux the GUI runs on Wayland or X11. Building it needs the `libxkbcommon`, `wayland`, `X11`
+and OpenGL development packages (on Debian/Ubuntu: `libxkbcommon-dev libwayland-dev libx11-dev
+libgl1-mesa-dev`). Pasting images on Wayland uses `wl-paste` (from `wl-clipboard`), and the
+sandbox uses `bwrap` (from `bubblewrap`). Both are optional.
+
+On **Windows** the `bash` tool needs a `bash` on the `PATH`, for example the one from
+[Git for Windows](https://git-scm.com/download/win). Config, sessions and state go under
+`%USERPROFILE%` (`.config\magia`, `.local\share\magia`, `.local\state\magia`). Windows builds
+are built and tested in CI. The sandbox is Linux-only.
 
 ## Quick start
 
@@ -316,6 +327,20 @@ cargo test -p magia-core --test agent_loop               # full loop against a f
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all
 ```
+
+CI (`.github/workflows/ci.yml`) runs all of the above on Linux, runs the tests on Windows too,
+builds release binaries for both and uploads them as artifacts. Pushing a `v*` tag publishes them as a GitHub
+release.
+
+To try a Windows build on Linux, install `mingw64-gcc` and `wine`, then:
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+cargo build --target x86_64-pc-windows-gnu -p magia-cli -p magia-gui
+CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUNNER=wine cargo test --workspace --target x86_64-pc-windows-gnu
+```
+
+Tests that run `bash` (the `bash` tool, hooks) fail under Wine unless a `bash.exe` is on its PATH.
 
 Constraints the code keeps to:
 
