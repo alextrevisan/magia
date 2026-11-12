@@ -35,8 +35,11 @@ jobs:
       - run: cargo test --workspace
       - name: No Vulkan / OpenSSL / SQLite anywhere in the tree
         run: |
+          # `cargo tree -i` exits 0 even when the crate is absent, so look at what it prints.
           for c in wgpu ash openssl aws-lc-rs rusqlite; do
-            if cargo tree --workspace -i "$c" >/dev/null 2>&1; then echo "forbidden crate: $c"; exit 1; fi
+            if cargo tree --workspace --target all -i "$c" 2>/dev/null | grep -q "^$c v"; then
+              echo "forbidden crate: $c"; cargo tree --workspace --target all -i "$c"; exit 1
+            fi
           done
       - name: No CPU flags beyond the x86-64 baseline
         run: test -z "$(grep -rE 'target-cpu|target-feature|x86-64-v' .cargo Cargo.toml 2>/dev/null)"
