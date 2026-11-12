@@ -206,7 +206,9 @@ fn parse(cmd: &str) -> Parsed {
 // ───────────────────────── paths ─────────────────────────
 
 fn home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 /// `arg` as an absolute, lexically normalized path (`~` and `$HOME` expanded).

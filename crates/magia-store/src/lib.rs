@@ -19,14 +19,33 @@ use std::sync::Mutex;
 pub fn sessions_dir() -> PathBuf {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+        .or_else(|| {
+            // USERPROFILE: Windows has no HOME.
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|h| PathBuf::from(h).join(".local/share"))
+        })
         .unwrap_or_else(|| PathBuf::from("."));
     base.join("magia").join("sessions")
 }
 
 /// Canonical form of a working folder (symlinks resolved), so `~/p` and `/home/u/p` match.
 pub fn canonical(cwd: &Path) -> PathBuf {
-    fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf())
+    let p = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    if cfg!(windows) { strip_verbatim(p) } else { p }
+}
+
+/// Windows' canonicalize returns `\\?\C:\x` (and `\\?\UNC\host\share`); keep the plain form
+/// people know (`C:\x`, `\\host\share`), the one the current directory uses too.
+fn strip_verbatim(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy().into_owned();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => p,
+    }
 }
 
 /// Directory holding the sessions of one working folder: readable name + hash of the full path.
@@ -457,6 +476,16 @@ pub fn age(unix: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_verbatim_paths_become_plain() {
+        use std::path::PathBuf;
+        let s = |p: &str| super::strip_verbatim(PathBuf::from(p));
+        assert_eq!(s(r"\\?\C:\Users\a"), PathBuf::from(r"C:\Users\a"));
+        assert_eq!(s(r"\\?\UNC\host\share"), PathBuf::from(r"\\host\share"));
+        assert_eq!(s(r"\\?\Volume{x}\a"), PathBuf::from(r"\\?\Volume{x}\a"));
+        assert_eq!(s("/home/u"), PathBuf::from("/home/u"));
+    }
+
     use super::*;
 
     #[test]

@@ -110,9 +110,7 @@ fn expand_str(s: &str, base_dir: &Path) -> String {
         } else if let Some(p) = inner.strip_prefix("file:") {
             let p = p.trim();
             let path = if let Some(h) = p.strip_prefix("~/") {
-                std::env::var_os("HOME")
-                    .map(|home| Path::new(&home).join(h))
-                    .unwrap_or_default()
+                crate::config::home().join(h)
             } else if Path::new(p).is_absolute() {
                 p.into()
             } else {

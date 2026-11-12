@@ -266,7 +266,7 @@ mod tests {
             session: SessionInfo {
                 path: PathBuf::from(path),
                 meta: SessionMeta {
-                    cwd: cwd.map(PathBuf::from),
+                    cwd: cwd.map(|c| magia_store::canonical(Path::new(c))),
                     created: 0,
                     updated: 0,
                     title: title.into(),

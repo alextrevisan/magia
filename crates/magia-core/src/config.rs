@@ -81,8 +81,10 @@ impl Default for Config {
     }
 }
 
-fn home() -> PathBuf {
+/// `$HOME`, or `%USERPROFILE%` on Windows.
+pub(crate) fn home() -> PathBuf {
     std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_default()
 }

@@ -13,6 +13,16 @@ pub use permissions::{Decision, Effect, PermissionMode, RuleSet, decide};
 pub use web::{html_to_text, parse_ddg_results};
 
 use anyhow::Result;
+
+/// A relative path as the model sees it: `/`-separated on every OS (`src\\a.rs` → `src/a.rs`).
+pub fn slashed(p: &Path) -> String {
+    let s = p.to_string_lossy();
+    if cfg!(windows) {
+        s.replace('\\', "/")
+    } else {
+        s.into_owned()
+    }
+}
 use async_trait::async_trait;
 use magia_types::ToolSpec;
 use serde_json::Value;

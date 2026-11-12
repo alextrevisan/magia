@@ -117,9 +117,14 @@ pub fn parse_uri_list(s: &str) -> Vec<PathBuf> {
 fn file_uri_to_path(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     // `file:///path` or `file://localhost/path`.
-    let path = rest.strip_prefix("localhost").unwrap_or(rest);
-    path.starts_with('/')
-        .then(|| PathBuf::from(uri_decode(path)))
+    let path = uri_decode(rest.strip_prefix("localhost").unwrap_or(rest));
+    // Windows: `file:///C:/x` (and the sloppy `file://C:\x`) name the drive path `C:/x`.
+    let drive =
+        |s: &str| s.as_bytes().get(1) == Some(&b':') && s.as_bytes()[0].is_ascii_alphabetic();
+    if let Some(p) = path.strip_prefix('/').filter(|p| drive(p)) {
+        return Some(PathBuf::from(p));
+    }
+    (path.starts_with('/') || drive(&path)).then(|| PathBuf::from(path))
 }
 
 /// `%XX` escapes only (`+` is a literal plus in file URIs, unlike in query strings).
@@ -171,6 +176,10 @@ mod tests {
                 "# comment\r\nfile:///tmp/a%20b+c.png\r\nfile://localhost/x.jpg\nhttp://e/x.png"
             ),
             [PathBuf::from("/tmp/a b+c.png"), PathBuf::from("/x.jpg")]
+        );
+        assert_eq!(
+            file_uri_to_path("file:///C:/Users/a%20b/shot.png"),
+            Some(PathBuf::from("C:/Users/a b/shot.png"))
         );
         let d = tempfile_dir();
         let img = d.join("shot.png");

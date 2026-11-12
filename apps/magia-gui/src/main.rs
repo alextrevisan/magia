@@ -1,6 +1,9 @@
 //! Desktop front-end (egui/eframe, OpenGL only). All I/O runs on a small tokio runtime;
 //! `update()` only drains channels and draws.
 
+// No console window next to the app on Windows (release builds; debug keeps it for logs).
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;

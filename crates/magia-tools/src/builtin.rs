@@ -377,7 +377,7 @@ impl Tool for Glob {
                 if e.file_type().is_some_and(|t| t.is_file()) {
                     let rel = e.path().strip_prefix(&root).unwrap_or(e.path());
                     if matcher.is_match(rel) {
-                        hits.push(rel.display().to_string());
+                        hits.push(crate::slashed(rel));
                     }
                 }
             }
@@ -434,7 +434,7 @@ impl Tool for Grep {
                     if re.is_match(line) {
                         out.push_str(&format!(
                             "{}:{}:{}\n",
-                            rel.display(),
+                            crate::slashed(rel),
                             i + 1,
                             line.chars().take(300).collect::<String>()
                         ));
