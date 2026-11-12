@@ -671,7 +671,10 @@ It can read/search the project but not modify it; it returns a concise report."
             return;
         }
         // The API's reported input size is the truth; the byte estimate covers the first request.
-        let size = estimate_tokens(&self.history).max(self.last_input_tokens);
+        // Only the history can be compacted, so the fixed prompt (which a big file agent can
+        // push past the threshold on its own) is taken out of the reported size.
+        let fixed = (self.system_prompt().len() / 4) as u64;
+        let size = estimate_tokens(&self.history).max(self.last_input_tokens.saturating_sub(fixed));
         if size <= self.compact_at_tokens {
             return;
         }

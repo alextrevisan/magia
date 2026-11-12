@@ -847,3 +847,46 @@ async fn a_file_agent_is_added_to_the_instructions_once() {
     assert_eq!(bodies[1].matches("PROJECT RULES").count(), 1);
     assert!(!bodies[2].contains("YOU ARE FABLE") && bodies[2].contains("PROJECT RULES"));
 }
+
+#[tokio::test]
+async fn a_big_agent_prompt_alone_does_not_trigger_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    // The provider reports the whole input (prompt + history) as ~8k tokens.
+    let usage = r#"{"choices":[],"usage":{"prompt_tokens":8000,"completion_tokens":1}}"#;
+    let reply = |t: &str| {
+        sse(&[
+            &format!(r#"{{"choices":[{{"delta":{{"content":"{t}"}},"finish_reason":"stop"}}]}}"#),
+            usage,
+            "[DONE]",
+        ])
+    };
+    let (url, server) = serve(vec![reply("a"), reply("b"), reply("c")]).await;
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Ask,
+        dir.path().into(),
+    );
+    agent.compact_at_tokens = 1_000;
+    // ≈ 7.5k tokens of instructions: nearly all of the reported input (the fake server
+    // reads at most 64 KB per request, so this stays small).
+    agent.persona = Some(("BIG.md".into(), "x".repeat(30_000)));
+    // Long enough to be compactable, so only the threshold decides.
+    for i in 0..5 {
+        agent.history.push(Message::user(format!("question {i}")));
+        agent.history.push(Message::Assistant {
+            text: format!("answer {i}"),
+            tool_calls: vec![],
+        });
+    }
+    for p in ["one", "two", "three"] {
+        let ev = run(&mut agent, p).await;
+        assert!(
+            !ev.iter()
+                .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("compact"))),
+            "{p}: {ev:?}"
+        );
+    }
+    let bodies = server.await.unwrap();
+    assert!(bodies.iter().all(|b| !b.contains("Summarize this session")));
+}
