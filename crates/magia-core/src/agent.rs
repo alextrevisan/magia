@@ -778,6 +778,7 @@ Do not call tools."
     pub fn new_session(&mut self) -> Result<()> {
         self.history.clear();
         self.last_input_tokens = 0;
+        self.forget_session_state();
         self.store = Some(SessionFile::create_for(
             &magia_store::sessions_dir(),
             &self.cx.cwd,
@@ -790,8 +791,20 @@ Do not call tools."
         let sf = SessionFile::resume(&magia_store::sessions_dir(), path, &self.cx.cwd)?;
         self.history = sf.load()?;
         self.last_input_tokens = 0;
+        self.forget_session_state();
         self.store = Some(sf);
         Ok(self.history.len())
+    }
+
+    /// Per-conversation state that must not leak into the next one: the task list and the
+    /// auto-mode reviewer's allows (they were approved against the old user requests).
+    fn forget_session_state(&mut self) {
+        if let Ok(mut t) = self.cx.todos.lock() {
+            t.clear();
+        }
+        if let Ok(mut r) = self.reviewed.lock() {
+            r.clear();
+        }
     }
 
     pub fn fork(&mut self) -> Result<PathBuf> {

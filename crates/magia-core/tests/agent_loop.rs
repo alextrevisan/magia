@@ -642,7 +642,15 @@ async fn session_header_is_stable_within_a_conversation_and_user_agent_is_ours()
     );
     assert!(heads[0].contains("user-agent: magia/"), "{}", heads[0]);
     let first = ids[0].clone();
+    agent.cx.todos.lock().unwrap().push(magia_tools::Todo {
+        content: "old task".into(),
+        status: "pending".into(),
+    });
     agent.new_session().unwrap();
+    assert!(
+        agent.cx.todos.lock().unwrap().is_empty(),
+        "a new conversation starts with no tasks"
+    );
     assert_ne!(
         agent.session_id(),
         first,
