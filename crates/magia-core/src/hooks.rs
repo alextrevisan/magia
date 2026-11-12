@@ -48,7 +48,7 @@ impl Hooks {
             {
                 continue;
             }
-            let Ok(mut child) = tokio::process::Command::new("bash")
+            let Ok(mut child) = tokio::process::Command::new(magia_tools::bash_program())
                 .arg("-c")
                 .arg(&h.command)
                 .current_dir(cwd)

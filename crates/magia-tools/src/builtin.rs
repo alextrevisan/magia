@@ -229,7 +229,7 @@ impl Tool for Bash {
             .args(["bash", "-c", cmd]);
             c
         } else {
-            let mut c = tokio::process::Command::new("bash");
+            let mut c = tokio::process::Command::new(crate::bash_program());
             c.arg("-c").arg(cmd);
             c
         };

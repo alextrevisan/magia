@@ -14,6 +14,46 @@ pub use web::{html_to_text, parse_ddg_results};
 
 use anyhow::Result;
 
+/// The `bash` that runs commands and hooks. On Windows, `Command::new("bash")` looks in
+/// System32 before PATH and finds the WSL launcher (`System32\\bash.exe`), which fails without a
+/// Linux distribution. So search PATH ourselves, skip that launcher, and fall back to Git for
+/// Windows' usual places.
+pub fn bash_program() -> PathBuf {
+    if !cfg!(windows) {
+        return PathBuf::from("bash");
+    }
+    static FOUND: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    FOUND
+        .get_or_init(|| {
+            let wsl_launcher = |p: &Path| {
+                let s = p.to_string_lossy().to_lowercase();
+                s.contains("\\system32\\") || s.contains("\\windowsapps\\")
+            };
+            let in_path = std::env::var_os("PATH").and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|d| d.join("bash.exe"))
+                    .find(|p| p.is_file() && !wsl_launcher(p))
+            });
+            let git = || {
+                ["ProgramFiles", "ProgramW6432", "LOCALAPPDATA"]
+                    .iter()
+                    .filter_map(std::env::var_os)
+                    .flat_map(|base| {
+                        let base = PathBuf::from(base);
+                        [
+                            base.join("Git\\bin\\bash.exe"),
+                            base.join("Programs\\Git\\bin\\bash.exe"),
+                        ]
+                    })
+                    .find(|p| p.is_file())
+            };
+            in_path
+                .or_else(git)
+                .unwrap_or_else(|| PathBuf::from("bash"))
+        })
+        .clone()
+}
+
 /// A relative path as the model sees it: `/`-separated on every OS (`src\\a.rs` → `src/a.rs`).
 pub fn slashed(p: &Path) -> String {
     let s = p.to_string_lossy();
