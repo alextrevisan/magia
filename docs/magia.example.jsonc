@@ -46,7 +46,7 @@
   // magia-only settings
   "magia": {
     "permission_mode": "ask",          // ask | accept_edits | auto | plan | yolo
-    // "auto_model": "claude-haiku-5-5", // modo auto: modelo que revisa as ações duvidosas (padrão: o da sessão)
+    // "auto_model": "claude-haiku-5-5", // auto mode: model that reviews unclear actions (default: the session model)
     "compact_at_tokens": 100000,       // 0 = never
     "sandbox": false,                  // bash inside bubblewrap
     "wire_overrides": { "zen/some-model": "messages" },   // chat_completions | responses | messages
