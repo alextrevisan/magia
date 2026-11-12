@@ -83,7 +83,7 @@ Agrupadas por prioridade para o magia:
 - Revisão de diff na UI antes/depois de aplicar edições.
 - Sandbox opcional para `bash` (Linux: bubblewrap/landlock).
 - Diagnósticos LSP após edições (fase tardia).
-- Modo headless (`magia run "prompt"`) para scripts/CI, saída JSON.
+- Modo headless (`magia <pedido>`, igual a `--run`) para scripts/CI, saída JSON.
 - Múltiplas sessões em abas.
 
 ---
@@ -196,7 +196,7 @@ Requisitos: **Rust 1.98+** e **egui/eframe 0.36.2** (exigidos pelo fastframe), e
 | **F2 — Agente** | `magia-tools` (read/write/edit/bash/grep/glob/ls/todo), loop agêntico, tool calls paralelas, diálogo de permissão, modo plan | Agente edita arquivos de um projeto de teste com aprovação na UI |
 | **F3 — Contexto** | Sessões JSONL com histórico paginado do disco (retomar/fork), UI virtualizada, `AGENTS.md`, `@arquivo`, compactação automática, contagem de tokens/custo, prompt caching | Sessão longa sobrevive a reinício e a estouro de contexto |
 | **F4 — Extensões** | Cliente MCP (`rmcp`), slash commands, skills, hooks | Servidor MCP stdio de exemplo funcionando |
-| **F5 — Avançado** | Subagentes, checkpoints/rewind, revisão de diff, `magia-cli` headless, sandbox bash | Rewind restaura arquivos; `magia run` em CI |
+| **F5 — Avançado** | Subagentes, checkpoints/rewind, revisão de diff, `magia-cli` headless, sandbox bash | Rewind restaura arquivos; `magia <pedido>` em CI |
 | **F6 — Polimento** | Abas de sessão, notificações, tray, LSP, auto-update | — |
 
 ## 4. Riscos / decisões em aberto
@@ -217,7 +217,7 @@ Requisitos: **Rust 1.98+** e **egui/eframe 0.36.2** (exigidos pelo fastframe), e
 | F1 Chat | ✅ 3 wires + SSE + retry + prompt caching (Messages); `/models` validado contra Zen, Go e OpenRouter reais; **chat real não testado (sem API key)** — coberto por fixtures e servidor falso |
 | F2 Agente | ✅ read/write/edit/bash/ls/glob/grep/todo, modos ask/accept_edits/plan/yolo, aprovação na GUI/CLI, cancelamento, leituras em paralelo |
 | F3 Contexto | ✅ sessões JSONL por pasta + `/resume` com seletor e busca (todas as pastas; só restaura na própria) + fork, `AGENTS.md`/`CLAUDE.md`, `@arquivo`, imagens (Ctrl+V, arrastar, `@foto.png`; testado no Go com kimi-k3, claude-haiku-5-5, gpt-5.6-luna), compactação automática e `/compact`, GUI virtualizada. Fora: custo em $ (Zen não publica preços em `/models`), histórico paginado do disco (a GUI ainda mantém o transcript em RAM; só o desenho é virtualizado) |
-| F4 Extensões | ✅ MCP stdio, skills, slash commands (com autocomplete `/` na GUI e `magia commands` no CLI), hooks |
+| F4 Extensões | ✅ MCP stdio, skills, slash commands (com autocomplete `/` na GUI e `magia --commands` no CLI), hooks |
 | F5 Avançado | ✅ subagente `task`, checkpoints + `/rewind` (só `write`/`edit`; `bash` não é rastreado), sandbox `bwrap`, CLI headless. Fora: diff visual antes de aplicar edição |
 | F6 Polimento | 🟡 notificações desktop (lazy, só com a janela sem foco); identidade visual com tokens claro/escuro seguindo o sistema (`theme.rs`, contraste WCAG testado), coluna de leitura, markdown nas respostas, ferramentas como linhas de log, modais de permissão/pergunta, tela inicial com atalhos. Fora: abas, tray, LSP, auto-update, MCP via HTTP |
 

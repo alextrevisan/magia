@@ -299,7 +299,7 @@ pub struct SessionInfo {
 }
 
 impl SessionInfo {
-    /// File stem, used as the session's short id (`magia run --session <id>`).
+    /// File stem, used as the session's short id (`magia --session <id> …`).
     pub fn id(&self) -> String {
         self.path
             .file_stem()
