@@ -3,8 +3,8 @@
 # Lists functions containing instructions from newer extensions (AVX*, SSE3/SSSE3/SSE4, BMI,
 # POPCNT, LZCNT, AES, PCLMUL…). Such code is fine only if it is behind runtime CPU detection
 # (ring, memchr, aho-corasick, rustls, miniz_oxide, …); anything else is a bug.
-# usage: CARGO_PROFILE_RELEASE_STRIP=none cargo build --release -p ufrh-cli --target-dir target/baseline
-#        scripts/check-baseline.sh target/baseline/release/ufrh [--list]
+# usage: CARGO_PROFILE_RELEASE_STRIP=none cargo build --release -p magia-cli --target-dir target/baseline
+#        scripts/check-baseline.sh target/baseline/release/magia [--list]
 set -euo pipefail
 bin="${1:?binary}"
 # A stripped binary has no function names, so the allowlist cannot work: refuse it.
@@ -18,10 +18,10 @@ OPS='^(v[a-z0-9]+|pshufb|phadd[a-z]*|phsub[a-z]*|pmaddubsw|pmulhrsw|psign[bwd]|p
 objdump -d --no-show-raw-insn -M intel "$bin" 2>/dev/null | awk -v ops="$OPS" '
   /^[0-9a-f]+ <.*>:$/ { fn=$0; next }
   { n=split($0, a, "\t"); if (n>=2) { split(a[2], b, " "); m=b[1]; if (m ~ ops) { hits[fn]++; kinds[fn]=kinds[fn] " " m } } }
-  END { for (f in hits) print hits[f] "\t" f "\t" kinds[f] }' | sort -rn > /tmp/ufrh-baseline-hits.txt
-total=$(wc -l < /tmp/ufrh-baseline-hits.txt)
-bad=$(grep -viE "$ALLOW" /tmp/ufrh-baseline-hits.txt || true)
+  END { for (f in hits) print hits[f] "\t" f "\t" kinds[f] }' | sort -rn > /tmp/magia-baseline-hits.txt
+total=$(wc -l < /tmp/magia-baseline-hits.txt)
+bad=$(grep -viE "$ALLOW" /tmp/magia-baseline-hits.txt || true)
 echo "functions with post-SSE2 instructions: $total"
-if [ "${2:-}" = "--list" ]; then cat /tmp/ufrh-baseline-hits.txt | cut -c1-200 | head -60; fi
+if [ "${2:-}" = "--list" ]; then cat /tmp/magia-baseline-hits.txt | cut -c1-200 | head -60; fi
 if [ -n "$bad" ]; then echo "NOT in a known runtime-dispatched crate:"; echo "$bad" | cut -c1-220 | head -40; exit 1; fi
 echo "OK: every such function belongs to a runtime-dispatched crate (allowlist)."

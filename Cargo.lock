@@ -1931,6 +1931,132 @@ dependencies = [
 ]
 
 [[package]]
+name = "magia-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "magia-core",
+ "magia-providers",
+ "magia-store",
+ "magia-tools",
+ "magia-types",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "magia-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "futures-util",
+ "globset",
+ "ignore",
+ "image",
+ "magia-mcp",
+ "magia-providers",
+ "magia-store",
+ "magia-tools",
+ "magia-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "magia-gui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "async-trait",
+ "eframe",
+ "egui",
+ "egui_kittest",
+ "fastframe-fonts",
+ "fastframe-graphics",
+ "fastframe-notifications",
+ "fastframe-text",
+ "magia-core",
+ "magia-providers",
+ "magia-store",
+ "magia-tools",
+ "magia-types",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "magia-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "magia-tools",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "magia-providers"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "futures-util",
+ "magia-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "magia-store"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "magia-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "magia-tools"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "globset",
+ "ignore",
+ "magia-types",
+ "regex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "magia-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3601,132 +3727,6 @@ dependencies = [
  "memoffset",
  "tempfile",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "ufrh-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "serde_json",
- "tokio",
- "tokio-util",
- "ufrh-core",
- "ufrh-providers",
- "ufrh-store",
- "ufrh-tools",
- "ufrh-types",
-]
-
-[[package]]
-name = "ufrh-core"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.22.1",
- "futures-util",
- "globset",
- "ignore",
- "image",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "ufrh-mcp",
- "ufrh-providers",
- "ufrh-store",
- "ufrh-tools",
- "ufrh-types",
-]
-
-[[package]]
-name = "ufrh-gui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arboard",
- "async-trait",
- "eframe",
- "egui",
- "egui_kittest",
- "fastframe-fonts",
- "fastframe-graphics",
- "fastframe-notifications",
- "fastframe-text",
- "serde_json",
- "tokio",
- "tokio-util",
- "ufrh-core",
- "ufrh-providers",
- "ufrh-store",
- "ufrh-tools",
- "ufrh-types",
-]
-
-[[package]]
-name = "ufrh-mcp"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "serde",
- "serde_json",
- "tokio",
- "ufrh-tools",
-]
-
-[[package]]
-name = "ufrh-providers"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "futures-util",
- "reqwest",
- "serde",
- "serde_json",
- "tokio",
- "ufrh-types",
-]
-
-[[package]]
-name = "ufrh-store"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
- "tempfile",
- "ufrh-types",
-]
-
-[[package]]
-name = "ufrh-tools"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "globset",
- "ignore",
- "regex",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
- "ufrh-types",
-]
-
-[[package]]
-name = "ufrh-types"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
 ]
 
 [[package]]

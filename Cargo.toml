@@ -9,12 +9,12 @@ rust-version = "1.98"
 license = "MIT"
 
 [workspace.dependencies]
-ufrh-types = { path = "crates/ufrh-types" }
-ufrh-providers = { path = "crates/ufrh-providers" }
-ufrh-tools = { path = "crates/ufrh-tools" }
-ufrh-core = { path = "crates/ufrh-core" }
-ufrh-store = { path = "crates/ufrh-store" }
-ufrh-mcp = { path = "crates/ufrh-mcp" }
+magia-types = { path = "crates/magia-types" }
+magia-providers = { path = "crates/magia-providers" }
+magia-tools = { path = "crates/magia-tools" }
+magia-core = { path = "crates/magia-core" }
+magia-store = { path = "crates/magia-store" }
+magia-mcp = { path = "crates/magia-mcp" }
 
 anyhow = "1"
 base64 = "0.22"

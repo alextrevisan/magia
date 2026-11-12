@@ -1,4 +1,4 @@
-# ufrh — Plano de implementação
+# magia — Plano de implementação
 
 Harness de agente de código **100% Rust**, com GUI nativa em **egui/eframe + fastframe**, conectando a:
 
@@ -36,7 +36,7 @@ Metas (RSS medido no Linux, binário release):
 |---|---|
 | GUI ociosa, sem sessão | ≤ 50 MB |
 | Sessão com 500 mensagens e saídas de ferramentas grandes | ≤ 120 MB |
-| `ufrh-cli` headless executando um turno | ≤ 25 MB |
+| `magia-cli` headless executando um turno | ≤ 25 MB |
 
 Táticas:
 - **Histórico fora da RAM:** a sessão vive no JSONL em disco; a memória mantém só um índice (offset por mensagem) + a janela visível + o contexto que será enviado. Saídas de ferramentas grandes vão inteiras para disco e ficam truncadas em memória.
@@ -54,7 +54,7 @@ Táticas:
 
 ## 1. Features de harnesses modernos (Claude Code, OpenCode, Codex CLI, Aider, Goose)
 
-Agrupadas por prioridade para o ufrh:
+Agrupadas por prioridade para o magia:
 
 **Núcleo (MVP)**
 - Loop agêntico: modelo → tool calls (inclusive paralelas) → resultados → modelo, até `stop`.
@@ -73,7 +73,7 @@ Agrupadas por prioridade para o ufrh:
 
 **Extensibilidade**
 - Cliente MCP (stdio e HTTP streamable), ferramentas MCP namespaced `mcp__server__tool`.
-- Slash commands customizados (arquivos markdown em `.ufrh/commands/`).
+- Slash commands customizados (arquivos markdown em `.magia/commands/`).
 - Skills (pasta com `SKILL.md` + recursos, carregadas sob demanda pela descrição).
 - Subagentes (sessão filha com contexto próprio e conjunto de ferramentas restrito, retorna só o resultado).
 - Hooks (comandos shell em eventos: `pre_tool`, `post_tool`, `user_prompt`, `stop`), que podem bloquear/modificar.
@@ -83,7 +83,7 @@ Agrupadas por prioridade para o ufrh:
 - Revisão de diff na UI antes/depois de aplicar edições.
 - Sandbox opcional para `bash` (Linux: bubblewrap/landlock).
 - Diagnósticos LSP após edições (fase tardia).
-- Modo headless (`ufrh run "prompt"`) para scripts/CI, saída JSON.
+- Modo headless (`magia run "prompt"`) para scripts/CI, saída JSON.
 - Múltiplas sessões em abas.
 
 ---
@@ -94,15 +94,15 @@ Workspace Cargo, com o core sem nenhuma dependência de UI:
 
 ```
 crates/
-  ufrh-types      # Mensagens, ContentBlock, ToolCall, Usage, eventos. Sem I/O.
-  ufrh-providers  # trait Provider + adaptadores de wire format + SSE
-  ufrh-tools      # trait Tool, ferramentas embutidas, motor de permissões
-  ufrh-mcp        # cliente MCP → expõe ferramentas como `dyn Tool`
-  ufrh-core       # Agent loop, Session, compactação, hooks, subagentes, config
-  ufrh-store      # persistência de sessões/checkpoints
+  magia-types      # Mensagens, ContentBlock, ToolCall, Usage, eventos. Sem I/O.
+  magia-providers  # trait Provider + adaptadores de wire format + SSE
+  magia-tools      # trait Tool, ferramentas embutidas, motor de permissões
+  magia-mcp        # cliente MCP → expõe ferramentas como `dyn Tool`
+  magia-core       # Agent loop, Session, compactação, hooks, subagentes, config
+  magia-store      # persistência de sessões/checkpoints
 apps/
-  ufrh-gui        # eframe + fastframe
-  ufrh-cli        # headless (mesmo core)
+  magia-gui        # eframe + fastframe
+  magia-cli        # headless (mesmo core)
 ```
 
 ### 2.1 Provedores
@@ -158,7 +158,7 @@ trait Tool: Send + Sync {
 
 Evitar dependências C: `reqwest` com `rustls` + provider `ring` (sem OpenSSL), sessões em **JSONL append-only** (um arquivo por sessão, eventos imutáveis — fork = novo arquivo apontando para pai+offset) ou `redb` para índice. Sem SQLite/rusqlite. Caminhos via `fastframe-dirs`, escrita atômica via `fastframe-file`.
 
-Config em **JSON/JSONC compatível com OpenCode** (`ufrh.json[c]`: `~/.config/ufrh/`, projeto, `.ufrh/`, `$UFRH_CONFIG`; camadas fundidas chave a chave; `{env:X}`/`{file:p}`). Configurações só do ufrh ficam sob `"ufrh"`. Chaves de API via env/`{env:}`; keyring do sistema não implementado.
+Config em **JSON/JSONC compatível com OpenCode** (`magia.json[c]`: `~/.config/magia/`, projeto, `.magia/`, `$MAGIA_CONFIG`; camadas fundidas chave a chave; `{env:X}`/`{file:p}`). Configurações só do magia ficam sob `"magia"`. Chaves de API via env/`{env:}`; keyring do sistema não implementado.
 
 ### 2.5 GUI (eframe + fastframe)
 
@@ -166,7 +166,7 @@ Layout: barra lateral (sessões/projetos) | conversa (mensagens com markdown, bl
 
 Crates fastframe úteis (todos pinados na **mesma tag**, hoje `v0.17.0`, via git — não estão no crates.io):
 
-| Crate | Uso no ufrh |
+| Crate | Uso no magia |
 |---|---|
 | `fastframe-fonts`, `fastframe-text` | fontes e renderização nítida (fallbacks CJK só sob demanda, ver §0.2) |
 | `fastframe-theme` | paletas JSON, tema claro/escuro do sistema |
@@ -191,12 +191,12 @@ Requisitos: **Rust 1.98+** e **egui/eframe 0.36.2** (exigidos pelo fastframe), e
 
 | Fase | Entrega | Critério de pronto |
 |---|---|---|
-| **F0 — Esqueleto** | Workspace, `ufrh-types`, janela eframe (`glow`) com fastframe-fonts/text/theme, config JSON/JSONC (compatível com OpenCode), CI (fmt, clippy `-D warnings`, test, **testes sob `qemu -cpu core2duo`**, **benchmark de RSS**) | `cargo run -p ufrh-gui` abre janela temada; GUI ociosa ≤ 50 MB; roda em llvmpipe |
-| **F1 — Chat** | `ufrh-providers` com os 3 wires + SSE, presets Zen/Go/OpenRouter, listagem de modelos, chat com streaming e cancelamento na GUI | Conversa streaming com um modelo de cada provedor; testes de parsing SSE com fixtures gravadas |
-| **F2 — Agente** | `ufrh-tools` (read/write/edit/bash/grep/glob/ls/todo), loop agêntico, tool calls paralelas, diálogo de permissão, modo plan | Agente edita arquivos de um projeto de teste com aprovação na UI |
+| **F0 — Esqueleto** | Workspace, `magia-types`, janela eframe (`glow`) com fastframe-fonts/text/theme, config JSON/JSONC (compatível com OpenCode), CI (fmt, clippy `-D warnings`, test, **testes sob `qemu -cpu core2duo`**, **benchmark de RSS**) | `cargo run -p magia-gui` abre janela temada; GUI ociosa ≤ 50 MB; roda em llvmpipe |
+| **F1 — Chat** | `magia-providers` com os 3 wires + SSE, presets Zen/Go/OpenRouter, listagem de modelos, chat com streaming e cancelamento na GUI | Conversa streaming com um modelo de cada provedor; testes de parsing SSE com fixtures gravadas |
+| **F2 — Agente** | `magia-tools` (read/write/edit/bash/grep/glob/ls/todo), loop agêntico, tool calls paralelas, diálogo de permissão, modo plan | Agente edita arquivos de um projeto de teste com aprovação na UI |
 | **F3 — Contexto** | Sessões JSONL com histórico paginado do disco (retomar/fork), UI virtualizada, `AGENTS.md`, `@arquivo`, compactação automática, contagem de tokens/custo, prompt caching | Sessão longa sobrevive a reinício e a estouro de contexto |
 | **F4 — Extensões** | Cliente MCP (`rmcp`), slash commands, skills, hooks | Servidor MCP stdio de exemplo funcionando |
-| **F5 — Avançado** | Subagentes, checkpoints/rewind, revisão de diff, `ufrh-cli` headless, sandbox bash | Rewind restaura arquivos; `ufrh run` em CI |
+| **F5 — Avançado** | Subagentes, checkpoints/rewind, revisão de diff, `magia-cli` headless, sandbox bash | Rewind restaura arquivos; `magia run` em CI |
 | **F6 — Polimento** | Abas de sessão, notificações, tray, LSP, auto-update | — |
 
 ## 4. Riscos / decisões em aberto
@@ -217,7 +217,7 @@ Requisitos: **Rust 1.98+** e **egui/eframe 0.36.2** (exigidos pelo fastframe), e
 | F1 Chat | ✅ 3 wires + SSE + retry + prompt caching (Messages); `/models` validado contra Zen, Go e OpenRouter reais; **chat real não testado (sem API key)** — coberto por fixtures e servidor falso |
 | F2 Agente | ✅ read/write/edit/bash/ls/glob/grep/todo, modos ask/accept_edits/plan/yolo, aprovação na GUI/CLI, cancelamento, leituras em paralelo |
 | F3 Contexto | ✅ sessões JSONL por pasta + `/resume` com seletor e busca (todas as pastas; só restaura na própria) + fork, `AGENTS.md`/`CLAUDE.md`, `@arquivo`, imagens (Ctrl+V, arrastar, `@foto.png`; testado no Go com kimi-k3, claude-haiku-5-5, gpt-5.6-luna), compactação automática e `/compact`, GUI virtualizada. Fora: custo em $ (Zen não publica preços em `/models`), histórico paginado do disco (a GUI ainda mantém o transcript em RAM; só o desenho é virtualizado) |
-| F4 Extensões | ✅ MCP stdio, skills, slash commands (com autocomplete `/` na GUI e `ufrh commands` no CLI), hooks |
+| F4 Extensões | ✅ MCP stdio, skills, slash commands (com autocomplete `/` na GUI e `magia commands` no CLI), hooks |
 | F5 Avançado | ✅ subagente `task`, checkpoints + `/rewind` (só `write`/`edit`; `bash` não é rastreado), sandbox `bwrap`, CLI headless. Fora: diff visual antes de aplicar edição |
 | F6 Polimento | 🟡 notificações desktop (lazy, só com a janela sem foco); identidade visual com tokens claro/escuro seguindo o sistema (`theme.rs`, contraste WCAG testado), coluna de leitura, markdown nas respostas, ferramentas como linhas de log, modais de permissão/pergunta, tela inicial com atalhos. Fora: abas, tray, LSP, auto-update, MCP via HTTP |
 
