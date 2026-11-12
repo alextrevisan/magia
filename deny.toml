@@ -9,3 +9,40 @@ deny = [
   { crate = "aws-lc-rs" },
   { crate = "rusqlite" },
 ]
+
+# Permissive licenses only. GPL/LGPL appear in the tree just as alternatives ("Apache-2.0 OR
+# GPL-2.0-only"), where the permissive one applies, so they stay off this list on purpose.
+[licenses]
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "0BSD",
+  "BSL-1.0",
+  "Unlicense",
+  "Unicode-3.0",
+  "CDLA-Permissive-2.0", # webpki-roots (Mozilla's CA list)
+  "MPL-2.0",             # option-ext (file-level copyleft only)
+  "OFL-1.1",             # egui's default fonts
+  "Ubuntu-font-1.0",     # egui's default fonts
+]
+confidence-threshold = 0.9
+
+# fastframe comes from git (see CLAUDE.md: pinned tag, not on crates.io).
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = ["https://github.com/crmne/fastframe"]
+
+[advisories]
+ignore = [
+  # Unmaintained, not vulnerable: folded into zbus itself. They arrive through
+  # fastframe-notifications (zbus); drop these when fastframe moves to a newer zbus.
+  { id = "RUSTSEC-2026-0370", reason = "zvariant via fastframe-notifications/zbus" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names via fastframe-notifications/zbus" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive via fastframe-notifications/zbus" },
+]
