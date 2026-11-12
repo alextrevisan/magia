@@ -787,3 +787,24 @@ async fn auto_mode_runs_safe_blocks_risky_and_reviews_the_rest() {
         "the reviewer never sees the agent's earlier actions or tool output"
     );
 }
+
+#[tokio::test]
+async fn the_model_is_told_which_model_and_mode_it_runs_as() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = serve(vec![text_reply("hi"), text_reply("hi")]).await;
+    let mut agent = Agent::new(
+        client(url),
+        "kimi-k3".into(),
+        PermissionMode::Auto,
+        dir.path().into(),
+    );
+    run(&mut agent, "which model are you?").await;
+    agent.model = "claude-haiku-5-5".into(); // switched in the GUI mid-session
+    run(&mut agent, "and now?").await;
+    let bodies = server.await.unwrap();
+    assert!(
+        bodies[0].contains("Model: `kimi-k3` via the `fake` provider")
+            && bodies[0].contains("mode: `auto`")
+    );
+    assert!(bodies[1].contains("Model: `claude-haiku-5-5`"));
+}

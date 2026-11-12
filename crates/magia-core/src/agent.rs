@@ -240,6 +240,22 @@ impl Agent {
         true
     }
 
+    /// The system prompt plus what the model cannot know on its own: which model it is and how
+    /// it is being run. Built per request, since provider, model and mode can change mid-session.
+    fn system_prompt(&self) -> String {
+        format!(
+            "{}\n\n# This session\n- You are running in magia, a coding agent.\n- Model: `{}` via the `{}` provider. When asked which model you are, answer with this id.\n- Permission mode: `{}`.\n- Working folder: {}",
+            self.system,
+            self.model,
+            self.client.config.name,
+            serde_json::to_value(self.mode)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_owned))
+                .unwrap_or_default(),
+            self.cx.cwd.display()
+        )
+    }
+
     fn all_specs(&self, interactive: bool) -> Vec<ToolSpec> {
         let mut v: Vec<ToolSpec> = self
             .tools
@@ -339,7 +355,7 @@ It can read/search the project but not modify it; it returns a concise report."
             self.maybe_compact(events).await;
             let req = ChatRequest {
                 model: self.model.clone(),
-                system: Some(self.system.clone()),
+                system: Some(self.system_prompt()),
                 messages: self.history.clone(),
                 tools: self.all_specs(approver.interactive()),
                 max_tokens: None,
