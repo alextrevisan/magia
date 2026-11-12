@@ -25,6 +25,8 @@ enum UiMsg {
     Permission(ToolCall, Option<String>, tokio::sync::oneshot::Sender<bool>),
     Question(Question),
     Catalog(Vec<SlashEntry>),
+    /// Project files for the `@` autocomplete.
+    Files(Vec<String>),
     /// Images read from the clipboard or from files, with their RGBA previews.
     Attach(Result<Vec<(Image, Option<Thumb>)>, String>),
     /// Earlier messages for the composer's ↑/↓ history (from the folder's latest session).
@@ -124,6 +126,8 @@ struct App {
     question: Option<(Question, String)>,
     /// `/` autocomplete: everything available (refreshed off the UI thread when the popup opens).
     catalog: Vec<SlashEntry>,
+    /// Project files for `@` (loaded when the list opens).
+    files: Vec<String>,
     models: Vec<String>,
     status: String,
     tokens: (u64, u64),
@@ -206,6 +210,7 @@ impl App {
             pending: None,
             question: None,
             catalog: vec![],
+            files: vec![],
             models: vec![],
             status,
             tokens: (0, 0),
@@ -327,6 +332,15 @@ impl App {
         );
         self.rt.spawn_blocking(move || {
             let _ = tx.send(UiMsg::Catalog(slash_catalog(&cwd, BUILTINS, &cfg)));
+            ctx.request_repaint();
+        });
+    }
+
+    /// List the project's files for `@` on a blocking thread (walks the tree, honours .gitignore).
+    fn refresh_files(&self, ctx: &egui::Context) {
+        let (cwd, tx, ctx) = (self.cwd.clone(), self.tx.clone(), ctx.clone());
+        self.rt.spawn_blocking(move || {
+            let _ = tx.send(UiMsg::Files(magia_core::project_files(&cwd, 20_000)));
             ctx.request_repaint();
         });
     }
@@ -592,6 +606,7 @@ impl App {
                 UiMsg::Models(Ok(m)) => self.models = m,
                 UiMsg::Models(Err(e)) => self.status = format!("models: {e}"),
                 UiMsg::Catalog(c) => self.catalog = c,
+                UiMsg::Files(f) => self.files = f,
                 UiMsg::History(h) => self.composer.load_history(h),
                 UiMsg::Sessions(generation, hits) => {
                     if let Some(p) = &mut self.resume {
@@ -868,7 +883,10 @@ impl App {
                     // Enter sends, Shift+Enter inserts a newline. The plain-Enter event is removed
                     // before the TextEdit sees it (egui's consume_key would also swallow
                     // Shift+Enter, since it ignores extra Shift).
-                    let out = self.composer.show(ui, &self.catalog);
+                    let out = self.composer.show(ui, &self.catalog, &self.files);
+                    if out.files_opened {
+                        self.refresh_files(ctx);
+                    }
                     if out.opened {
                         self.refresh_catalog(ctx); // pick up commands/skills added since last time
                     }

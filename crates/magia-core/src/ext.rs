@@ -312,6 +312,64 @@ pub fn filter_slash<'a>(entries: &'a [SlashEntry], query: &str) -> Vec<&'a Slash
     scored.into_iter().map(|(_, _, e)| e).collect()
 }
 
+/// Files and folders of the project for the `@` autocomplete: relative paths with `/`,
+/// folders ending in `/`, hidden and git-ignored entries skipped, at most `limit` entries.
+pub fn project_files(cwd: &Path, limit: usize) -> Vec<String> {
+    let mut v = Vec::new();
+    for e in ignore::WalkBuilder::new(cwd).build().flatten() {
+        if v.len() >= limit {
+            break;
+        }
+        let Ok(rel) = e.path().strip_prefix(cwd) else {
+            continue;
+        };
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let mut s = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        if s.contains(char::is_whitespace) {
+            continue; // an `@mention` ends at whitespace
+        }
+        if e.file_type().is_some_and(|t| t.is_dir()) {
+            s.push('/');
+        }
+        v.push(s);
+    }
+    v.sort();
+    v
+}
+
+/// Paths matching what was typed after `@`, best first: file name starts with it, path starts
+/// with it, path contains it, then letters in order; shorter paths first within each group.
+/// Case-insensitive; at most `max` results.
+pub fn filter_files<'a>(files: &'a [String], query: &str, max: usize) -> Vec<&'a String> {
+    let q = query.to_lowercase();
+    let mut scored: Vec<(u8, usize, &String)> = files
+        .iter()
+        .filter_map(|f| {
+            let path = f.to_lowercase();
+            let name = path.trim_end_matches('/').rsplit('/').next().unwrap_or("");
+            let score = if q.is_empty() || path.starts_with(&q) || name.starts_with(&q) {
+                0
+            } else if path.contains(&q) {
+                1
+            } else if is_subsequence(&q, &path) {
+                2
+            } else {
+                return None;
+            };
+            let depth = f.trim_end_matches('/').matches('/').count();
+            Some((score, if q.is_empty() { depth } else { f.len() }, f))
+        })
+        .collect();
+    scored.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+    scored.into_iter().take(max).map(|(_, _, f)| f).collect()
+}
+
 /// Inline the content of `@path` mentions (files ≤ 64 KB) and mark them as read, so the
 /// model can edit them without an extra `read` round-trip.
 /// Inline `@path` mentions: text files (≤ 64 KiB) are appended to the prompt, image files
@@ -357,6 +415,47 @@ pub fn expand_mentions(cx: &ToolCx, prompt: &str) -> (String, Vec<Image>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn files_are_listed_relative_and_filtered_by_name_first() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("src/ui")).unwrap();
+        for f in [
+            "src/main.rs",
+            "src/ui/menu.rs",
+            "README.md",
+            "domain.rs",
+            ".hidden",
+        ] {
+            std::fs::write(d.path().join(f), "").unwrap();
+        }
+        let files = super::project_files(d.path(), 100);
+        assert_eq!(
+            files,
+            [
+                "README.md",
+                "domain.rs",
+                "src/",
+                "src/main.rs",
+                "src/ui/",
+                "src/ui/menu.rs"
+            ]
+        );
+        let f = |q| super::filter_files(&files, q, 10);
+        assert_eq!(
+            f("ma"),
+            ["src/main.rs", "domain.rs"],
+            "name prefix before substring"
+        );
+        assert_eq!(f("src/u"), ["src/ui/", "src/ui/menu.rs"]);
+        assert_eq!(f("smr"), ["src/main.rs", "src/ui/menu.rs"]);
+        assert_eq!(
+            f("")[..3],
+            ["README.md", "domain.rs", "src/"],
+            "top level first"
+        );
+        assert!(f("zzz").is_empty());
+    }
+
     use super::*;
 
     #[test]

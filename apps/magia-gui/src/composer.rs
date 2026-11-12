@@ -1,8 +1,9 @@
 //! The message box: Enter sends, Shift+Enter is a newline, and typing `/` opens a list of
 //! commands and skills that filters as you type (↑↓ to move, Tab/Enter to complete, Esc to close).
+//! `@` anywhere opens the same kind of list with the project's files and folders.
 //! Images are attached with Ctrl+V or by dropping files on the window.
 
-use magia_core::{SlashEntry, SlashKind, filter_slash, media};
+use magia_core::{SlashEntry, SlashKind, filter_files, filter_slash, media};
 use magia_types::Image;
 use std::path::PathBuf;
 
@@ -14,6 +15,8 @@ pub struct Composer {
     sel: usize,
     was_open: bool,
     last_query: Option<String>,
+    /// The `@` list was open last frame.
+    was_mention: bool,
     /// Input value for which the user pressed Esc (the list stays closed until it changes).
     dismissed: Option<String>,
     /// Focus as of the previous frame: egui drops focus on Esc before widgets run.
@@ -51,6 +54,8 @@ pub struct Output {
     pub send: bool,
     /// The `/` list just opened: the caller should refresh the catalog.
     pub opened: bool,
+    /// The `@` list just opened: the caller should refresh the file list.
+    pub files_opened: bool,
     /// Ctrl+V with something other than text on the clipboard: the caller should read the
     /// clipboard image (off the UI thread) and call [`Composer::attach`].
     pub paste_image: bool,
@@ -65,19 +70,109 @@ pub fn slash_query(input: &str) -> Option<&str> {
     (!rest.contains(char::is_whitespace)).then_some(rest)
 }
 
+/// The `@mention` being typed at the caret (a char index): `(start char of the @, text after
+/// it)`. The token must start the input or follow whitespace, and the caret must be at its end.
+pub fn mention_query(input: &str, caret: usize) -> Option<(usize, String)> {
+    let chars: Vec<char> = input.chars().collect();
+    if caret > chars.len() || chars.get(caret).is_some_and(|c| !c.is_whitespace()) {
+        return None;
+    }
+    let start = chars[..caret]
+        .iter()
+        .rposition(|c| c.is_whitespace())
+        .map_or(0, |i| i + 1);
+    (chars.get(start) == Some(&'@')).then(|| (start, chars[start + 1..caret].iter().collect()))
+}
+
+/// What the list is completing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Mode {
+    Slash(String),
+    /// `@` at char `start`, caret at char `end`.
+    Mention {
+        start: usize,
+        end: usize,
+        query: String,
+    },
+}
+
+/// One line of the list; `value` is what gets inserted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Row {
+    pub value: String,
+    title: String,
+    args: String,
+    description: String,
+    tag: &'static str,
+}
+
+const MAX_FILES: usize = 200;
+
 impl Composer {
     pub fn id() -> egui::Id {
         egui::Id::new("composer")
     }
 
-    /// Entries the list would show right now (empty = closed).
-    pub fn suggestions(&self, catalog: &[SlashEntry]) -> Vec<SlashEntry> {
-        match slash_query(&self.input) {
-            Some(q) if self.dismissed.as_deref() != Some(self.input.as_str()) => {
-                filter_slash(catalog, q).into_iter().cloned().collect()
-            }
-            _ => Vec::new(),
+    fn mode(&self, ctx: &egui::Context) -> Option<Mode> {
+        if let Some(q) = slash_query(&self.input) {
+            return Some(Mode::Slash(q.to_owned()));
         }
+        let caret = egui::text_edit::TextEditState::load(ctx, Self::id())
+            .and_then(|s| s.cursor.char_range())
+            .filter(|r| r.primary.index == r.secondary.index)
+            .map_or(self.input.chars().count(), |r| r.primary.index.0);
+        mention_query(&self.input, caret).map(|(start, query)| Mode::Mention {
+            start,
+            end: caret,
+            query,
+        })
+    }
+
+    fn rows(&self, mode: &Option<Mode>, catalog: &[SlashEntry], files: &[String]) -> Vec<Row> {
+        if self.dismissed.as_deref() == Some(self.input.as_str()) {
+            return Vec::new();
+        }
+        match mode {
+            Some(Mode::Slash(q)) => filter_slash(catalog, q)
+                .into_iter()
+                .map(|e| Row {
+                    value: e.name.clone(),
+                    title: format!("/{}", e.name),
+                    args: e.args.clone(),
+                    description: e.description.clone(),
+                    tag: match e.kind {
+                        SlashKind::Builtin => "",
+                        SlashKind::Command => "command",
+                        SlashKind::Skill => "skill",
+                    },
+                })
+                .collect(),
+            Some(Mode::Mention { query, .. }) => filter_files(files, query, MAX_FILES)
+                .into_iter()
+                .map(|f| Row {
+                    value: f.clone(),
+                    title: f.clone(),
+                    args: String::new(),
+                    description: String::new(),
+                    tag: if f.ends_with('/') { "folder" } else { "" },
+                })
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Entries the list would show right now (empty = closed).
+    #[cfg(test)]
+    pub fn suggestions(
+        &self,
+        ctx: &egui::Context,
+        catalog: &[SlashEntry],
+        files: &[String],
+    ) -> Vec<String> {
+        self.rows(&self.mode(ctx), catalog, files)
+            .into_iter()
+            .map(|r| r.value)
+            .collect()
     }
 
     /// Add an image; `thumb` is its RGBA preview (computed off the UI thread).
@@ -181,21 +276,33 @@ impl Composer {
         self.sel
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, catalog: &[SlashEntry]) -> Output {
+    pub fn show(&mut self, ui: &mut egui::Ui, catalog: &[SlashEntry], files: &[String]) -> Output {
         let ctx = ui.ctx().clone();
         let id = Self::id();
         let focused = ui.memory(|m| m.has_focus(id));
-        let query = slash_query(&self.input).map(str::to_owned);
+        let mode = self.mode(&ctx);
+        let query = match &mode {
+            Some(Mode::Slash(q)) => Some(q.clone()),
+            _ => None,
+        };
+        let key = match &mode {
+            Some(Mode::Slash(q)) => Some(format!("/{q}")),
+            Some(Mode::Mention { start, query, .. }) => Some(format!("@{start}:{query}")),
+            None => None,
+        };
+        let mention = matches!(mode, Some(Mode::Mention { .. }));
         let mut out = Output {
             opened: query.is_some() && !self.was_open,
+            files_opened: mention && !self.was_mention,
             ..Default::default()
         };
         self.was_open = query.is_some();
-        if query != self.last_query {
+        self.was_mention = mention;
+        if key != self.last_query {
             self.sel = 0;
-            self.last_query = query.clone();
+            self.last_query = key;
         }
-        let matches = self.suggestions(catalog);
+        let matches = self.rows(&mode, catalog, files);
         let popup = !matches.is_empty();
         self.sel = self.sel.min(matches.len().saturating_sub(1));
 
@@ -260,8 +367,11 @@ impl Composer {
                 if esc {
                     self.dismissed = Some(self.input.clone());
                     refocus = true; // Esc closes the list, not the text box
-                } else if tab || (enter && query.as_deref() != Some(sel.name.as_str())) {
-                    complete = Some(sel.name.clone());
+                } else if tab
+                    || (enter && mention)
+                    || (enter && query.as_deref() != Some(sel.value.as_str()))
+                {
+                    complete = Some(sel.value.clone());
                 } else if enter {
                     out.send = true; // name already complete: run it
                 }
@@ -295,9 +405,29 @@ impl Composer {
         {
             complete = self.popup(&ctx, resp.rect, &matches);
         }
-        if let Some(name) = complete {
-            self.input = format!("/{name} ");
-            set_cursor_to_end(&ctx, id, &self.input);
+        if let Some(value) = complete {
+            match &mode {
+                Some(Mode::Mention { start, end, .. }) => {
+                    // Folders keep the list open to go deeper; files end the mention.
+                    let insert = if value.ends_with('/') {
+                        format!("@{value}")
+                    } else {
+                        format!("@{value} ")
+                    };
+                    let chars: Vec<char> = self.input.chars().collect();
+                    let mut rest: String = chars[*end..].iter().collect();
+                    if !value.ends_with('/') && rest.starts_with(' ') {
+                        rest.remove(0);
+                    }
+                    let head: String = chars[..*start].iter().collect();
+                    self.input = format!("{head}{insert}{rest}");
+                    set_cursor(&ctx, id, start + insert.chars().count());
+                }
+                _ => {
+                    self.input = format!("/{value} ");
+                    set_cursor_to_end(&ctx, id, &self.input);
+                }
+            }
             refocus = true;
         }
         if refocus {
@@ -380,12 +510,7 @@ impl Composer {
     }
 
     /// Draw the suggestion list above the box. Returns the clicked entry, if any.
-    fn popup(
-        &self,
-        ctx: &egui::Context,
-        anchor: egui::Rect,
-        matches: &[SlashEntry],
-    ) -> Option<String> {
+    fn popup(&self, ctx: &egui::Context, anchor: egui::Rect, matches: &[Row]) -> Option<String> {
         let start = self.sel.saturating_sub(VISIBLE - 1);
         let mut picked = None;
         egui::Area::new(egui::Id::new("slash_popup"))
@@ -408,19 +533,18 @@ impl Composer {
                             ..Default::default()
                         };
                         let mut job = egui::text::LayoutJob::default();
-                        job.append(&format!("/{}", e.name), 0.0, fmt(strong));
+                        job.append(&e.title, 0.0, fmt(strong));
                         if !e.args.is_empty() {
                             job.append(&format!(" {}", e.args), 0.0, fmt(weak));
                         }
-                        job.append(&format!("   {}", e.description), 0.0, fmt(normal));
-                        let tag = match e.kind {
-                            SlashKind::Builtin => "",
-                            SlashKind::Command => "   command",
-                            SlashKind::Skill => "   skill",
-                        };
-                        job.append(tag, 0.0, fmt(weak));
+                        if !e.description.is_empty() {
+                            job.append(&format!("   {}", e.description), 0.0, fmt(normal));
+                        }
+                        if !e.tag.is_empty() {
+                            job.append(&format!("   {}", e.tag), 0.0, fmt(weak));
+                        }
                         if ui.selectable_label(i == self.sel, job).clicked() {
-                            picked = Some(e.name.clone());
+                            picked = Some(e.value.clone());
                         }
                     }
                     let more = if matches.len() > VISIBLE {
@@ -498,9 +622,23 @@ mod tests {
         ]
     }
 
+    fn project() -> Vec<String> {
+        ["README.md", "src/", "src/main.rs", "src/menu.rs"]
+            .map(String::from)
+            .to_vec()
+    }
+
+    fn sugg(h: &Harness<'_, State>) -> Vec<String> {
+        h.state()
+            .composer
+            .suggestions(&h.ctx, &catalog(), &project())
+    }
+
     struct State {
         composer: Composer,
         catalog: Vec<SlashEntry>,
+        project: Vec<String>,
+        files_opened: usize,
         sent: Vec<String>,
         opened: usize,
         paste_image: usize,
@@ -511,6 +649,8 @@ mod tests {
         let state = State {
             composer: Composer::default(),
             catalog: catalog(),
+            project: project(),
+            files_opened: 0,
             sent: vec![],
             opened: 0,
             paste_image: 0,
@@ -519,8 +659,9 @@ mod tests {
         let mut h = Harness::new_ui_state(
             |ui, s: &mut State| {
                 ui.add_space(300.0); // room for the list above the box
-                let out = s.composer.show(ui, &s.catalog);
+                let out = s.composer.show(ui, &s.catalog, &s.project);
                 s.opened += out.opened as usize;
+                s.files_opened += out.files_opened as usize;
                 s.paste_image += out.paste_image as usize;
                 s.files.extend(out.files);
                 if out.send {
@@ -576,32 +717,20 @@ mod tests {
         let mut h = harness();
         type_text(&mut h, "/");
         assert_eq!(h.state().opened, 1, "catalog refresh requested once");
-        assert_eq!(h.state().composer.suggestions(&catalog()).len(), 4);
+        assert_eq!(sugg(&h).len(), 4);
         assert!(
             h.query_by_label_contains("/deploy").is_some(),
             "list is drawn"
         );
         type_text(&mut h, "c");
-        let names: Vec<String> = h
-            .state()
-            .composer
-            .suggestions(&catalog())
-            .into_iter()
-            .map(|e| e.name)
-            .collect();
+        let names: Vec<String> = sugg(&h);
         assert_eq!(names, ["clear", "compact"]);
         assert!(
             h.query_by_label_contains("/deploy").is_none(),
             "filtered out"
         );
         type_text(&mut h, "o");
-        let names: Vec<String> = h
-            .state()
-            .composer
-            .suggestions(&catalog())
-            .into_iter()
-            .map(|e| e.name)
-            .collect();
+        let names: Vec<String> = sugg(&h);
         assert_eq!(names, ["compact"]);
     }
 
@@ -620,10 +749,7 @@ mod tests {
             "/compact ",
             "completed with a trailing space"
         );
-        assert!(
-            h.state().composer.suggestions(&catalog()).is_empty(),
-            "list closes after completion"
-        );
+        assert!(sugg(&h).is_empty(), "list closes after completion");
         type_text(&mut h, "now");
         assert_eq!(
             h.state().composer.input,
@@ -652,13 +778,10 @@ mod tests {
         let mut h = harness();
         type_text(&mut h, "/re");
         press(&mut h, Key::Escape, Modifiers::NONE);
-        assert!(h.state().composer.suggestions(&catalog()).is_empty());
+        assert!(sugg(&h).is_empty());
         assert!(h.query_by_label_contains("/review").is_none());
         type_text(&mut h, "v");
-        assert!(
-            !h.state().composer.suggestions(&catalog()).is_empty(),
-            "reopens on typing"
-        );
+        assert!(!sugg(&h).is_empty(), "reopens on typing");
         h.get_by_label_contains("/review").click();
         h.run();
         assert_eq!(h.state().composer.input, "/review ");
@@ -796,7 +919,7 @@ mod tests {
         press(&mut h, Key::ArrowUp, Modifiers::NONE);
         assert_eq!(input(&h), "/compact");
         assert!(
-            h.state().composer.suggestions(&catalog()).is_empty(),
+            sugg(&h).is_empty(),
             "a recalled command does not open the list"
         );
         press(&mut h, Key::ArrowDown, Modifiers::NONE);
@@ -844,5 +967,74 @@ mod tests {
             press(&mut h, Key::ArrowUp, Modifiers::NONE);
             assert_eq!(input(&h), want);
         }
+    }
+
+    #[test]
+    fn mention_query_finds_the_token_at_the_caret() {
+        assert_eq!(mention_query("@", 1), Some((0, String::new())));
+        assert_eq!(
+            mention_query("look at @src/ma", 15),
+            Some((8, "src/ma".into()))
+        );
+        assert_eq!(
+            mention_query("look at @src/ma now", 15),
+            Some((8, "src/ma".into()))
+        );
+        assert_eq!(
+            mention_query("mail@host", 9),
+            None,
+            "an @ inside a word is not a mention"
+        );
+        assert_eq!(
+            mention_query("@abc", 2),
+            None,
+            "caret in the middle of the word"
+        );
+        assert_eq!(mention_query("@done ", 6), None);
+    }
+
+    #[test]
+    fn at_lists_project_files_and_enter_inserts_the_path() {
+        let mut h = harness();
+        type_text(&mut h, "explain @");
+        assert_eq!(h.state().files_opened, 1, "file list refresh requested");
+        assert_eq!(
+            sugg(&h),
+            ["README.md", "src/", "src/main.rs", "src/menu.rs"]
+        );
+        assert!(
+            h.query_by_label_contains("src/menu.rs").is_some(),
+            "list is drawn"
+        );
+        type_text(&mut h, "men");
+        assert_eq!(sugg(&h), ["src/menu.rs"]);
+        press(&mut h, Key::Enter, Modifiers::NONE);
+        assert_eq!(input(&h), "explain @src/menu.rs ");
+        assert!(h.state().sent.is_empty(), "Enter inserts, does not send");
+        assert!(sugg(&h).is_empty(), "list closes after a file");
+        type_text(&mut h, "and @s");
+        press(&mut h, Key::Tab, Modifiers::NONE);
+        assert_eq!(input(&h), "explain @src/menu.rs and @src/");
+        assert_eq!(
+            sugg(&h),
+            ["src/", "src/main.rs", "src/menu.rs"],
+            "a folder keeps the list open"
+        );
+        press(&mut h, Key::ArrowDown, Modifiers::NONE);
+        press(&mut h, Key::Enter, Modifiers::NONE);
+        assert_eq!(input(&h), "explain @src/menu.rs and @src/main.rs ");
+        press(&mut h, Key::Enter, Modifiers::NONE);
+        assert_eq!(h.state().sent, ["explain @src/menu.rs and @src/main.rs "]);
+    }
+
+    #[test]
+    fn escape_closes_the_file_list() {
+        let mut h = harness();
+        type_text(&mut h, "@READ");
+        assert_eq!(sugg(&h), ["README.md"]);
+        press(&mut h, Key::Escape, Modifiers::NONE);
+        assert!(sugg(&h).is_empty());
+        press(&mut h, Key::Enter, Modifiers::NONE);
+        assert_eq!(h.state().sent, ["@READ"]);
     }
 }
