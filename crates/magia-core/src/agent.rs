@@ -244,8 +244,13 @@ impl Agent {
     /// it is being run. Built per request, since provider, model and mode can change mid-session.
     fn system_prompt(&self) -> String {
         format!(
-            "{}\n\n# This session\n- You are running in magia, a coding agent.\n- Model: `{}` via the `{}` provider. When asked which model you are, answer with this id.\n- Permission mode: `{}`.\n- Working folder: {}",
+            "{}\n\n# This session\n- You are running in magia, a coding agent. It has two programs: the `magia` CLI and the desktop app `magia-gui`. When the user asks to open \"the GUI\", \"the app\" or magia itself, they mean `magia-gui`: start it detached in the working folder with `{}`, and do not look for other programs.\n- Model: `{}` via the `{}` provider. When asked which model you are, answer with this id.\n- Permission mode: `{}`.\n- Working folder: {}",
             self.system,
+            if cfg!(windows) {
+                "magia-gui &"
+            } else {
+                "setsid magia-gui >/dev/null 2>&1 < /dev/null &"
+            },
             self.model,
             self.client.config.name,
             serde_json::to_value(self.mode)

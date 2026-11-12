@@ -807,4 +807,8 @@ async fn the_model_is_told_which_model_and_mode_it_runs_as() {
             && bodies[0].contains("mode: `auto`")
     );
     assert!(bodies[1].contains("Model: `claude-haiku-5-5`"));
+    assert!(
+        bodies[0].contains("they mean `magia-gui`"),
+        "the model knows what \"the GUI\" is"
+    );
 }
