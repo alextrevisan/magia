@@ -92,6 +92,15 @@ pub fn tokens(ui: &egui::Ui) -> &'static Tokens {
     }
 }
 
+/// Same as [`tokens`], for code that has a context but no `Ui` yet (another window).
+pub fn tokens_of(ctx: &egui::Context) -> &'static Tokens {
+    if ctx.theme() == egui::Theme::Dark {
+        &DARK
+    } else {
+        &LIGHT
+    }
+}
+
 pub fn semibold(size: f32) -> FontId {
     Weight::SemiBold.font_id(size)
 }

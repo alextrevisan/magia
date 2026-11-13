@@ -213,6 +213,8 @@ struct App {
     side: magia_core::btw::SideSlot,
     btw: Option<Btw>,
     btw_count: u64,
+    /// A follow-up typed in the `/btw` window.
+    btw_input: String,
 }
 
 /// What depends on the project folder: its config layers, agent files and a fresh agent.
@@ -363,6 +365,7 @@ impl App {
             side: Default::default(),
             btw: None,
             btw_count: 0,
+            btw_input: String::new(),
         };
         app.side = app
             .agent
@@ -453,61 +456,92 @@ impl App {
         });
     }
 
-    /// The `/btw` card above the composer; × or Esc closes it.
-    fn btw_card(&mut self, ui: &mut egui::Ui) {
-        let Some(b) = &self.btw else { return };
-        let t = *theme::tokens(ui);
+    /// The `/btw` answer in a small window of its own, apart from the session. Closing it
+    /// (or Esc) drops the answer; a question typed there replaces it.
+    fn btw_window(&mut self, ctx: &egui::Context) {
+        if self.btw.is_none() {
+            return;
+        }
+        let id = egui::ViewportId::from_hash_of("btw");
+        let builder = egui::ViewportBuilder::default()
+            .with_title(format!("{APP_NAME} — btw"))
+            .with_inner_size([480.0, 360.0])
+            .with_min_inner_size([320.0, 200.0]);
+        let mut ask = None;
         let mut close = false;
-        egui::Frame::new()
-            .fill(t.surface)
-            .stroke(egui::Stroke::new(1.0, t.line))
-            .corner_radius(egui::CornerRadius::same(8))
-            .inner_margin(egui::Margin::symmetric(12, 8))
-            .outer_margin(egui::Margin::symmetric(0, 4))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
+        ctx.show_viewport_immediate(id, builder, |ctx, class| {
+            let mut body = |ui: &mut egui::Ui, this: &mut Self| {
+                let Some(b) = &this.btw else { return };
+                let t = *theme::tokens(ui);
+                ui.horizontal_wrapped(|ui| {
                     ui.label(
                         egui::RichText::new("btw")
                             .font(theme::semibold(theme::SMALL))
                             .color(t.accent),
                     );
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(&b.question)
-                                .color(t.fg)
-                                .size(theme::SMALL + 0.5),
-                        )
-                        .truncate(),
+                    ui.label(
+                        egui::RichText::new(&b.question)
+                            .color(t.fg)
+                            .size(theme::SMALL + 1.0),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        close = ui
-                            .small_button("×")
-                            .on_hover_text("Close (Esc). Not kept in the session.")
-                            .clicked();
-                    });
                 });
+                ui.separator();
+                let input_h = 40.0;
                 egui::ScrollArea::vertical()
                     .id_salt("btw")
-                    .max_height(220.0)
+                    .max_height((ui.available_height() - input_h).max(60.0))
+                    .auto_shrink([false, false])
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         if !b.answer.is_empty() {
                             markdown::show(ui, &b.answer, usize::MAX - b.n as usize);
                         } else if !b.done {
-                            ui.label(
-                                egui::RichText::new("thinking…")
-                                    .color(t.muted)
-                                    .size(theme::SMALL),
-                            );
+                            ui.label(egui::RichText::new("thinking…").color(t.muted));
                         }
                         if let Some(e) = &b.error {
                             ui.label(egui::RichText::new(e).color(t.danger).size(theme::SMALL));
                         }
                     });
-            });
+                ui.add_space(4.0);
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut this.btw_input)
+                        .hint_text("Ask another side question (Enter) · Esc closes · not saved")
+                        .desired_width(f32::INFINITY),
+                );
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let q = std::mem::take(&mut this.btw_input);
+                    if !q.trim().is_empty() {
+                        ask = Some(q);
+                    }
+                    edit.request_focus();
+                }
+            };
+            if class == egui::ViewportClass::EmbeddedWindow {
+                // No separate windows on this platform: a floating window inside the main one.
+                let mut open = true;
+                egui::Window::new("btw")
+                    .open(&mut open)
+                    .default_size([460.0, 320.0])
+                    .show(ctx, |ui| body(ui, self));
+                close |= !open;
+            } else {
+                let t = theme::tokens_of(ctx);
+                egui::CentralPanel::default()
+                    .frame(
+                        egui::Frame::new()
+                            .fill(t.bg)
+                            .inner_margin(egui::Margin::same(12)),
+                    )
+                    .show(ctx, |ui| body(ui, self));
+                close |= ctx
+                    .input(|i| i.viewport().close_requested() || i.key_pressed(egui::Key::Escape));
+            }
+        });
         if close {
             self.btw = None;
+            self.btw_input.clear();
+        } else if let Some(q) = ask {
+            self.ask_btw(q, ctx);
         }
     }
 
@@ -1170,21 +1204,18 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.shown_title = title;
         }
-        if (self.running || self.btw.is_some())
+        if self.running
             && self.pending.is_none()
             && self.question.is_none()
             && !self.composer.input.starts_with('/')
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))
         {
-            if self.btw.is_some() {
-                self.btw = None; // Esc closes the side answer first
-            } else {
-                self.stop(&ctx);
-            }
+            self.stop(&ctx);
         }
 
         // Before the panels: the picker takes ↑↓/Enter/Esc ahead of the composer.
         self.resume_picker(&ctx);
+        self.btw_window(&ctx);
         self.top_bar(ui, &ctx);
         self.composer_panel(ui, &ctx);
         self.tasks_panel(ui);
@@ -1409,7 +1440,6 @@ impl App {
                             );
                         });
                     }
-                    self.btw_card(ui);
                     let mut unqueue = None;
                     for (i, (text, images)) in self.queue.iter().enumerate() {
                         ui.horizontal(|ui| {
