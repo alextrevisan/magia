@@ -17,6 +17,7 @@ mod magic;
 mod markdown;
 mod model_picker;
 mod resume;
+mod sidebar;
 mod theme;
 
 use magia_core::agents::{self, FileAgent};
@@ -47,6 +48,8 @@ enum UiMsg {
     Sessions(u64, Vec<magia_store::Hit>),
     /// Folders of earlier sessions, for the folder menu.
     Recent(Vec<PathBuf>),
+    /// Every saved session, for the left bar.
+    SessionList(Vec<magia_store::SessionInfo>),
     /// The folder dialog's answer (`None` = cancelled).
     Folder(Result<Option<PathBuf>, String>),
     /// A `/btw` answer, by question number: a piece of text, or the end (with any error).
@@ -209,6 +212,12 @@ struct App {
     mode_before_plan: PermissionMode,
     /// Folders of earlier sessions (the folder menu).
     recent: Vec<PathBuf>,
+    /// The left bar: projects, their conversations and standalone chats.
+    nav: sidebar::Sidebar,
+    /// The open session's file, to highlight it in the left bar.
+    current_session: Option<PathBuf>,
+    /// The left bar's list needs reloading (a turn ended, a session opened…).
+    nav_dirty: bool,
     /// The agent's request during a turn, for `/btw`.
     side: magia_core::btw::SideSlot,
     btw: Option<Btw>,
@@ -362,6 +371,9 @@ impl App {
             agents: file_agents,
             mode_before_plan,
             recent: vec![],
+            nav: Default::default(),
+            current_session: None,
+            nav_dirty: false,
             side: Default::default(),
             btw: None,
             btw_count: 0,
@@ -400,6 +412,7 @@ impl App {
         }
         self.start_mcp(ctx);
         self.refresh_catalog(ctx);
+        self.refresh_sessions(ctx);
         let (tx, ctx, cwd) = (self.tx.clone(), ctx.clone(), self.cwd.clone());
         self.rt.spawn_blocking(move || {
             // ↑ works from the first frame: earlier messages of this folder's latest session.
@@ -409,6 +422,109 @@ impl App {
             }
             let _ = tx.send(UiMsg::Recent(folder::recent(&sessions_dir(), &cwd)));
             ctx.request_repaint();
+        });
+    }
+
+    /// Continue the saved session at `path`, switching to its folder first when it belongs to
+    /// another one. `false` (with the reason in the status line) when it cannot be opened.
+    fn resume_path(&mut self, path: &std::path::Path, ctx: &egui::Context) -> bool {
+        // The sidecar is a few hundred bytes: read here, like the picker's own selection.
+        if let Some(dir) = SessionFile::open(path).meta().cwd
+            && dir.is_dir()
+            && dir != magia_store::canonical(&self.cwd)
+        {
+            self.open_folder(dir, ctx);
+        }
+        let Ok(mut a) = self.agent.try_lock() else {
+            self.status = "busy — wait for the current turn to finish".into();
+            return false;
+        };
+        match a.resume(path) {
+            Ok(n) => {
+                let history = a.history.clone();
+                drop(a);
+                self.reset_items(&history);
+                self.status = format!("resumed ({n} messages)");
+                ctx.memory_mut(|m| m.request_focus(composer::Composer::id()));
+                true
+            }
+            Err(e) => {
+                self.status = format!("{e:#}");
+                false
+            }
+        }
+    }
+
+    /// Reload the left bar's list (reads the session sidecars, off the UI thread) and note
+    /// which session is open.
+    fn refresh_sessions(&mut self, ctx: &egui::Context) {
+        if let Ok(a) = self.agent.try_lock() {
+            self.current_session = a.store.as_ref().map(|s| s.path().to_path_buf());
+        }
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        self.rt.spawn_blocking(move || {
+            let list = magia_store::list(&sessions_dir(), magia_store::Scope::All);
+            let _ = tx.send(UiMsg::SessionList(list));
+            ctx.request_repaint();
+        });
+    }
+
+    /// The left bar, when open. Switching is refused while a request runs.
+    fn nav_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if !self.cfg.sidebar {
+            return;
+        }
+        let t = *theme::tokens(ui);
+        let root = folder::chats_root();
+        let act = egui::Panel::left("nav")
+            .resizable(true)
+            .default_size(250.0)
+            .size_range(190.0..=420.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(t.bg)
+                    .inner_margin(egui::Margin::symmetric(10, 10))
+                    .stroke(egui::Stroke::new(1.0, t.line)),
+            )
+            .show(ui, |ui| {
+                self.nav
+                    .show(ui, &self.cwd, self.current_session.as_deref(), &root)
+            })
+            .inner;
+        let Some(act) = act else { return };
+        if self.running && !matches!(act, sidebar::Action::Search) {
+            self.status = "busy — stop or wait for the current request first".into();
+            return;
+        }
+        match act {
+            sidebar::Action::NewChat => match folder::new_chat_dir() {
+                Ok(dir) => self.open_folder(dir, ctx),
+                Err(e) => self.status = format!("{e:#}"),
+            },
+            sidebar::Action::NewIn(dir) => {
+                if magia_store::canonical(&dir) == magia_store::canonical(&self.cwd) {
+                    self.slash("/clear", ctx);
+                } else {
+                    self.open_folder(dir, ctx);
+                }
+            }
+            sidebar::Action::Open { path } => {
+                self.resume_path(&path, ctx);
+            }
+            sidebar::Action::AddProject => self.pick_folder(ctx),
+            sidebar::Action::Search => {
+                let current = self.current_session.clone();
+                self.resume = Some(resume::Picker::new(&self.cwd, "", current));
+            }
+        }
+    }
+
+    /// Show or hide the left bar (remembered for the next start).
+    fn toggle_nav(&mut self) {
+        self.cfg.sidebar = !self.cfg.sidebar;
+        let cfg = self.cfg.clone();
+        self.rt.spawn_blocking(move || {
+            let _ = cfg.save_state();
         });
     }
 
@@ -779,21 +895,14 @@ impl App {
                     });
                 }
                 resume::Action::Open(path) => {
-                    let Ok(mut a) = self.agent.try_lock() else {
+                    if self.running {
                         self.status = "busy — wait for the current turn to finish".into();
                         continue;
-                    };
-                    match a.resume(&path) {
-                        Ok(n) => {
-                            let history = a.history.clone();
-                            drop(a);
-                            self.reset_items(&history);
-                            self.status = format!("resumed ({n} messages)");
-                            self.resume = None;
-                            ctx.memory_mut(|m| m.request_focus(composer::Composer::id()));
-                            return;
-                        }
-                        Err(e) => self.status = format!("{e:#}"),
+                    }
+                    if self.resume_path(&path, ctx) {
+                        self.resume = None;
+                        ctx.memory_mut(|m| m.request_focus(composer::Composer::id()));
+                        return;
                     }
                 }
                 resume::Action::Close => {
@@ -827,6 +936,7 @@ impl App {
     fn reset_items(&mut self, history: &[Message]) {
         // Resume, rewind and /clear all change which session (or how much of it) is open.
         self.activity.clear();
+        self.nav_dirty = true;
         self.session_title = sent_messages(history)
             .first()
             .map(|t| magia_store::title_of(t))
@@ -1091,6 +1201,7 @@ impl App {
                 UiMsg::Files(f) => self.files = f,
                 UiMsg::History(h) => self.composer.load_history(h),
                 UiMsg::Recent(r) => self.recent = r,
+                UiMsg::SessionList(list) => self.nav.set_sessions(list),
                 UiMsg::Btw(n, update) => {
                     if let Some(b) = self.btw.as_mut().filter(|b| b.n == n) {
                         match update {
@@ -1190,6 +1301,7 @@ impl App {
                                 .push(Item::Round(format!("round {n} · {reason}")));
                         }
                         AgentEvent::TurnDone => {
+                            self.nav_dirty = true; // a new conversation or a new title
                             self.running = false;
                             self.pending = None;
                             self.question = None;
@@ -1245,6 +1357,14 @@ impl eframe::App for App {
         // Before the panels: the picker takes ↑↓/Enter/Esc ahead of the composer.
         self.resume_picker(&ctx);
         self.btw_window(&ctx);
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::B)) {
+            self.toggle_nav();
+        }
+        if std::mem::take(&mut self.nav_dirty) {
+            self.refresh_sessions(&ctx);
+        }
+        // Before the top bar, so it runs the full height of the window.
+        self.nav_panel(ui, &ctx);
         self.top_bar(ui, &ctx);
         self.composer_panel(ui, &ctx);
         self.tasks_panel(ui);
@@ -1268,16 +1388,31 @@ impl App {
                 // One height for every control in the bar (combos, the model field, buttons).
                 ui.spacing_mut().interact_size.y = BAR_H;
                 ui.horizontal(|ui| {
+                    let hint = if self.cfg.sidebar {
+                        "Hide projects and chats (Ctrl+B)"
+                    } else {
+                        "Show projects and chats (Ctrl+B)"
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("☰").size(16.0).color(t.muted))
+                                .frame(false),
+                        )
+                        .on_hover_text(hint)
+                        .clicked()
+                    {
+                        self.toggle_nav();
+                    }
                     ui.label(
                         egui::RichText::new(APP_NAME)
                             .font(theme::semibold(15.0))
                             .color(t.fg),
                     );
-                    let folder = self
-                        .cwd
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| self.cwd.display().to_string());
+                    let folder = if self.cwd.starts_with(folder::chats_root()) {
+                        "chat".to_owned() // a standalone chat's scratch folder
+                    } else {
+                        sidebar::name_of(&self.cwd)
+                    };
                     if let Some(dir) = self.folder_menu(ui, folder) {
                         match dir {
                             Some(dir) => self.open_folder(dir, ctx),

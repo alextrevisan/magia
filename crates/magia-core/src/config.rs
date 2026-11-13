@@ -43,6 +43,8 @@ pub struct Config {
     /// Primary agent: `build`, `plan`, `magia` or a root `.md` file name (`crate::agents`).
     /// From OpenCode's `default_agent`, then the last GUI choice.
     pub agent: String,
+    /// GUI: the left bar (projects and chats) is open. Last choice, from the state file.
+    pub sidebar: bool,
     pub providers: HashMap<String, ProviderOverride>,
     /// Compact the conversation when it nears this many tokens (0 = never). Default 100k.
     pub compact_at_tokens: u64,
@@ -72,6 +74,7 @@ impl Default for Config {
             model: String::new(),
             permission_mode: PermissionMode::Ask,
             agent: crate::agents::BUILD.into(),
+            sidebar: true,
             providers: HashMap::new(),
             compact_at_tokens: 100_000,
             sandbox: false,
@@ -435,6 +438,9 @@ impl Config {
         if let Some(a) = v.get("agent").and_then(Value::as_str) {
             self.agent = a.to_owned();
         }
+        if let Some(b) = v.get("sidebar").and_then(Value::as_bool) {
+            self.sidebar = b;
+        }
     }
 
     pub fn save_state(&self) -> Result<()> {
@@ -447,6 +453,7 @@ impl Config {
             "model": self.model,
             "permission_mode": self.permission_mode,
             "agent": self.agent,
+            "sidebar": self.sidebar,
         });
         std::fs::write(path, serde_json::to_string_pretty(&v)?)?;
         Ok(())

@@ -8,6 +8,26 @@ use std::path::{Path, PathBuf};
 /// How many earlier folders the menu offers.
 const RECENT: usize = 12;
 
+/// Where standalone chats (outside any project) get their scratch folders.
+pub fn chats_root() -> PathBuf {
+    let sessions = magia_store::sessions_dir();
+    sessions
+        .parent()
+        .map(|p| p.join("chats"))
+        .unwrap_or_else(|| sessions.join("chats"))
+}
+
+/// A new, empty folder for a standalone chat.
+pub fn new_chat_dir() -> anyhow::Result<PathBuf> {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let dir = chats_root().join(ms.to_string());
+    std::fs::create_dir_all(&dir)?;
+    Ok(magia_store::canonical(&dir))
+}
+
 /// Ask the user for a folder, starting at `start`. `Ok(None)` = cancelled.
 pub async fn pick(start: &Path) -> anyhow::Result<Option<PathBuf>> {
     imp::pick(start).await
@@ -16,10 +36,11 @@ pub async fn pick(start: &Path) -> anyhow::Result<Option<PathBuf>> {
 /// Folders of earlier sessions that still exist, most recent first, without `current`.
 pub fn recent(sessions: &Path, current: &Path) -> Vec<PathBuf> {
     let current = magia_store::canonical(current);
+    let chats = chats_root();
     let mut out: Vec<PathBuf> = Vec::new();
     for s in magia_store::list(sessions, magia_store::Scope::All) {
         let Some(dir) = s.meta.cwd else { continue };
-        if dir != current && !out.contains(&dir) && dir.is_dir() {
+        if dir != current && !dir.starts_with(&chats) && !out.contains(&dir) && dir.is_dir() {
             out.push(dir);
             if out.len() == RECENT {
                 break;
