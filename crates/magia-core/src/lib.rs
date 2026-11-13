@@ -2,6 +2,7 @@
 
 mod agent;
 pub mod agents;
+pub mod btw;
 mod config;
 mod ext;
 mod hooks;

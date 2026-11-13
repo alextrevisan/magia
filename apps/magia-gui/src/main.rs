@@ -49,6 +49,22 @@ enum UiMsg {
     Recent(Vec<PathBuf>),
     /// The folder dialog's answer (`None` = cancelled).
     Folder(Result<Option<PathBuf>, String>),
+    /// A `/btw` answer, by question number: a piece of text, or the end (with any error).
+    Btw(u64, BtwUpdate),
+}
+
+enum BtwUpdate {
+    Text(String),
+    Done(Option<String>),
+}
+
+/// The open `/btw` question and its answer (never part of the session).
+struct Btw {
+    n: u64,
+    question: String,
+    answer: String,
+    done: bool,
+    error: Option<String>,
 }
 
 /// RGBA preview: width, height, pixels.
@@ -170,6 +186,10 @@ struct App {
     mode_before_plan: PermissionMode,
     /// Folders of earlier sessions (the folder menu).
     recent: Vec<PathBuf>,
+    /// The agent's request during a turn, for `/btw`.
+    side: magia_core::btw::SideSlot,
+    btw: Option<Btw>,
+    btw_count: u64,
 }
 
 /// What depends on the project folder: its config layers, agent files and a fresh agent.
@@ -317,7 +337,15 @@ impl App {
             agents: file_agents,
             mode_before_plan,
             recent: vec![],
+            side: Default::default(),
+            btw: None,
+            btw_count: 0,
         };
+        app.side = app
+            .agent
+            .try_lock()
+            .map(|a| a.side.clone())
+            .unwrap_or_default();
         app.folder_opened(&cc.egui_ctx);
         // `magia-gui --resume`: reopen this folder's most recent session.
         if std::env::args().any(|a| a == "--resume")
@@ -358,6 +386,108 @@ impl App {
         });
     }
 
+    /// `/btw`: answer a side question from the conversation so far, while a turn may run.
+    /// Nothing is added to the session and no tool runs.
+    fn ask_btw(&mut self, question: String, ctx: &egui::Context) {
+        if self.cfg.model.trim().is_empty() {
+            self.status = "pick or type a model first".into();
+            return;
+        }
+        let side = if self.running {
+            self.side.lock().ok().and_then(|s| s.clone())
+        } else {
+            // Idle: what the next request would send (in memory, no I/O).
+            self.agent
+                .try_lock()
+                .ok()
+                .map(|a| Arc::new(magia_core::btw::SideContext::of(&a, true)))
+        };
+        let Some(side) = side else {
+            self.status = "busy — ask again in a moment".into();
+            return;
+        };
+        self.btw_count += 1;
+        let n = self.btw_count;
+        self.btw = Some(Btw {
+            n,
+            question: question.clone(),
+            answer: String::new(),
+            done: false,
+            error: None,
+        });
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        self.rt.spawn(async move {
+            let r = magia_core::btw::answer(&side, &question, |piece| {
+                let _ = tx.send(UiMsg::Btw(n, BtwUpdate::Text(piece.to_owned())));
+                ctx.request_repaint();
+            })
+            .await;
+            let _ = tx.send(UiMsg::Btw(
+                n,
+                BtwUpdate::Done(r.err().map(|e| format!("{e:#}"))),
+            ));
+            ctx.request_repaint();
+        });
+    }
+
+    /// The `/btw` card above the composer; × or Esc closes it.
+    fn btw_card(&mut self, ui: &mut egui::Ui) {
+        let Some(b) = &self.btw else { return };
+        let t = *theme::tokens(ui);
+        let mut close = false;
+        egui::Frame::new()
+            .fill(t.surface)
+            .stroke(egui::Stroke::new(1.0, t.line))
+            .corner_radius(egui::CornerRadius::same(8))
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .outer_margin(egui::Margin::symmetric(0, 4))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("btw")
+                            .font(theme::semibold(theme::SMALL))
+                            .color(t.accent),
+                    );
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&b.question)
+                                .color(t.fg)
+                                .size(theme::SMALL + 0.5),
+                        )
+                        .truncate(),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        close = ui
+                            .small_button("×")
+                            .on_hover_text("Close (Esc). Not kept in the session.")
+                            .clicked();
+                    });
+                });
+                egui::ScrollArea::vertical()
+                    .id_salt("btw")
+                    .max_height(220.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if !b.answer.is_empty() {
+                            markdown::show(ui, &b.answer, usize::MAX - b.n as usize);
+                        } else if !b.done {
+                            ui.label(
+                                egui::RichText::new("thinking…")
+                                    .color(t.muted)
+                                    .size(theme::SMALL),
+                            );
+                        }
+                        if let Some(e) = &b.error {
+                            ui.label(egui::RichText::new(e).color(t.danger).size(theme::SMALL));
+                        }
+                    });
+            });
+        if close {
+            self.btw = None;
+        }
+    }
+
     /// Show the system folder dialog; the answer comes back as `UiMsg::Folder`.
     fn pick_folder(&mut self, ctx: &egui::Context) {
         let (tx, ctx, start) = (self.tx.clone(), ctx.clone(), self.cwd.clone());
@@ -384,6 +514,8 @@ impl App {
         // A few small files (config layers, agent list): the same work the first frame waits for.
         let l = Loaded::new(&dir);
         self.todos = l.agent.cx.todos.clone();
+        self.side = l.agent.side.clone();
+        self.btw = None;
         self.agent = Arc::new(tokio::sync::Mutex::new(l.agent)); // the old one (and its MCP servers) goes
         self.cfg = l.cfg;
         self.agents = l.file_agents;
@@ -678,6 +810,16 @@ impl App {
                     ctx.request_repaint();
                 });
             }
+            "btw" => {
+                let question = input.trim_start()["/btw".len()..].trim();
+                if question.is_empty() {
+                    self.status =
+                        "/btw <question>: ask something on the side, without stopping the work"
+                            .into();
+                } else {
+                    self.ask_btw(question.to_owned(), ctx);
+                }
+            }
             "open" => {
                 // The whole rest of the line: paths may have spaces.
                 let typed = input.trim_start()["/open".len()..].trim();
@@ -863,6 +1005,17 @@ impl App {
                 UiMsg::Files(f) => self.files = f,
                 UiMsg::History(h) => self.composer.load_history(h),
                 UiMsg::Recent(r) => self.recent = r,
+                UiMsg::Btw(n, update) => {
+                    if let Some(b) = self.btw.as_mut().filter(|b| b.n == n) {
+                        match update {
+                            BtwUpdate::Text(piece) => b.answer.push_str(&piece),
+                            BtwUpdate::Done(error) => {
+                                b.done = true;
+                                b.error = error;
+                            }
+                        }
+                    }
+                }
                 UiMsg::Folder(Ok(Some(dir))) => self.open_folder(dir, ctx),
                 UiMsg::Folder(Ok(None)) => {}
                 UiMsg::Folder(Err(e)) => {
@@ -990,13 +1143,17 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.shown_title = title;
         }
-        if self.running
+        if (self.running || self.btw.is_some())
             && self.pending.is_none()
             && self.question.is_none()
             && !self.composer.input.starts_with('/')
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))
         {
-            self.stop(&ctx);
+            if self.btw.is_some() {
+                self.btw = None; // Esc closes the side answer first
+            } else {
+                self.stop(&ctx);
+            }
         }
 
         // Before the panels: the picker takes ↑↓/Enter/Esc ahead of the composer.
@@ -1225,6 +1382,7 @@ impl App {
                             );
                         });
                     }
+                    self.btw_card(ui);
                     let mut unqueue = None;
                     for (i, (text, images)) in self.queue.iter().enumerate() {
                         ui.horizontal(|ui| {
@@ -1839,6 +1997,11 @@ const BUILTINS: &[(&str, &str, &str)] = &[
         "open",
         "Work in another folder (no path: the folder dialog)",
         "[path]",
+    ),
+    (
+        "btw",
+        "Ask a side question; answered from the conversation without stopping the work or saving it",
+        "<question>",
     ),
 ];
 

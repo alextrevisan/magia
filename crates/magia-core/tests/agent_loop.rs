@@ -1336,3 +1336,60 @@ async fn subagents_in_one_response_run_at_the_same_time() {
     assert!(one < two);
     assert!(matches!(&agent.history[2], Message::ToolResult { call_id, .. } if call_id == "t1"));
 }
+
+// ───────────── /btw ─────────────
+
+#[tokio::test]
+async fn btw_answers_from_the_conversation_during_a_turn_and_keeps_nothing() {
+    use magia_core::btw;
+    let dir = tempfile::tempdir().unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", l.local_addr().unwrap());
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Ask,
+        dir.path().into(),
+    );
+    let slot = agent.side.clone();
+    let (asked_tx, asked_rx) = tokio::sync::oneshot::channel::<String>();
+    let server = tokio::spawn(async move {
+        // The main turn's request arrives; while it waits, a side question comes in.
+        let (mut main, _) = l.accept().await.unwrap();
+        read_request(&mut main).await;
+        let side = slot.lock().unwrap().clone().expect("published");
+        let ask = tokio::spawn(async move {
+            let mut pieces = Vec::new();
+            let r = btw::answer(&side, "what did I ask?", |p| pieces.push(p.to_owned())).await;
+            (r.unwrap(), pieces)
+        });
+        let (mut s, _) = l.accept().await.unwrap();
+        let _ = asked_tx.send(read_request(&mut s).await);
+        s.write_all(text_reply("you asked about the moon").as_bytes())
+            .await
+            .unwrap();
+        let (answer, pieces) = ask.await.unwrap();
+        main.write_all(text_reply("the moon is far").as_bytes())
+            .await
+            .unwrap();
+        (answer, pieces)
+    });
+    let ev = run(&mut agent, "tell me about the moon").await;
+    no_errors(&ev);
+    let (answer, pieces) = server.await.unwrap();
+    assert_eq!(answer, "you asked about the moon");
+    assert_eq!(pieces.concat(), answer);
+    let body = asked_rx.await.unwrap();
+    assert!(
+        body.contains("tell me about the moon"),
+        "has the conversation"
+    );
+    assert!(body.contains("what did I ask?") && body.contains("side question"));
+    // Nothing of the side exchange is kept, and the slot is cleared after the turn.
+    assert_eq!(agent.history.len(), 2);
+    assert!(!format!("{:?}", agent.history).contains("what did I ask"));
+    assert!(agent.side.lock().unwrap().is_none());
+    // Idle: the context comes from the agent itself, including the last answer.
+    let idle = btw::SideContext::of(&agent, true).question("and then?");
+    assert!(format!("{:?}", idle.messages).contains("the moon is far"));
+}

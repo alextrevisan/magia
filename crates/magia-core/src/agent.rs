@@ -12,6 +12,7 @@ use magia_tools::{Decision, Effect, PermissionMode, Registry, RuleSet, Tool, Too
 use magia_types::{ChatRequest, Image, Message, StreamEvent, ToolCall, ToolSpec, Usage};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
@@ -177,6 +178,8 @@ impl From<&str> for UserInput {
 pub struct Agent {
     /// Free subagent slots (see `MAX_PARALLEL_SUBAGENTS`).
     subagents: tokio::sync::Semaphore,
+    /// The request being sent during a turn, for `/btw` questions (see `crate::btw`).
+    pub side: crate::btw::SideSlot,
     pub client: Client,
     pub model: String,
     pub mode: PermissionMode,
@@ -244,6 +247,7 @@ impl Agent {
             persona: None,
             magia: None,
             subagents: tokio::sync::Semaphore::new(MAX_PARALLEL_SUBAGENTS),
+            side: Default::default(),
             retry_delay: RETRY_DELAY,
             project_instructions,
             reviewed: Default::default(),
@@ -464,6 +468,9 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
             images,
         });
         self.run_rounds(&request, &events, &cancel, approver).await;
+        if let Ok(mut s) = self.side.lock() {
+            *s = None; // idle again: `/btw` reads the agent itself
+        }
         self.hooks.run("stop", None, &json!({}), &self.cx.cwd).await;
         let _ = events.send(AgentEvent::TurnDone);
     }
@@ -645,19 +652,20 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
         let done = |end: End, calls: usize, edits: usize| Ok(RoundEnd { end, calls, edits });
         for _ in 0..self.max_steps() {
             self.maybe_compact(events).await;
-            let req = ChatRequest {
-                model: self.model.clone(),
-                system: Some(self.system_prompt()),
-                messages: self.history.clone(),
-                tools: self.all_specs(approver.interactive()),
-                max_tokens: None,
-                session_id: Some(self.session_id()),
-            };
+            // Also published for `/btw` questions asked during the turn (same Arc, no copy).
+            let side = Arc::new(crate::btw::SideContext {
+                client: self.client.clone(),
+                req: self.request(approver.interactive()),
+            });
+            if let Ok(mut s) = self.side.lock() {
+                *s = Some(side.clone());
+            }
+            let req = &side.req;
             // Any failure (network, decode, an error event, a dropped stream, 429/5xx) is
             // retried after a pause, from the start of this response.
             let mut attempt = 0u32;
             let (text, calls) = loop {
-                match self.stream_once(&req, events, cancel).await {
+                match self.stream_once(req, events, cancel).await {
                     Streamed::Done(text, calls) => break (text, calls),
                     Streamed::Cancelled(text, calls) => {
                         self.cancelled(text, calls);
@@ -803,6 +811,18 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
                     let _ = events.send(AgentEvent::Usage(u));
                 }
             }
+        }
+    }
+
+    /// The next model request: system prompt, the whole history and the tools on offer.
+    pub(crate) fn request(&self, interactive: bool) -> ChatRequest {
+        ChatRequest {
+            model: self.model.clone(),
+            system: Some(self.system_prompt()),
+            messages: self.history.clone(),
+            tools: self.all_specs(interactive),
+            max_tokens: None,
+            session_id: Some(self.session_id()),
         }
     }
 
