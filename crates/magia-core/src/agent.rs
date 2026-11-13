@@ -103,6 +103,8 @@ impl Approver for AutoApprove {
 
 const MAX_STEPS: usize = 50;
 const CHILD_MAX_STEPS: usize = 25;
+/// Subagents running at once; more `task` calls in one response wait for a free slot.
+pub const MAX_PARALLEL_SUBAGENTS: usize = 3;
 const SUMMARY_PREFIX: &str = "[Summary of the earlier conversation]";
 
 /// How a round of the agent loop ended.
@@ -173,6 +175,8 @@ impl From<&str> for UserInput {
 }
 
 pub struct Agent {
+    /// Free subagent slots (see `MAX_PARALLEL_SUBAGENTS`).
+    subagents: tokio::sync::Semaphore,
     pub client: Client,
     pub model: String,
     pub mode: PermissionMode,
@@ -239,6 +243,7 @@ impl Agent {
             auto_model: None,
             persona: None,
             magia: None,
+            subagents: tokio::sync::Semaphore::new(MAX_PARALLEL_SUBAGENTS),
             retry_delay: RETRY_DELAY,
             project_instructions,
             reviewed: Default::default(),
@@ -406,9 +411,9 @@ or a decision is genuinely theirs; do not use it for things you can find out you
         if !self.is_child && !self.rules.fully_denied("task") {
             v.push(ToolSpec {
                 name: "task".into(),
-                description: "Delegate a self-contained research question to a read-only subagent with its own context. \
-It can read/search the project but not modify it; it returns a concise report."
-                    .into(),
+                description: format!("Delegate a self-contained research question to a read-only subagent with its own context. \
+It can read/search the project but not modify it; it returns a concise report. Several `task` calls in one response \
+run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent questions across them."),
                 schema: json!({"type":"object","properties":{
                     "description":{"type":"string","description":"3-5 word label"},
                     "prompt":{"type":"string","description":"everything the subagent needs to know"}},
@@ -701,30 +706,43 @@ It can read/search the project but not modify it; it returns a concise report."
             }
             calls_made += calls.len();
 
-            // Independent, pre-approved calls (reads, greps, subagents…) run in parallel.
-            let parallel = calls.len() > 1 && calls.iter().all(|c| self.auto_allowed(c));
-            let results: Vec<(String, bool)> = if parallel {
-                join_all(calls.iter().map(|c| self.exec_tool(c, events, approver))).await
-            } else {
-                let mut r = Vec::new();
-                for c in &calls {
-                    if cancel.is_cancelled() {
-                        r.push(("cancelled by user".to_string(), true));
-                        continue;
-                    }
-                    r.push(self.exec_tool(c, events, approver).await);
+            // Runs of independent, pre-approved calls (reads, greps, subagents…) run in
+            // parallel; a call that needs approval runs alone, in its place in the order. Each
+            // call reports its end as soon as it finishes; history keeps the model's order.
+            let mut results: Vec<(String, bool)> = Vec::with_capacity(calls.len());
+            let mut i = 0;
+            while i < calls.len() {
+                if cancel.is_cancelled() {
+                    let r = ("cancelled by user".to_string(), true);
+                    self.report_end(&calls[i], &r, events);
+                    results.push(r);
+                    i += 1;
+                    continue;
                 }
-                r
-            };
+                let run = calls[i..]
+                    .iter()
+                    .take_while(|c| self.auto_allowed(c))
+                    .count();
+                if run > 1 {
+                    let this: &Self = self;
+                    let batch = calls[i..i + run].iter().map(|c| async move {
+                        let r = this.exec_tool(c, events, approver).await;
+                        this.report_end(c, &r, events);
+                        r
+                    });
+                    results.extend(join_all(batch).await);
+                    i += run;
+                } else {
+                    let r = self.exec_tool(&calls[i], events, approver).await;
+                    self.report_end(&calls[i], &r, events);
+                    results.push(r);
+                    i += 1;
+                }
+            }
             for (call, (output, is_error)) in calls.into_iter().zip(results) {
                 if !is_error && self.tools.get(&call.name).is_some_and(|t| t.is_edit()) {
                     edits += 1;
                 }
-                let _ = events.send(AgentEvent::ToolEnd {
-                    id: call.id.clone(),
-                    output: output.clone(),
-                    is_error,
-                });
                 self.push(Message::ToolResult {
                     call_id: call.id,
                     content: output,
@@ -786,6 +804,19 @@ It can read/search the project but not modify it; it returns a concise report."
                 }
             }
         }
+    }
+
+    fn report_end(
+        &self,
+        call: &ToolCall,
+        r: &(String, bool),
+        events: &UnboundedSender<AgentEvent>,
+    ) {
+        let _ = events.send(AgentEvent::ToolEnd {
+            id: call.id.clone(),
+            output: r.0.clone(),
+            is_error: r.1,
+        });
     }
 
     fn auto_allowed(&self, call: &ToolCall) -> bool {
@@ -945,6 +976,8 @@ It can read/search the project but not modify it; it returns a concise report."
             if prompt.is_empty() {
                 Err(anyhow::anyhow!("missing `prompt`"))
             } else {
+                // Waits here when MAX_PARALLEL_SUBAGENTS are already running.
+                let _slot = self.subagents.acquire().await;
                 Ok(run_subagent(
                     self.client.clone(),
                     self.model.clone(),

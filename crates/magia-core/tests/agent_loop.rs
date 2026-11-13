@@ -1242,3 +1242,97 @@ async fn magia_reports_its_phases_and_what_subagents_do() {
         .collect();
     assert_eq!(subs, vec![("t1", "read"), (REVIEW_PARENT, "read")]);
 }
+
+// ───────────── parallel subagents ─────────────
+
+/// Read one HTTP request from `s` (head and body).
+async fn read_request(s: &mut tokio::net::TcpStream) -> String {
+    let mut buf = vec![0u8; 65536];
+    let mut n = 0;
+    loop {
+        n += s.read(&mut buf[n..]).await.unwrap();
+        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+        if let Some(i) = text.find("\r\n\r\n") {
+            let len: usize = text[..i]
+                .lines()
+                .find_map(|l| {
+                    l.to_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(|v| v.trim().parse().unwrap())
+                })
+                .unwrap_or(0);
+            if n >= i + 4 + len {
+                return text[i + 4..].to_string();
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn subagents_in_one_response_run_at_the_same_time() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", l.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        // The parent asks for two subagents, then a read that needs no approval either.
+        let (mut s, _) = l.accept().await.unwrap();
+        read_request(&mut s).await;
+        s.write_all(
+            tool_reply(&[
+                (
+                    "t1",
+                    "task",
+                    r#"{"description":"one","prompt":"question one"}"#,
+                ),
+                (
+                    "t2",
+                    "task",
+                    r#"{"description":"two","prompt":"question two"}"#,
+                ),
+            ])
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        // Both children must be connected before either gets an answer.
+        let (mut c1, _) = l.accept().await.unwrap();
+        let b1 = read_request(&mut c1).await;
+        let (mut c2, _) = l.accept().await.unwrap();
+        let b2 = read_request(&mut c2).await;
+        for (mut c, b) in [(c1, b1), (c2, b2)] {
+            let which = if b.contains("question one") {
+                "one"
+            } else {
+                "two"
+            };
+            c.write_all(text_reply(&format!("report {which}")).as_bytes())
+                .await
+                .unwrap();
+        }
+        let (mut s, _) = l.accept().await.unwrap();
+        let last = read_request(&mut s).await;
+        s.write_all(text_reply("both done").as_bytes())
+            .await
+            .unwrap();
+        last
+    });
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Ask,
+        dir.path().into(),
+    );
+    let ev = tokio::time::timeout(std::time::Duration::from_secs(10), run(&mut agent, "go"))
+        .await
+        .expect("the subagents ran one after the other");
+    no_errors(&ev);
+    let last = server.await.unwrap();
+    // Results go back in the model's order, whichever finished first.
+    let (one, two) = (
+        last.find("report one").unwrap(),
+        last.find("report two").unwrap(),
+    );
+    assert!(one < two);
+    assert!(matches!(&agent.history[2], Message::ToolResult { call_id, .. } if call_id == "t1"));
+}

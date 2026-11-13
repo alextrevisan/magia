@@ -60,7 +60,8 @@ expensive to redo, a trade-off they must choose, an irreversible step). Do not e
 question in plain text while work remains: either ask with `question` or decide, say what you \
 assumed, and continue.
 - Use `task` for broad read-only searches whose details you do not need, to keep your context \
-small.
+small. Independent questions go in separate `task` calls in the same response: they run in \
+parallel.
 - When everything is done, an independent reviewer may check the changed files. If it reports \
 problems, fix the real ones; if a point is wrong, say why in one line.
 - Finish with a short report: what changed (paths), how it was verified, anything left open.";
