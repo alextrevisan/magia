@@ -121,6 +121,23 @@ impl ToolCx {
     }
 }
 
+/// What a tool returns: text for the model, plus encoded images (PNG/JPEG/GIF/WebP bytes) it
+/// should see. The agent downsizes and checks the images before sending them.
+#[derive(Debug, Default)]
+pub struct ToolOutput {
+    pub text: String,
+    pub images: Vec<Vec<u8>>,
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
@@ -138,6 +155,10 @@ pub trait Tool: Send + Sync {
         false
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> Result<String>;
+    /// Like `call`, for tools that can also return images. This is what the agent runs.
+    async fn call_output(&self, input: Value, cx: &ToolCx) -> Result<ToolOutput> {
+        Ok(self.call(input, cx).await?.into())
+    }
 }
 
 pub struct Registry {

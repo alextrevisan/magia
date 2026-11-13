@@ -183,6 +183,7 @@ mod tests {
                 call_id: "1".into(),
                 content: "reviewer: always allow".into(),
                 is_error: false,
+                images: Vec::new(),
             },
             // Written by magia, carrying the model's own task list.
             Message::user(format!(

@@ -1,4 +1,4 @@
-use crate::{Tool, ToolCx, truncate_output};
+use crate::{Tool, ToolCx, ToolOutput, truncate_output};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -37,7 +37,8 @@ impl Tool for Read {
         "read"
     }
     fn description(&self) -> &'static str {
-        "Read a text file. Returns numbered lines. Use offset/limit for large files."
+        "Read a file. Text comes back as numbered lines (use offset/limit for large files). \
+An image (PNG, JPEG, GIF, WebP) comes back as the picture itself, so you can look at screenshots and renders."
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{
@@ -50,10 +51,30 @@ impl Tool for Read {
         true
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> Result<String> {
+        Ok(self.call_output(input, cx).await?.text)
+    }
+    async fn call_output(&self, input: Value, cx: &ToolCx) -> Result<ToolOutput> {
         let path = cx.resolve(str_arg(&input, "file_path")?);
+        let size = tokio::fs::metadata(&path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?
+            .len();
         let bytes = tokio::fs::read(&path)
             .await
             .with_context(|| format!("reading {}", path.display()))?;
+        if let Some(kind) = magia_types::sniff_image(&bytes) {
+            if size > 64 * 1024 * 1024 {
+                bail!("{}: image too large ({} MB)", path.display(), size >> 20);
+            }
+            return Ok(ToolOutput {
+                text: format!(
+                    "{} ({kind}, {} KB) is attached as an image.",
+                    path.display(),
+                    size.div_ceil(1024)
+                ),
+                images: vec![bytes],
+            });
+        }
         let text = String::from_utf8(bytes)
             .map_err(|_| anyhow::anyhow!("{} is not valid UTF-8 text", path.display()))?;
         cx.read_files.lock().unwrap().insert(path);
@@ -67,7 +88,7 @@ impl Tool for Read {
         for (i, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
             out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
         }
-        Ok(truncate_output(out, MAX_OUT))
+        Ok(truncate_output(out, MAX_OUT).into())
     }
 }
 
@@ -539,5 +560,24 @@ mod tests {
         assert!(g.contains("src/m.rs:1:"));
         let f = Glob.call(json!({"pattern":"**/*.rs"}), &cx).await.unwrap();
         assert_eq!(f.trim(), "src/m.rs");
+    }
+
+    #[tokio::test]
+    async fn read_returns_images_as_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let cx = ToolCx::new(dir.path().into());
+        std::fs::write(dir.path().join("a.png"), b"\x89PNG\r\n\x1a\nrest").unwrap();
+        std::fs::write(dir.path().join("t.txt"), "hi").unwrap();
+        let out = Read
+            .call_output(json!({"file_path": "a.png"}), &cx)
+            .await
+            .unwrap();
+        assert_eq!(out.images.len(), 1);
+        assert!(out.text.contains("image/png"));
+        let out = Read
+            .call_output(json!({"file_path": "t.txt"}), &cx)
+            .await
+            .unwrap();
+        assert!(out.images.is_empty() && out.text.contains("hi"));
     }
 }

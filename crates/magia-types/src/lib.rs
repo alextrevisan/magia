@@ -27,6 +27,9 @@ pub enum Message {
         call_id: String,
         content: String,
         is_error: bool,
+        /// Images the tool returned (a screenshot, an image file it read).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<Image>,
     },
 }
 
@@ -36,6 +39,21 @@ pub struct Image {
     /// `image/png`, `image/jpeg`, `image/gif` or `image/webp`.
     pub media_type: String,
     pub data: String,
+}
+
+/// Media type of encoded image bytes, from their magic bytes.
+pub fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
 }
 
 impl Image {

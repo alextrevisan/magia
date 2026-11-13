@@ -17,6 +17,7 @@ mod magic;
 mod markdown;
 mod model_picker;
 mod resume;
+mod screenshot;
 mod sidebar;
 mod theme;
 
@@ -262,6 +263,9 @@ impl Loaded {
         .expect("http client");
         let mut agent = Agent::new(client, cfg.model.clone(), cfg.permission_mode, cwd.into());
         agent.configure(&cfg);
+        if screenshot::available() {
+            agent.tools.add(Box::new(screenshot::Screenshot));
+        }
         agent.store = SessionFile::create_for(&sessions_dir(), cwd).ok();
         let mut status = status;
         let mut cfg = cfg;
@@ -2824,6 +2828,7 @@ fn items_from_history(history: &[Message], cwd: &std::path::Path) -> Vec<Item> {
                 call_id,
                 content,
                 is_error,
+                ..
             } => {
                 for it in items.iter_mut().rev() {
                     if let Item::Tool { id, output, .. } = it

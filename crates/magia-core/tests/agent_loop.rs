@@ -1800,3 +1800,51 @@ async fn reference_folders_are_read_freely_but_writing_there_asks() {
         bodies[0].contains("Reference folders") && bodies[0].contains(&r.display().to_string())
     );
 }
+
+#[tokio::test]
+async fn an_image_read_by_a_tool_reaches_the_model_and_old_ones_are_left_out() {
+    let dir = tempfile::tempdir().unwrap();
+    // A real 1×1 PNG, so the agent's checks (decode, size) pass.
+    let png = {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(1, 1)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    };
+    std::fs::write(dir.path().join("shot.png"), &png).unwrap();
+    let read = (r#"{"file_path":"shot.png"}"#).to_string();
+    let replies = vec![
+        tool_reply(&[("c1", "read", &read)]),
+        tool_reply(&[("c2", "read", &read)]),
+        tool_reply(&[("c3", "read", &read)]),
+        tool_reply(&[("c4", "read", &read)]),
+        text_reply("I see a pixel"),
+    ];
+    let (url, server) = serve(replies).await;
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Ask,
+        dir.path().into(),
+    );
+    run(&mut agent, "look at shot.png").await;
+    let images = |h: &Vec<Message>| -> Vec<usize> {
+        h.iter()
+            .filter_map(|m| match m {
+                Message::ToolResult { images, .. } => Some(images.len()),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        images(&agent.history),
+        [1, 1, 1, 1],
+        "history keeps them all"
+    );
+    let bodies = server.await.unwrap();
+    assert!(bodies[1].contains("data:image/png;base64,"));
+    // The last request carries only the 3 newest images.
+    assert_eq!(bodies[4].matches("data:image/png;base64,").count(), 3);
+    assert!(bodies[4].contains("image no longer shown"));
+}

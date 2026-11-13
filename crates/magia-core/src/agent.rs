@@ -790,11 +790,11 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
             // Runs of independent, pre-approved calls (reads, greps, subagents…) run in
             // parallel; a call that needs approval runs alone, in its place in the order. Each
             // call reports its end as soon as it finishes; history keeps the model's order.
-            let mut results: Vec<(String, bool)> = Vec::with_capacity(calls.len());
+            let mut results: Vec<(String, bool, Vec<Image>)> = Vec::with_capacity(calls.len());
             let mut i = 0;
             while i < calls.len() {
                 if cancel.is_cancelled() {
-                    let r = ("cancelled by user".to_string(), true);
+                    let r = ("cancelled by user".to_string(), true, Vec::new());
                     self.report_end(&calls[i], &r, events);
                     results.push(r);
                     i += 1;
@@ -820,7 +820,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
                     i += 1;
                 }
             }
-            for (call, (output, is_error)) in calls.into_iter().zip(results) {
+            for (call, (output, is_error, images)) in calls.into_iter().zip(results) {
                 if !is_error && self.tools.get(&call.name).is_some_and(|t| t.is_edit()) {
                     edits += 1;
                 }
@@ -828,6 +828,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
                     call_id: call.id,
                     content: output,
                     is_error,
+                    images,
                 });
             }
             if cancel.is_cancelled() {
@@ -892,7 +893,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
         ChatRequest {
             model: self.model.clone(),
             system: Some(self.system_prompt()),
-            messages: self.history.clone(),
+            messages: recent_tool_images(self.history.clone()),
             tools: self.all_specs(interactive),
             max_tokens: None,
             session_id: Some(self.session_id()),
@@ -913,7 +914,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
     fn report_end(
         &self,
         call: &ToolCall,
-        r: &(String, bool),
+        r: &(String, bool, Vec<Image>),
         events: &UnboundedSender<AgentEvent>,
     ) {
         let _ = events.send(AgentEvent::ToolEnd {
@@ -1136,6 +1137,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
                 call_id: id,
                 content: "cancelled by user".into(),
                 is_error: true,
+                images: Vec::new(),
             });
         }
     }
@@ -1145,7 +1147,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
         call: &ToolCall,
         events: &UnboundedSender<AgentEvent>,
         approver: &dyn Approver,
-    ) -> (String, bool) {
+    ) -> (String, bool, Vec<Image>) {
         let _ = events.send(AgentEvent::ToolStart {
             id: call.id.clone(),
             name: call.name.clone(),
@@ -1161,7 +1163,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
             )
             .await;
         if let Some(reason) = pre.blocked {
-            return (format!("blocked by hook: {reason}"), true);
+            return (format!("blocked by hook: {reason}"), true, Vec::new());
         }
 
         let result = if call.name == "question" && !self.is_child {
@@ -1191,7 +1193,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
             } else {
                 match approver.ask(&question, &options).await {
                     Some(a) if !a.trim().is_empty() => {
-                        Ok(format!("The user answered: {}", a.trim()))
+                        Ok(format!("The user answered: {}", a.trim()).into())
                     }
                     _ => Err(anyhow::anyhow!(
                         "the user did not answer; continue with your best judgment and say what you assumed"
@@ -1217,17 +1219,19 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
                     self.cx.cancel.clone(),
                     Some((events.clone(), call.id.clone())),
                 )
-                .await)
+                .await
+                .into())
             }
         } else {
             let Some(tool) = self.tools.get(&call.name) else {
-                return (format!("unknown tool `{}`", call.name), true);
+                return (format!("unknown tool `{}`", call.name), true, Vec::new());
             };
             let decision = self.decision(call, tool);
             if decision == Decision::Deny {
                 return (
                     format!("`{}` is not allowed in {:?} mode", call.name, self.mode),
                     true,
+                    Vec::new(),
                 );
             }
             // Reaching outside the project asks first; a yes there approves the call too. A
@@ -1243,28 +1247,41 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
             } else {
                 match self.outside_check(call, approver).await {
                     Ok(asked) => asked,
-                    Err(msg) => return (msg, true),
+                    Err(msg) => return (msg, true, Vec::new()),
                 }
             };
             match decision {
                 _ if approved => {}
                 Decision::Ask if !approver.approve(call).await => {
                     self.denied.store(true, Ordering::Relaxed);
-                    return (format!("the user denied this tool call.{AGAIN}"), true);
+                    return (
+                        format!("the user denied this tool call.{AGAIN}"),
+                        true,
+                        Vec::new(),
+                    );
                 }
                 Decision::Review => {
                     if let Err(msg) = self.auto_check(call, events, approver).await {
-                        return (msg, true);
+                        return (msg, true, Vec::new());
                     }
                 }
                 _ => {}
             }
-            tool.call(call.arguments.clone(), &self.cx).await
+            tool.call_output(call.arguments.clone(), &self.cx).await
         };
-        let (out, is_err) = match result {
-            Ok(o) => (o, false),
-            Err(e) => (format!("{e:#}"), true),
+        let (mut out, is_err, raw) = match result {
+            Ok(o) => (o.text, false, o.images),
+            Err(e) => (format!("{e:#}"), true, Vec::new()),
         };
+        // Downsized and checked off the async workers (PNG decoding takes a moment).
+        let mut images = Vec::new();
+        for bytes in raw {
+            match tokio::task::spawn_blocking(move || crate::media::image_from_bytes(bytes)).await {
+                Ok(Ok(img)) => images.push(img),
+                Ok(Err(e)) => out.push_str(&format!("\n(the image could not be attached: {e:#})")),
+                Err(e) => out.push_str(&format!("\n(the image could not be attached: {e})")),
+            }
+        }
         self.hooks
             .run(
                 "post_tool",
@@ -1273,7 +1290,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
                 &self.cx.cwd,
             )
             .await;
-        (out, is_err)
+        (out, is_err, images)
     }
 
     // ───────────── context compaction ─────────────
@@ -1589,6 +1606,30 @@ fn new_session_id() -> String {
     format!("magia-{:016x}", h.finish())
 }
 
+/// Tool results whose images are still sent; older ones say the image was left out. A loop
+/// that takes a screenshot per step would otherwise resend every one of them each request.
+const TOOL_IMAGES_KEPT: usize = 3;
+
+fn recent_tool_images(mut history: Vec<Message>) -> Vec<Message> {
+    let mut seen = 0;
+    for m in history.iter_mut().rev() {
+        if let Message::ToolResult {
+            content, images, ..
+        } = m
+            && !images.is_empty()
+        {
+            seen += 1;
+            if seen > TOOL_IMAGES_KEPT {
+                images.clear();
+                content.push_str(
+                    "\n(image no longer shown, to save context; call the tool again to see it)",
+                );
+            }
+        }
+    }
+    history
+}
+
 fn estimate_tokens(h: &[Message]) -> u64 {
     let bytes: usize = h
         .iter()
@@ -1602,7 +1643,9 @@ fn estimate_tokens(h: &[Message]) -> u64 {
                         .map(|c| c.arguments.to_string().len() + c.name.len())
                         .sum::<usize>()
             }
-            Message::ToolResult { content, .. } => content.len(),
+            Message::ToolResult {
+                content, images, ..
+            } => content.len() + images.len() * 6400,
         })
         .sum();
     (bytes / 4) as u64
@@ -1639,12 +1682,20 @@ fn render_transcript(h: &[Message]) -> String {
                 }
             }
             Message::ToolResult {
-                content, is_error, ..
-            } => out.push_str(&format!(
-                "[tool result{}] {}\n",
-                if *is_error { " (error)" } else { "" },
-                clip(content, 800)
-            )),
+                content,
+                is_error,
+                images,
+                ..
+            } => {
+                out.push_str(&format!(
+                    "[tool result{}] {}\n",
+                    if *is_error { " (error)" } else { "" },
+                    clip(content, 800)
+                ));
+                if !images.is_empty() {
+                    out.push_str(&format!("[tool returned {} image(s)]\n", images.len()));
+                }
+            }
         }
     }
     out

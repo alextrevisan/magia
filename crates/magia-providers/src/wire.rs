@@ -100,12 +100,43 @@ fn messages_user_content(text: &str, images: &[Image]) -> Value {
 
 // ───────────────────────── Chat Completions ─────────────────────────
 
+/// Chat Completions and Responses take no images in a tool result, so the images of a run of
+/// tool results follow it as one user message.
+const TOOL_IMAGES_NOTE: &str = "Images returned by the tool calls above:";
+
+/// Images of the run of tool results that ends before `messages[i]` (empty when `i` does not
+/// end one).
+fn tool_images_before(messages: &[Message], i: usize) -> Vec<Image> {
+    let ends_run = matches!(
+        messages.get(i.wrapping_sub(1)),
+        Some(Message::ToolResult { .. })
+    ) && !matches!(messages.get(i), Some(Message::ToolResult { .. }));
+    if i == 0 || !ends_run {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for m in messages[..i].iter().rev() {
+        match m {
+            Message::ToolResult { images, .. } => out.splice(0..0, images.iter().cloned()),
+            _ => break,
+        };
+    }
+    out
+}
+
 fn chat_body(req: &ChatRequest) -> Value {
     let mut msgs = Vec::new();
     if let Some(sys) = &req.system {
         msgs.push(json!({"role": "system", "content": sys}));
     }
-    for m in &req.messages {
+    for i in 0..=req.messages.len() {
+        let images = tool_images_before(&req.messages, i);
+        if !images.is_empty() {
+            msgs.push(
+                json!({"role": "user", "content": chat_user_content(TOOL_IMAGES_NOTE, &images)}),
+            );
+        }
+        let Some(m) = req.messages.get(i) else { break };
         match m {
             Message::User { text, images } => {
                 msgs.push(json!({"role": "user", "content": chat_user_content(text, images)}))
@@ -275,7 +306,12 @@ impl Decoder for ChatDecoder {
 
 fn responses_body(req: &ChatRequest) -> Value {
     let mut input = Vec::new();
-    for m in &req.messages {
+    for i in 0..=req.messages.len() {
+        let images = tool_images_before(&req.messages, i);
+        if !images.is_empty() {
+            input.push(json!({"role": "user", "content": responses_user_content(TOOL_IMAGES_NOTE, &images)}));
+        }
+        let Some(m) = req.messages.get(i) else { break };
         match m {
             Message::User { text, images } => {
                 input.push(json!({"role": "user", "content": responses_user_content(text, images)}))
@@ -429,7 +465,13 @@ fn messages_body(req: &ChatRequest) -> Value {
                 call_id,
                 content,
                 is_error,
+                images,
             } => {
+                let content = if images.is_empty() {
+                    json!(content)
+                } else {
+                    messages_user_content(content, images)
+                };
                 let block = json!({"type": "tool_result", "tool_use_id": call_id,
                     "content": content, "is_error": is_error});
                 // Consecutive tool results must share one user message.
@@ -714,6 +756,80 @@ mod tests {
     }
 
     #[test]
+    fn tool_images_in_every_wire() {
+        let img = Image {
+            media_type: "image/png".into(),
+            data: "QUJD".into(),
+        };
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "screenshot".into(),
+            arguments: json!({}),
+        };
+        let result = |id: &str, images: Vec<Image>| Message::ToolResult {
+            call_id: id.into(),
+            content: "shot".into(),
+            is_error: false,
+            images,
+        };
+        let req = ChatRequest {
+            model: "m".into(),
+            messages: vec![
+                Message::user("look"),
+                Message::Assistant {
+                    text: String::new(),
+                    tool_calls: vec![call("a"), call("b")],
+                },
+                result("a", vec![img.clone()]),
+                result("b", vec![img.clone()]),
+                Message::Assistant {
+                    text: "ok".into(),
+                    tool_calls: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+        // Chat: tool messages stay text; one user message with both images follows them.
+        let chat = build_body(Wire::ChatCompletions, &req);
+        let m = chat["messages"].as_array().unwrap();
+        let roles: Vec<&str> = m.iter().map(|x| x["role"].as_str().unwrap()).collect();
+        assert_eq!(
+            roles,
+            ["user", "assistant", "tool", "tool", "user", "assistant"]
+        );
+        assert_eq!(m[2]["content"], "shot");
+        let parts = m[4]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["text"], TOOL_IMAGES_NOTE);
+        assert_eq!(parts.len(), 3);
+
+        let resp = build_body(Wire::Responses, &req);
+        let i = resp["input"].as_array().unwrap();
+        assert_eq!(i[3]["type"], "function_call_output");
+        assert_eq!(i[5]["role"], "user");
+        assert_eq!(i[5]["content"][1]["type"], "input_image");
+        assert_eq!(i[6]["role"], "assistant");
+
+        // Messages: the image goes inside its tool_result block.
+        let msg = build_body(Wire::Messages, &req);
+        let blocks = msg["messages"][2]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["content"][0]["type"], "image");
+        assert_eq!(
+            blocks[0]["content"][1],
+            json!({"type": "text", "text": "shot"})
+        );
+
+        // A result at the very end still gets its images sent.
+        let mut tail = req.clone();
+        tail.messages.pop();
+        let chat = build_body(Wire::ChatCompletions, &tail);
+        assert_eq!(
+            chat["messages"].as_array().unwrap().last().unwrap()["role"],
+            "user"
+        );
+    }
+
+    #[test]
     fn user_images_in_every_wire() {
         let img = Image {
             media_type: "image/png".into(),
@@ -785,11 +901,13 @@ mod tests {
                     call_id: "a".into(),
                     content: "1".into(),
                     is_error: false,
+                    images: Vec::new(),
                 },
                 Message::ToolResult {
                     call_id: "b".into(),
                     content: "2".into(),
                     is_error: false,
+                    images: Vec::new(),
                 },
             ],
             ..Default::default()

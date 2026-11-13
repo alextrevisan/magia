@@ -72,7 +72,7 @@ pub fn resolve(typed: &str, cwd: &Path) -> anyhow::Result<PathBuf> {
 
 /// `file:///home/a/my%20app` → `/home/a/my app`.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn path_from_uri(uri: &str) -> Option<PathBuf> {
+pub(crate) fn path_from_uri(uri: &str) -> Option<PathBuf> {
     let rest = uri.strip_prefix("file://")?;
     // An authority before the path ("file://localhost/…") is allowed and ignored.
     let path = &rest[rest.find('/')?..];
