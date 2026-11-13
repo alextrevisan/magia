@@ -6,6 +6,7 @@ mod config;
 mod ext;
 mod hooks;
 mod jsonc;
+pub mod magia_mode;
 pub mod media;
 pub mod review;
 

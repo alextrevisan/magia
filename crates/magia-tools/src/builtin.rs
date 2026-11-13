@@ -295,12 +295,12 @@ impl Tool for TodoTool {
         "todo"
     }
     fn description(&self) -> &'static str {
-        "Replace the task list used to plan and track multi-step work. Each item has content and status (pending|in_progress|completed)."
+        "Replace the task list used to plan and track multi-step work. Send the whole list each time. Each item has content and status: pending, in_progress, completed (really done), or cancelled (decided not to do it; say why)."
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{"todos":{"type":"array","items":{"type":"object","properties":{
             "content":{"type":"string"},
-            "status":{"type":"string","enum":["pending","in_progress","completed"]}},
+            "status":{"type":"string","enum":["pending","in_progress","completed","cancelled"]}},
             "required":["content","status"]}}},"required":["todos"]})
     }
     fn read_only(&self) -> bool {

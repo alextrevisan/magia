@@ -890,3 +890,232 @@ async fn a_big_agent_prompt_alone_does_not_trigger_compaction() {
     let bodies = server.await.unwrap();
     assert!(bodies.iter().all(|b| !b.contains("Summarize this session")));
 }
+
+// ───────────── Magia mode ─────────────
+
+fn magia_agent(url: String, dir: &std::path::Path, mode: PermissionMode) -> Agent {
+    let mut a = Agent::new(client(url), "m".into(), mode, dir.into());
+    a.magia = Some(magia_core::magia_mode::MagiaMode::default());
+    a
+}
+
+fn todos(items: &[(&str, &str)]) -> String {
+    let list: Vec<_> = items
+        .iter()
+        .map(|(c, s)| serde_json::json!({"content": c, "status": s}))
+        .collect();
+    serde_json::json!({ "todos": list }).to_string()
+}
+
+fn rounds(ev: &[AgentEvent]) -> Vec<(u32, String)> {
+    ev.iter()
+        .filter_map(|e| match e {
+            AgentEvent::Round { n, reason } => Some((*n, reason.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn no_errors(ev: &[AgentEvent]) {
+    for e in ev {
+        if let AgentEvent::Error(e) = e {
+            panic!("unexpected error: {e}");
+        }
+    }
+}
+
+fn notices(ev: &[AgentEvent]) -> String {
+    ev.iter()
+        .filter_map(|e| match e {
+            AgentEvent::Notice(n) => Some(n.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[tokio::test]
+async fn magia_continues_while_tasks_are_open_then_has_the_work_reviewed() {
+    let dir = tempfile::tempdir().unwrap();
+    let plan = todos(&[("write x", "pending"), ("check x", "pending")]);
+    let half = todos(&[("write x", "completed"), ("check x", "pending")]);
+    let all = todos(&[("write x", "completed"), ("check x", "completed")]);
+    let (url, server) = serve(vec![
+        tool_reply(&[("t1", "todo", &plan)]),
+        tool_reply(&[
+            ("w1", "write", r#"{"file_path":"x.txt","content":"x"}"#),
+            ("t2", "todo", &half),
+        ]),
+        text_reply("x written"), // stops with one item open
+        tool_reply(&[("t3", "todo", &all)]),
+        text_reply("all done"),
+        text_reply(r#"Checked x.txt. {"verdict":"pass","issues":[]}"#), // the reviewer
+    ])
+    .await;
+    let mut agent = magia_agent(url, dir.path(), PermissionMode::Yolo);
+    let ev = run(&mut agent, "create x.txt and check it").await;
+    no_errors(&ev);
+    assert_eq!(rounds(&ev), vec![(2, "1 task(s) left".into())]);
+    assert!(notices(&ev).contains("review passed"));
+    let bodies = server.await.unwrap();
+    assert_eq!(bodies.len(), 6);
+    assert!(bodies[3].contains("[magia: continue]"));
+    assert!(bodies[3].contains("create x.txt and check it"));
+    assert!(
+        bodies[3].contains("Magia mode"),
+        "instructions in the system prompt"
+    );
+    assert!(bodies[5].contains("independent reviewer"));
+    assert!(bodies[5].contains("x.txt"));
+    assert!(
+        !bodies[5].contains("Magia mode"),
+        "the reviewer is not a Magia agent"
+    );
+    // One request, one rewind: every round goes, and the file with it.
+    agent.rewind(1).unwrap();
+    assert!(agent.history.is_empty());
+    assert!(!dir.path().join("x.txt").exists());
+}
+
+#[tokio::test]
+async fn magia_reopens_the_work_when_the_review_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = serve(vec![
+        tool_reply(&[
+            ("w1", "write", r#"{"file_path":"x.txt","content":""}"#),
+            ("t1", "todo", &todos(&[("write x", "completed")])),
+        ]),
+        text_reply("done"),
+        text_reply(r#"{"verdict":"fail","issues":["x.txt is empty"]}"#),
+        text_reply("The file is meant to be empty."), // no tool calls: stop
+    ])
+    .await;
+    let mut agent = magia_agent(url, dir.path(), PermissionMode::Yolo);
+    let ev = run(&mut agent, "create x.txt").await;
+    no_errors(&ev);
+    assert_eq!(rounds(&ev), vec![(2, "review found 1 problem(s)".into())]);
+    let bodies = server.await.unwrap();
+    assert!(bodies[3].contains("x.txt is empty"));
+}
+
+#[tokio::test]
+async fn magia_stops_when_the_model_only_talks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = serve(vec![
+        tool_reply(&[("t1", "todo", &todos(&[("pick a db", "pending")]))]),
+        text_reply("Starting."),
+        text_reply("Which database should I use?"),
+    ])
+    .await;
+    let mut agent = magia_agent(url, dir.path(), PermissionMode::Yolo);
+    let ev = run(&mut agent, "set up storage").await;
+    no_errors(&ev);
+    assert_eq!(rounds(&ev).len(), 1);
+    assert_eq!(server.await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn magia_gives_up_after_rounds_without_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    let read = || tool_reply(&[("r", "read", r#"{"file_path":"a.txt"}"#)]);
+    let mut replies = vec![
+        tool_reply(&[("t1", "todo", &todos(&[("task", "pending")]))]),
+        text_reply("on it"),
+    ];
+    for _ in 0..3 {
+        replies.push(read());
+        replies.push(text_reply("still thinking"));
+    }
+    let (url, server) = serve(replies).await;
+    let mut agent = magia_agent(url, dir.path(), PermissionMode::Yolo);
+    let ev = run(&mut agent, "do the task").await;
+    no_errors(&ev);
+    assert_eq!(
+        rounds(&ev).iter().map(|r| r.0).collect::<Vec<_>>(),
+        vec![2, 3, 4]
+    );
+    assert!(notices(&ev).contains("without progress"));
+    assert_eq!(server.await.unwrap().len(), 8);
+}
+
+#[tokio::test]
+async fn magia_stops_when_the_user_denies_a_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = serve(vec![
+        tool_reply(&[
+            ("t1", "todo", &todos(&[("deploy", "pending")])),
+            ("b1", "bash", r#"{"command":"make deploy"}"#),
+        ]),
+        text_reply("I could not deploy."),
+    ])
+    .await;
+    // Ask mode, and the approver says no.
+    let mut agent = magia_agent(url, dir.path(), PermissionMode::Ask);
+    let ev = run(&mut agent, "deploy it").await;
+    no_errors(&ev);
+    assert!(rounds(&ev).is_empty());
+    assert!(notices(&ev).contains("denied"));
+    assert_eq!(server.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn magia_turns_the_step_limit_into_a_new_round() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    let mut replies: Vec<String> = (0..50)
+        .map(|_| tool_reply(&[("r", "read", r#"{"file_path":"a.txt"}"#)]))
+        .collect();
+    replies.push(text_reply("finished reading"));
+    let (url, server) = serve(replies).await;
+    let mut agent = magia_agent(url, dir.path(), PermissionMode::Yolo);
+    let ev = run(&mut agent, "read a lot").await;
+    no_errors(&ev);
+    assert_eq!(
+        rounds(&ev),
+        vec![(2, "step limit reached, continuing".into())]
+    );
+    assert_eq!(server.await.unwrap().len(), 51);
+}
+
+#[tokio::test]
+async fn magia_ignores_open_tasks_left_by_an_earlier_request() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+    let (url, server) = serve(vec![
+        tool_reply(&[("r", "read", r#"{"file_path":"a.txt"}"#)]),
+        text_reply("a.txt says a"),
+    ])
+    .await;
+    let mut agent = magia_agent(url, dir.path(), PermissionMode::Yolo);
+    agent.cx.todos.lock().unwrap().push(magia_tools::Todo {
+        content: "old work".into(),
+        status: "pending".into(),
+    });
+    let ev = run(&mut agent, "what is in a.txt?").await;
+    no_errors(&ev);
+    assert!(rounds(&ev).is_empty());
+    assert_eq!(server.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn build_and_plan_stop_with_open_tasks() {
+    for (magia, mode) in [(false, PermissionMode::Yolo), (true, PermissionMode::Plan)] {
+        let dir = tempfile::tempdir().unwrap();
+        let (url, server) = serve(vec![
+            tool_reply(&[("t1", "todo", &todos(&[("task", "pending")]))]),
+            text_reply("planned"),
+        ])
+        .await;
+        let mut agent = magia_agent(url, dir.path(), mode);
+        if !magia {
+            agent.magia = None;
+        }
+        let ev = run(&mut agent, "plan the task").await;
+        no_errors(&ev);
+        assert!(rounds(&ev).is_empty());
+        let bodies = server.await.unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert!(!bodies[0].contains("Magia mode"));
+    }
+}

@@ -40,7 +40,7 @@ pub struct Config {
     pub provider: String,
     pub model: String,
     pub permission_mode: PermissionMode,
-    /// Primary agent: `build`, `plan` or a root `.md` file name (`crate::agents`).
+    /// Primary agent: `build`, `plan`, `magia` or a root `.md` file name (`crate::agents`).
     /// From OpenCode's `default_agent`, then the last GUI choice.
     pub agent: String,
     pub providers: HashMap<String, ProviderOverride>,
@@ -50,6 +50,8 @@ pub struct Config {
     pub sandbox: bool,
     /// `auto` mode: model id that reviews unclear tool calls (default: the session's model).
     pub auto_model: Option<String>,
+    /// Limits of the Magia agent (`"magia": {"magia_mode": {...}}`).
+    pub magia_mode: crate::magia_mode::MagiaMode,
     pub hooks: Vec<HookConfig>,
     pub mcp: Vec<McpServerConfig>,
     pub rules: RuleSet,
@@ -74,6 +76,7 @@ impl Default for Config {
             compact_at_tokens: 100_000,
             sandbox: false,
             auto_model: None,
+            magia_mode: Default::default(),
             hooks: vec![],
             mcp: vec![],
             rules: RuleSet::default(),
@@ -334,6 +337,12 @@ impl Config {
         {
             cfg.auto_model = Some(m.to_owned());
         }
+        if let Some(m) = u
+            .get("magia_mode")
+            .and_then(|m| serde_json::from_value(m.clone()).ok())
+        {
+            cfg.magia_mode = m;
+        }
         if let Some(h) = u
             .get("hooks")
             .and_then(|h| serde_json::from_value(h.clone()).ok())
@@ -509,6 +518,7 @@ mod tests {
             "instructions": ["CONTRIBUTING.md"],
             "command": {"review": {"template": "Review $ARGUMENTS"}},
             "magia": {"permission_mode": "accept_edits", "compact_at_tokens": 5, "sandbox": true,
+                     "magia_mode": {"max_rounds": 7},
                      "wire_overrides": {"zen/foo": "messages"}}
         });
         let c = Config::from_value(&v);
@@ -545,6 +555,14 @@ mod tests {
         assert_eq!(
             (c.permission_mode, c.compact_at_tokens, c.sandbox),
             (PermissionMode::AcceptEdits, 5, true)
+        );
+        // Keys left out keep their defaults.
+        assert_eq!(
+            c.magia_mode,
+            crate::magia_mode::MagiaMode {
+                max_rounds: 7,
+                review: true
+            }
         );
         assert!(Config::default().provider_config("nope").is_err());
     }

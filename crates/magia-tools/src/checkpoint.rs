@@ -36,6 +36,15 @@ impl Checkpoints {
         self.state.lock().unwrap().0
     }
 
+    /// Files changed by `write`/`edit` in the current turn, in the order first touched.
+    pub fn changed_in_turn(&self) -> Vec<PathBuf> {
+        let s = self.state.lock().unwrap();
+        s.1.iter()
+            .filter(|e| e.turn == s.0)
+            .map(|e| e.path.clone())
+            .collect()
+    }
+
     /// Record `path` before it is modified (first time per turn only).
     pub fn snapshot(&self, path: &Path) {
         let mut s = self.state.lock().unwrap();

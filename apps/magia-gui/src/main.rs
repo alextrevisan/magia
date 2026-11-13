@@ -17,7 +17,7 @@ mod resume;
 mod theme;
 
 use magia_core::agents::{self, FileAgent};
-use magia_core::{Agent, AgentEvent, Approver, Config, SlashEntry, slash_catalog};
+use magia_core::{Agent, AgentEvent, Approver, Config, SlashEntry, magia_mode, slash_catalog};
 use magia_providers::Client;
 use magia_store::{SessionFile, sessions_dir};
 use magia_tools::PermissionMode;
@@ -69,6 +69,8 @@ enum Item {
         output: Option<(String, bool)>,
     },
     Error(String),
+    /// Magia mode started another round of the same request: "round N · why".
+    Round(String),
 }
 
 struct GuiApprover {
@@ -212,6 +214,7 @@ impl App {
         match cfg.agent.as_str() {
             agents::BUILD => {}
             agents::PLAN => agent.mode = PermissionMode::Plan,
+            agents::MAGIA => agent.magia = Some(cfg.magia_mode),
             name => match file_agents.iter().find(|a| a.name == name) {
                 Some(fa) => match agents::load_agent(fa) {
                     Ok(text) => agent.persona = Some((fa.name.clone(), text)),
@@ -304,6 +307,7 @@ impl App {
                     a.client = client;
                     a.model = self.cfg.model.clone();
                     a.mode = self.cfg.permission_mode;
+                    a.magia = (self.cfg.agent == agents::MAGIA).then_some(self.cfg.magia_mode);
                 }
                 self.status = if missing_key {
                     format!(
@@ -330,8 +334,10 @@ impl App {
                 self.mode_before_plan = self.cfg.permission_mode;
             }
             self.cfg.permission_mode = PermissionMode::Plan;
-        } else if self.cfg.agent == agents::PLAN && self.cfg.permission_mode == PermissionMode::Plan
+        } else if self.cfg.permission_mode == PermissionMode::Plan
+            && (self.cfg.agent == agents::PLAN || name == agents::MAGIA)
         {
+            // Magia has nothing to do in a mode where nothing can change.
             self.cfg.permission_mode = self.mode_before_plan;
         }
         let file = self.agents.iter().find(|a| a.name == name).cloned();
@@ -756,6 +762,10 @@ impl App {
                     }
                     AgentEvent::Notice(n) => self.status = n,
                     AgentEvent::Error(e) => self.items.push(Item::Error(e)),
+                    AgentEvent::Round { n, reason } => {
+                        self.items
+                            .push(Item::Round(format!("round {n} · {reason}")));
+                    }
                     AgentEvent::TurnDone => {
                         self.running = false;
                         self.pending = None;
@@ -863,6 +873,11 @@ impl App {
                                 for (name, help) in [
                                     (agents::BUILD, "magia's own instructions"),
                                     (agents::PLAN, "Read-only: switches the mode to Plan"),
+                                    (
+                                        agents::MAGIA,
+                                        "Keeps working until the task list is done, then has \
+                                         the changes reviewed",
+                                    ),
                                 ] {
                                     if ui
                                         .selectable_label(self.cfg.agent == name, agent_label(name))
@@ -889,8 +904,8 @@ impl App {
                             })
                             .response
                             .on_hover_text(
-                                "Agent: Build, Plan, or a .md file from the project root whose \
-                                 text is added to the instructions",
+                                "Agent: Build, Plan, Magia, or a .md file from the project root \
+                                 whose text is added to the instructions",
                             )
                             .clicked();
                         if opened {
@@ -928,7 +943,9 @@ impl App {
                                 self.cfg.agent = agents::BUILD.into();
                             } else if self.cfg.permission_mode == PermissionMode::Plan {
                                 self.mode_before_plan = before;
-                                if self.cfg.agent == agents::BUILD {
+                                if self.cfg.agent == agents::BUILD
+                                    || self.cfg.agent == agents::MAGIA
+                                {
                                     self.cfg.agent = agents::PLAN.into();
                                 }
                             }
@@ -1318,6 +1335,7 @@ fn agent_label(name: &str) -> &str {
     match name {
         agents::BUILD => "Build",
         agents::PLAN => "Plan",
+        agents::MAGIA => "Magia",
         file => file,
     }
 }
@@ -1407,7 +1425,10 @@ fn empty_state(ui: &mut egui::Ui, cwd: &std::path::Path) -> Option<&'static str>
 const TASKS_SIDE_MIN_WIDTH: f32 = 1000.0;
 
 fn tasks_title(todos: &[magia_tools::Todo]) -> String {
-    let done = todos.iter().filter(|t| t.status == "completed").count();
+    let done = todos
+        .iter()
+        .filter(|t| matches!(t.status.as_str(), "completed" | "cancelled"))
+        .count();
     format!("Tasks  {done}/{}", todos.len())
 }
 
@@ -1416,6 +1437,7 @@ fn todo_list(ui: &mut egui::Ui, todos: &[magia_tools::Todo]) {
     for todo in todos {
         let (mark, color, text_color) = match todo.status.as_str() {
             "completed" => ("✓", t.ok, t.muted),
+            "cancelled" => ("×", t.muted, t.muted),
             "in_progress" => ("▸", t.accent, t.fg),
             _ => ("○", t.muted, t.fg),
         };
@@ -1424,7 +1446,7 @@ fn todo_list(ui: &mut egui::Ui, todos: &[magia_tools::Todo]) {
             let mut text = egui::RichText::new(&todo.content)
                 .color(text_color)
                 .size(theme::SMALL + 0.5);
-            if todo.status == "completed" {
+            if matches!(todo.status.as_str(), "completed" | "cancelled") {
                 text = text.strikethrough();
             }
             ui.add(egui::Label::new(text).wrap());
@@ -1589,6 +1611,35 @@ fn render_item(ui: &mut egui::Ui, n: usize, it: &Item, prev: Option<&Item>) {
                     }
                 });
         }
+        Item::Round(label) => {
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                let text = egui::RichText::new(label)
+                    .size(theme::SMALL)
+                    .color(t.accent);
+                let w = ui.available_width();
+                let galley_w = ui
+                    .painter()
+                    .layout_no_wrap(
+                        label.clone(),
+                        egui::FontId::proportional(theme::SMALL),
+                        t.accent,
+                    )
+                    .size()
+                    .x;
+                let side = ((w - galley_w - 16.0) / 2.0).max(8.0);
+                let line = |ui: &mut egui::Ui| {
+                    let (r, _) =
+                        ui.allocate_exact_size(egui::vec2(side, 1.0), egui::Sense::hover());
+                    ui.painter()
+                        .hline(r.x_range(), r.center().y, egui::Stroke::new(1.0, t.line));
+                };
+                line(ui);
+                ui.label(text);
+                line(ui);
+            });
+            ui.add_space(4.0);
+        }
         Item::Error(e) => {
             ui.add_space(8.0);
             egui::Frame::new()
@@ -1617,7 +1668,9 @@ fn sent_messages(history: &[Message]) -> Vec<String> {
     history
         .iter()
         .filter_map(|m| match m {
-            Message::User { text, .. } if !text.starts_with("[Summary") => {
+            Message::User { text, .. }
+                if !text.starts_with("[Summary") && !magia_mode::is_continuation(m) =>
+            {
                 // `@file` contents and hook output are appended after the typed text.
                 let typed = text.split("\n\n<file path=").next().unwrap_or(text);
                 let typed = typed.split("\n\n[hook output]").next().unwrap_or(typed);
@@ -1663,12 +1716,20 @@ fn tool_summary(name: &str, args: &serde_json::Value) -> String {
 /// Rebuild the visible transcript from a saved history (resume / rewind / clear).
 fn items_from_history(history: &[Message], cwd: &std::path::Path) -> Vec<Item> {
     let mut items = Vec::new();
+    let mut round = 1;
     for m in history {
         match m {
-            Message::User { text, images } => items.push(Item::User(
-                text.clone(),
-                images.iter().map(composer::image_label).collect(),
-            )),
+            Message::User { .. } if magia_mode::is_continuation(m) => {
+                round += 1;
+                items.push(Item::Round(format!("round {round} · continued")));
+            }
+            Message::User { text, images } => {
+                round = 1;
+                items.push(Item::User(
+                    text.clone(),
+                    images.iter().map(composer::image_label).collect(),
+                ));
+            }
             Message::Assistant { text, tool_calls } => {
                 if !text.is_empty() {
                     items.push(Item::Assistant {
@@ -1768,7 +1829,38 @@ mod tests {
                 tool_calls: vec![],
             },
             Message::user("next\n\n[hook output]\nx"),
+            Message::user(format!("{}\nkeep going", magia_mode::CONTINUE_PREFIX)),
         ];
         assert_eq!(sent_messages(&h), ["look at @a.txt", "next"]);
+    }
+
+    #[test]
+    fn magia_continuations_come_back_as_round_dividers() {
+        let cont = || Message::user(format!("{}\nkeep going", magia_mode::CONTINUE_PREFIX));
+        let h = vec![
+            Message::user("build it"),
+            cont(),
+            cont(),
+            Message::user("thanks"),
+            cont(),
+        ];
+        let labels: Vec<String> = items_from_history(&h, std::path::Path::new("/p"))
+            .into_iter()
+            .map(|i| match i {
+                Item::User(t, _) => t,
+                Item::Round(r) => r,
+                _ => "?".into(),
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "build it",
+                "round 2 · continued",
+                "round 3 · continued",
+                "thanks",
+                "round 2 · continued"
+            ]
+        );
     }
 }

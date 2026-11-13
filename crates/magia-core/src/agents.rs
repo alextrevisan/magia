@@ -1,5 +1,6 @@
-//! Primary agents, as in OpenCode's agent switcher: `build` (the default), `plan` (read-only)
-//! and one agent per Markdown file in the project root (`AGENTS.md`, `FABLE.md`, …).
+//! Primary agents, as in OpenCode's agent switcher: `build` (the default), `plan` (read-only),
+//! `magia` (keeps going until the work is done, see `crate::magia_mode`) and one agent per
+//! Markdown file in the project root (`AGENTS.md`, `FABLE.md`, …).
 //!
 //! A file agent adds its text to the system prompt after magia's own; it does not replace it,
 //! so tool use and the session details keep working. A leading `---` frontmatter is dropped
@@ -11,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 pub const BUILD: &str = "build";
 pub const PLAN: &str = "plan";
+/// Works in rounds until the task list is done and reviewed (`crate::magia_mode`).
+pub const MAGIA: &str = "magia";
 
 /// Root files that are documentation, not instructions.
 const NOT_AGENTS: &[&str] = &[

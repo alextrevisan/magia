@@ -51,8 +51,10 @@ OPTIONS (anywhere, --opt value or --opt=value):
   --model ID        model id                                       (default: config)
   --mode MODE       ask | accept_edits | auto | plan | yolo        (default: config / ask)
                     auto: routine work runs, a reviewer model checks the rest, risky asks
-  --agent NAME      build | plan | a .md file in the project root, e.g. FABLE.md: its text is
-                    added to the instructions                      (default: config / build)
+  --agent NAME      build | plan | magia | a .md file in the project root, e.g. FABLE.md: its
+                    text is added to the instructions              (default: config / build)
+                    magia: keeps working in rounds until its task list is done, then has
+                    the changes reviewed
   --resume          continue this folder's most recent session
   --session ID      continue a session of this folder (id from --sessions)
   --all             with --sessions: every folder
@@ -191,6 +193,12 @@ async fn real_main() -> Result<()> {
             return Ok(());
         }
     }
+    let magia = args
+        .agent
+        .as_deref()
+        .unwrap_or(&cfg.agent)
+        .trim()
+        .eq_ignore_ascii_case(agents::MAGIA);
     let persona = pick_agent(&mut cfg, args.agent.as_deref(), args.mode.is_some(), &cwd)?;
     let client = Client::new(cfg.provider_config(&cfg.provider)?)?;
     if let Some(expanded) = magia_core::expand_command(&cwd, &prompt, &cfg.commands) {
@@ -233,6 +241,7 @@ async fn real_main() -> Result<()> {
     };
     agent.configure(&cfg);
     agent.persona = persona;
+    agent.magia = magia.then_some(cfg.magia_mode);
     for e in agent.connect_mcp(&cfg.mcp).await {
         eprintln!("mcp: {e}");
     }
@@ -271,6 +280,7 @@ async fn real_main() -> Result<()> {
                     eprintln!("\nerror: {e}")
                 }
                 AgentEvent::Notice(n) => eprintln!("\n[{n}]"),
+                AgentEvent::Round { n, reason } => eprintln!("\n── round {n} · {reason} ──"),
                 AgentEvent::Usage(u) => {
                     eprintln!("\n[tokens in {} / out {}]", u.input_tokens, u.output_tokens)
                 }
@@ -380,7 +390,7 @@ fn pick_agent(
 ) -> Result<Option<(String, String)>> {
     let name = flag.unwrap_or(&cfg.agent).trim().to_owned();
     match name.to_ascii_lowercase().as_str() {
-        agents::BUILD => return Ok(None),
+        agents::BUILD | agents::MAGIA => return Ok(None),
         agents::PLAN => {
             if flag.is_some() || !mode_flag {
                 cfg.permission_mode = magia_tools::PermissionMode::Plan;
@@ -392,7 +402,11 @@ fn pick_agent(
     match agents::find_agent(cwd, &name) {
         Some(fa) => Ok(Some((fa.name.clone(), agents::load_agent(&fa)?))),
         None if flag.is_some() => {
-            let mut names = vec![agents::BUILD.to_owned(), agents::PLAN.to_owned()];
+            let mut names = vec![
+                agents::BUILD.to_owned(),
+                agents::PLAN.to_owned(),
+                agents::MAGIA.to_owned(),
+            ];
             names.extend(agents::discover_agents(cwd).into_iter().map(|a| a.name));
             bail!("no agent `{name}` here; available: {}", names.join(", "))
         }

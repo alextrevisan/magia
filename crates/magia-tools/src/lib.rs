@@ -87,7 +87,7 @@ pub struct ToolCx {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Todo {
     pub content: String,
-    /// "pending" | "in_progress" | "completed"
+    /// "pending" | "in_progress" | "completed" | "cancelled"
     pub status: String,
 }
 

@@ -200,6 +200,34 @@ Requisitos: **Rust 1.98+** e **egui/eframe 0.36.2** (exigidos pelo fastframe), e
 | **F5 — Avançado** | Subagentes, checkpoints/rewind, revisão de diff, `magia-cli` headless, sandbox bash | Rewind restaura arquivos; `magia <pedido>` em CI |
 | **F6 — Polimento** | Abas de sessão, notificações, tray, LSP, auto-update | — |
 
+## 3.1 Modo Magia (ultrawork próprio)
+
+Terceiro agente embutido, ao lado de Build e Plan. Ideia (mesma do "ultrawork" do oh-my-opencode, implementação própria): o turno não termina quando o modelo para de chamar ferramentas se ainda há trabalho; o core injeta uma mensagem de continuação e roda outro *round*, até a lista de tarefas fechar e uma revisão independente aprovar. O limite de 50 passos passa a valer por round, não por pedido.
+
+**Decisões**
+- É um agente (`agents::MAGIA`), não um `PermissionMode`: combina com Ask/Accept edits/Auto/Yolo. No modo de permissão Plan o loop fica desligado (nada pode ser alterado). Subagentes nunca fazem loop.
+- Tudo dentro de **um** `Agent::run_turn`: um `TurnDone` no fim, o cancelamento para tudo, um checkpoint por pedido (o `/rewind 1` desfaz o pedido inteiro com todos os rounds).
+- Critério de "acabou": nenhum todo `pending`/`in_progress`. Novo status `cancelled` para o modelo encerrar com honestidade o que decidiu não fazer (em vez de marcar `completed`).
+- A mensagem de continuação é `Message::User` com o prefixo `[magia: continue]`, e traz o pedido original (até 2000 caracteres) e a lista de tarefas atual, então sobrevive à compactação. `rewind`, o histórico do composer e a reconstrução do transcript ignoram ou mostram essas mensagens à parte.
+- **Paradas**: tudo concluído (e revisão aprovada ou desligada); round sem nenhuma chamada de ferramenta (o modelo só falou: precisa do usuário ou acha que acabou); 3 rounds seguidos sem mudar a lista de tarefas nem arquivos; o usuário negou uma ferramenta no round (ele está presente e disse não); erro do provedor; cancelamento; `max_rounds` (padrão 30).
+- Bater o limite de passos no meio de um round não é erro no modo Magia: vira fim de round e o loop decide se continua.
+- **Revisão independente** (o "Oracle"): quando as tarefas fecham e o pedido alterou arquivos, um subagente só-leitura recebe o pedido original, a lista de tarefas, os arquivos alterados (checkpoints) e a última resposta, e responde JSON `{"verdict":"pass"|"fail","issues":[…]}`. `fail` vira uma continuação com os problemas; no máximo 2 revisões por pedido; resposta ilegível conta como `pass` (aviso), para não prender o loop.
+- Config sob `"magia"`: `"magia_mode": {"max_rounds": 30, "review": true}`.
+
+Também: as continuações ficam fora do revisor do modo Auto (`review::user_requests`), porque carregam a lista de tarefas escrita pelo modelo. "Progresso" = a lista mudou ou houve um `write`/`edit` bem-sucedido no round.
+
+**Etapas** (todas feitas em 2026-11-12; chat real ainda não testado, coberto pelo servidor falso)
+1. Core: `agents::MAGIA`, instruções do modo (`magia_mode.rs`: planejar com `todo`, trabalhar sem pedir licença, `question` só para decisões do usuário, verificar no fim, negação é final), campo `Agent::magia` com a config.
+2. `todo`: status `cancelled` (schema, descrição, GUI riscado/esmaecido).
+3. Loop: `run_turn` em rounds; mensagem de continuação; condições de parada; novo `AgentEvent::Round { n, reason }`.
+4. Limite de passos vira fim de round no modo Magia.
+5. Higiene do histórico: `rewind` e `sent_messages` ignoram continuações; `items_from_history` as mostra como divisória.
+6. Revisão independente (subagente revisor com veredito JSON).
+7. Config `magia.magia_mode` + `docs/magia.example.jsonc` + teste de config.
+8. Front-ends: "Magia" no seletor de agentes da GUI (sai do Plan como o Build), divisória "↻ round N · motivo" no transcript; CLI `--agent magia` imprime os rounds.
+9. Testes com o servidor SSE falso: continua com tarefas pendentes; para sem progresso; para quando o usuário nega; limite de passos continua; revisão `fail` reabre e `pass` encerra; rewind ignora continuações; Build não muda.
+10. Docs: status aqui e no CLAUDE.md.
+
 ## 4. Riscos / decisões em aberto
 
 - **Rust 1.98+**: verificar toolchain disponível; o fastframe é jovem e a API pode quebrar entre tags — atualizar todas as crates fastframe juntas.
@@ -225,5 +253,7 @@ Requisitos: **Rust 1.98+** e **egui/eframe 0.36.2** (exigidos pelo fastframe), e
 Medições (release, x86-64 baseline = sse2): CLI 4,5 MB / 8 MB RSS; GUI ≈20 MB anon (+≈49 MB de bibliotecas do sistema) com GPU (19,4 MB após o redesign, com sessão aberta), ≈43 MB anon sob llvmpipe. CPU antiga: `scripts/check-baseline.sh` passa no CLI (85 funções pós-SSE2, todas em ring/memchr/aho-corasick com detecção em runtime); qemu não pôde ser instalado (sem sudo), então não houve execução real em CPU sem AVX.
 
 Config JSON: implementados `model`, `provider(s)` (baseURL/apiKey/headers/npm/env/models), `mcp` local, `permission(s)` com padrões, `instructions` (arquivos/globs), `command(s)`. Ignorados: `agent(s)`, `lsp`, `formatter`, `plugin`, `mcp` remoto (aviso), `skills.urls`, URLs em `instructions`.
+
+Modo Magia (2026-11-12): agente `magia` (GUI, `--agent magia` no CLI) que trabalha em rounds até a lista de tarefas fechar, com revisão independente dos arquivos alterados; detalhes em §3.1. Seletor de modelos da GUI agora é um botão com lista pesquisável (`model_picker.rs`; Enter sem resultado usa o id digitado).
 
 Ferramentas (2026-11-11): adicionadas `webfetch` (HTML→texto próprio, corpo limitado a 2 MB), `websearch` (página HTML do DuckDuckGo; pode exigir captcha sob uso intenso) e `question`; a lista enviada ao modelo agora é filtrada pelo modo, pelas regras e por ser subagente.

@@ -1,5 +1,6 @@
 use crate::ext::{SkillTool, discover_skills, expand_mentions};
 use crate::hooks::Hooks;
+use crate::magia_mode::{self, Continue, MagiaMode};
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -11,6 +12,7 @@ use magia_tools::{Decision, Effect, PermissionMode, Registry, RuleSet, Tool, Too
 use magia_types::{ChatRequest, Image, Message, StreamEvent, ToolCall, ToolSpec, Usage};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +34,11 @@ pub enum AgentEvent {
     /// Informational (e.g. "context compacted").
     Notice(String),
     Error(String),
+    /// Magia mode started another round of the same request (`n` ≥ 2) and why.
+    Round {
+        n: u32,
+        reason: String,
+    },
     /// Turn finished (completed, cancelled or failed).
     TurnDone,
 }
@@ -65,6 +72,24 @@ impl Approver for AutoApprove {
 const MAX_STEPS: usize = 50;
 const CHILD_MAX_STEPS: usize = 25;
 const SUMMARY_PREFIX: &str = "[Summary of the earlier conversation]";
+
+/// How a round of the agent loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum End {
+    /// The model answered without calling tools.
+    Finished,
+    Cancelled,
+    /// The step limit was reached with the model still calling tools.
+    StepLimit,
+}
+
+struct RoundEnd {
+    end: End,
+    /// Tool calls the model made in the round.
+    calls: usize,
+    /// Successful `write`/`edit` calls in the round.
+    edits: usize,
+}
 
 /// What the user sends in one turn: text plus pasted/attached images.
 #[derive(Debug, Clone, Default)]
@@ -108,11 +133,16 @@ pub struct Agent {
     /// Instructions of the selected file agent (`crate::agents`): (file name, text). They are
     /// added after the base prompt; the subagent (`task`) does not get them.
     pub persona: Option<(String, String)>,
+    /// The Magia agent is selected (`crate::magia_mode`): the request runs in rounds until the
+    /// task list is closed. Ignored in plan mode and in subagents.
+    pub magia: Option<MagiaMode>,
     /// The root file already added as project instructions (`AGENTS.md`/`CLAUDE.md`), so picking
     /// it as the agent does not add it twice.
     project_instructions: Option<&'static str>,
     /// `auto` mode: calls the reviewer already allowed in this session (tool + key).
     reviewed: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// The user said no to a tool call in the current round (Magia mode stops then).
+    denied: AtomicBool,
     last_input_tokens: u64,
     is_child: bool,
     /// Used as the session id when there is no session file (tests, subagents).
@@ -147,8 +177,10 @@ impl Agent {
             compact_at_tokens: 100_000,
             auto_model: None,
             persona: None,
+            magia: None,
             project_instructions,
             reviewed: Default::default(),
+            denied: AtomicBool::new(false),
             last_input_tokens: 0,
             is_child: false,
             fallback_session: new_session_id(),
@@ -258,6 +290,11 @@ impl Agent {
             }
             _ => String::new(),
         };
+        let persona = if self.magia_active() {
+            format!("{persona}\n\n{}", magia_mode::INSTRUCTIONS)
+        } else {
+            persona
+        };
         format!(
             "{}{persona}\n\n# This session\n- You are running in magia, a coding agent. It has two programs: the `magia` CLI and the desktop app `magia-gui`. When the user asks to open \"the GUI\", \"the app\" or magia itself, they mean `magia-gui`: start it detached in the working folder with `{}`, and do not look for other programs.\n- Model: `{}` via the `{}` provider. When asked which model you are, answer with this id.\n- Permission mode: `{}`.\n- Working folder: {}",
             self.system,
@@ -274,6 +311,11 @@ impl Agent {
                 .unwrap_or_default(),
             self.cx.cwd.display()
         )
+    }
+
+    /// Whether this request runs in Magia rounds.
+    fn magia_active(&self) -> bool {
+        self.magia.is_some() && !self.is_child && self.mode != PermissionMode::Plan
     }
 
     fn all_specs(&self, interactive: bool) -> Vec<ToolSpec> {
@@ -343,6 +385,7 @@ It can read/search the project but not modify it; it returns a concise report."
             let _ = events.send(AgentEvent::TurnDone);
             return;
         }
+        let request = prompt.clone();
         let (mut prompt, mentioned) = expand_mentions(&self.cx, &prompt);
         images.extend(mentioned);
         if !hook.output.trim().is_empty() {
@@ -353,11 +396,152 @@ It can read/search the project but not modify it; it returns a concise report."
             text: prompt,
             images,
         });
-        if let Err(e) = self.run_loop(&events, &cancel, approver).await {
-            let _ = events.send(AgentEvent::Error(format!("{e:#}")));
-        }
+        self.run_rounds(&request, &events, &cancel, approver).await;
         self.hooks.run("stop", None, &json!({}), &self.cx.cwd).await;
         let _ = events.send(AgentEvent::TurnDone);
+    }
+
+    /// One user request: a single round normally; in Magia mode, more rounds while the task
+    /// list has open items (see `crate::magia_mode`).
+    async fn run_rounds(
+        &mut self,
+        request: &str,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+        approver: &dyn Approver,
+    ) {
+        let magia = self.magia.filter(|_| self.magia_active());
+        let todos_at_start = self.todos();
+        let (mut n, mut idle, mut reviews) = (1u32, 0u32, 0u32);
+        loop {
+            let todos_before = self.todos();
+            self.denied.store(false, Ordering::Relaxed);
+            let round = match self.run_loop(events, cancel, approver).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = events.send(AgentEvent::Error(format!("{e:#}")));
+                    return;
+                }
+            };
+            let Some(cfg) = magia else {
+                if round.end == End::StepLimit {
+                    let _ = events.send(AgentEvent::Error(format!(
+                        "stopped after {} steps without finishing",
+                        self.max_steps()
+                    )));
+                }
+                return;
+            };
+            if round.end == End::Cancelled {
+                return;
+            }
+            let todos = self.todos();
+            let open = magia_mode::open_tasks(&todos);
+            let changed = self.cx.checkpoints.changed_in_turn();
+            let progress = todos != todos_before || round.edits > 0;
+            idle = if progress { 0 } else { idle + 1 };
+            // The list counts only if this request wrote it: open items left over from an
+            // earlier request must not hijack an unrelated question.
+            let list_is_ours = todos != todos_at_start;
+            let notice = |m: &str| {
+                let _ = events.send(AgentEvent::Notice(format!("magia: {m}")));
+            };
+            let why = if self.denied.load(Ordering::Relaxed) {
+                notice("stopped because a tool call was denied");
+                return;
+            } else if round.end == End::StepLimit {
+                Continue::StepLimit
+            } else if round.calls == 0 {
+                return; // only talked: an answer, or something for the user to decide
+            } else if open > 0 && list_is_ours {
+                Continue::OpenTasks
+            } else if cfg.review && reviews < magia_mode::MAX_REVIEWS && !changed.is_empty() {
+                reviews += 1;
+                notice("reviewing the changes…");
+                match self.review_work(request, &todos, &changed, cancel).await {
+                    magia_mode::Verdict::Fail(issues) => Continue::Review(issues),
+                    magia_mode::Verdict::Pass => {
+                        notice("review passed");
+                        return;
+                    }
+                    magia_mode::Verdict::Unreadable => {
+                        notice("the reviewer gave no clear verdict; finishing");
+                        return;
+                    }
+                }
+            } else {
+                return;
+            };
+            if cancel.is_cancelled() {
+                return;
+            }
+            if idle >= magia_mode::MAX_IDLE_ROUNDS && !matches!(why, Continue::Review(_)) {
+                notice(&format!("stopped after {idle} rounds without progress"));
+                return;
+            }
+            if n >= cfg.max_rounds {
+                notice(&format!("stopped after {n} rounds; ask again to continue"));
+                return;
+            }
+            n += 1;
+            let _ = events.send(AgentEvent::Round {
+                n,
+                reason: why.label(open),
+            });
+            self.push(Message::user(magia_mode::continuation(
+                request, &todos, &why,
+            )));
+        }
+    }
+
+    fn todos(&self) -> Vec<magia_tools::Todo> {
+        self.cx.todos.lock().map(|t| t.clone()).unwrap_or_default()
+    }
+
+    fn max_steps(&self) -> usize {
+        if self.is_child {
+            CHILD_MAX_STEPS
+        } else {
+            MAX_STEPS
+        }
+    }
+
+    /// Ask a read-only reviewer whether the request is really done.
+    async fn review_work(
+        &self,
+        request: &str,
+        todos: &[magia_tools::Todo],
+        changed: &[PathBuf],
+        cancel: &CancellationToken,
+    ) -> magia_mode::Verdict {
+        let files: Vec<String> = changed
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&self.cx.cwd)
+                    .unwrap_or(p)
+                    .display()
+                    .to_string()
+            })
+            .collect();
+        let claim = self
+            .history
+            .iter()
+            .rev()
+            .find_map(|m| match m {
+                Message::Assistant { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or("");
+        let report = run_subagent(
+            self.client.clone(),
+            self.model.clone(),
+            self.cx.cwd.clone(),
+            magia_mode::review_prompt(request, todos, &files, claim),
+            magia_mode::REVIEWER,
+            cancel.clone(),
+        )
+        .await;
+        magia_mode::parse_review(&report)
     }
 
     async fn run_loop(
@@ -365,13 +549,10 @@ It can read/search the project but not modify it; it returns a concise report."
         events: &UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
         approver: &dyn Approver,
-    ) -> Result<()> {
-        let max_steps = if self.is_child {
-            CHILD_MAX_STEPS
-        } else {
-            MAX_STEPS
-        };
-        for _ in 0..max_steps {
+    ) -> Result<RoundEnd> {
+        let (mut calls_made, mut edits) = (0usize, 0usize);
+        let done = |end: End, calls: usize, edits: usize| Ok(RoundEnd { end, calls, edits });
+        for _ in 0..self.max_steps() {
             self.maybe_compact(events).await;
             let req = ChatRequest {
                 model: self.model.clone(),
@@ -383,14 +564,20 @@ It can read/search the project but not modify it; it returns a concise report."
             };
             let mut stream = tokio::select! {
                 s = self.client.stream(&req) => s?,
-                _ = cancel.cancelled() => return self.cancelled(String::new(), vec![]),
+                _ = cancel.cancelled() => {
+                    self.cancelled(String::new(), vec![]);
+                    return done(End::Cancelled, calls_made, edits);
+                }
             };
             let mut text = String::new();
             let mut calls: Vec<ToolCall> = Vec::new();
             loop {
                 let ev = tokio::select! {
                     ev = stream.next() => ev,
-                    _ = cancel.cancelled() => return self.cancelled(text, calls),
+                    _ = cancel.cancelled() => {
+                        self.cancelled(text, calls);
+                        return done(End::Cancelled, calls_made, edits);
+                    }
                 };
                 match ev {
                     None => break,
@@ -423,8 +610,9 @@ It can read/search the project but not modify it; it returns a concise report."
                 tool_calls: calls.clone(),
             });
             if calls.is_empty() {
-                return Ok(());
+                return done(End::Finished, calls_made, edits);
             }
+            calls_made += calls.len();
 
             // Independent, pre-approved calls (reads, greps, subagents…) run in parallel.
             let parallel = calls.len() > 1 && calls.iter().all(|c| self.auto_allowed(c));
@@ -442,6 +630,9 @@ It can read/search the project but not modify it; it returns a concise report."
                 r
             };
             for (call, (output, is_error)) in calls.into_iter().zip(results) {
+                if !is_error && self.tools.get(&call.name).is_some_and(|t| t.is_edit()) {
+                    edits += 1;
+                }
                 let _ = events.send(AgentEvent::ToolEnd {
                     id: call.id.clone(),
                     output: output.clone(),
@@ -454,10 +645,10 @@ It can read/search the project but not modify it; it returns a concise report."
                 });
             }
             if cancel.is_cancelled() {
-                return Ok(());
+                return done(End::Cancelled, calls_made, edits);
             }
         }
-        bail!("stopped after {max_steps} steps without finishing")
+        done(End::StepLimit, calls_made, edits)
     }
 
     fn auto_allowed(&self, call: &ToolCall) -> bool {
@@ -524,6 +715,7 @@ It can read/search the project but not modify it; it returns a concise report."
         if approver.approve_because(call, &reason).await {
             Ok(())
         } else {
+            self.denied.store(true, Ordering::Relaxed);
             Err(format!(
                 "the user denied this tool call (auto mode flagged it: {reason})"
             ))
@@ -531,7 +723,7 @@ It can read/search the project but not modify it; it returns a concise report."
     }
 
     /// Keep the history valid after cancellation: every tool call needs a result.
-    fn cancelled(&mut self, text: String, calls: Vec<ToolCall>) -> Result<()> {
+    fn cancelled(&mut self, text: String, calls: Vec<ToolCall>) {
         let ids: Vec<String> = calls.iter().map(|c| c.id.clone()).collect();
         if !text.is_empty() || !calls.is_empty() {
             self.push(Message::Assistant {
@@ -546,7 +738,6 @@ It can read/search the project but not modify it; it returns a concise report."
                 is_error: true,
             });
         }
-        Ok(())
     }
 
     async fn exec_tool(
@@ -622,6 +813,7 @@ It can read/search the project but not modify it; it returns a concise report."
                     self.model.clone(),
                     self.cx.cwd.clone(),
                     prompt,
+                    RESEARCHER,
                     self.cx.cancel.clone(),
                 )
                 .await)
@@ -638,6 +830,7 @@ It can read/search the project but not modify it; it returns a concise report."
                     );
                 }
                 Decision::Ask if !approver.approve(call).await => {
+                    self.denied.store(true, Ordering::Relaxed);
                     return ("the user denied this tool call".into(), true);
                 }
                 Decision::Review => {
@@ -761,9 +954,10 @@ Do not call tools."
             .history
             .iter()
             .enumerate()
-            .filter(
-                |(_, m)| matches!(m, Message::User { text, .. } if !text.starts_with(SUMMARY_PREFIX)),
-            )
+            .filter(|(_, m)| {
+                matches!(m, Message::User { text, .. } if !text.starts_with(SUMMARY_PREFIX))
+                    && !magia_mode::is_continuation(m)
+            })
             .map(|(i, _)| i)
             .collect();
         if n == 0 || n > turns.len() {
@@ -930,21 +1124,27 @@ fn render_transcript(h: &[Message]) -> String {
     out
 }
 
+const RESEARCHER: &str = "You are a read-only research subagent. Investigate, then reply with a concise report (no preamble).";
+
 /// A read-only child agent with a fresh context; returns its final report.
 fn run_subagent(
     client: Client,
     model: String,
     cwd: PathBuf,
     prompt: String,
+    role: &'static str,
     cancel: CancellationToken,
 ) -> BoxFuture<'static, String> {
     async move {
         let mut child = Agent::new(client, model, PermissionMode::Plan, cwd);
         child.is_child = true;
         child.compact_at_tokens = 0;
-        child.system.push_str("\n\nYou are a read-only research subagent. Investigate, then reply with a concise report (no preamble).");
+        child.system.push_str("\n\n");
+        child.system.push_str(role);
         let (tx, mut rx) = unbounded_channel();
-        child.run_turn(prompt, tx, cancel, &AutoApprove(false)).await;
+        child
+            .run_turn(prompt, tx, cancel, &AutoApprove(false))
+            .await;
         let mut error = None;
         while let Ok(ev) = rx.try_recv() {
             if let AgentEvent::Error(e) = ev {
