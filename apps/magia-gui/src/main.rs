@@ -11,6 +11,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 mod clipboard;
 mod composer;
+mod magic;
 mod markdown;
 mod model_picker;
 mod resume;
@@ -141,6 +142,8 @@ struct App {
     files: Vec<String>,
     models: Vec<String>,
     model_picker: model_picker::ModelPicker,
+    /// Spins the Magia agent picker's border.
+    magic: magic::Spin,
     status: String,
     tokens: (u64, u64),
     /// Cached rendered height per item (0 = not measured yet); drives the virtualized list.
@@ -253,6 +256,7 @@ impl App {
             files: vec![],
             models: vec![],
             model_picker: Default::default(),
+            magic: Default::default(),
             status,
             tokens: (0, 0),
             heights: vec![],
@@ -263,6 +267,9 @@ impl App {
             mode_before_plan,
         };
         app.refresh_models(&cc.egui_ctx);
+        if app.cfg.agent == agents::MAGIA {
+            app.magic.start(&cc.egui_ctx);
+        }
         app.start_mcp(&cc.egui_ctx);
         app.refresh_catalog(&cc.egui_ctx);
         // ↑ works from the first frame: earlier messages of this folder's latest session.
@@ -341,6 +348,9 @@ impl App {
             self.cfg.permission_mode = self.mode_before_plan;
         }
         let file = self.agents.iter().find(|a| a.name == name).cloned();
+        if name == agents::MAGIA {
+            self.magic.start(ctx);
+        }
         self.cfg.agent = name;
         // First: it takes the agent lock with `try_lock`, which the task below would hold.
         self.apply_settings(ctx);
@@ -644,6 +654,9 @@ impl App {
         ));
         self.running = true;
         self.status.clear();
+        if self.cfg.agent == agents::MAGIA && self.cfg.permission_mode != PermissionMode::Plan {
+            self.magic.start(ctx);
+        }
         self.cancel = CancellationToken::new();
         let (cancel, agent, ui_tx, ctx) = (
             self.cancel.clone(),
@@ -906,8 +919,11 @@ impl App {
                             .on_hover_text(
                                 "Agent: Build, Plan, Magia, or a .md file from the project root \
                                  whose text is added to the instructions",
-                            )
-                            .clicked();
+                            );
+                        if self.cfg.agent == agents::MAGIA {
+                            self.magic.paint(ui, opened.rect, &t.magic);
+                        }
+                        let opened = opened.clicked();
                         if opened {
                             self.refresh_catalog(ctx); // pick up .md files added since
                         }

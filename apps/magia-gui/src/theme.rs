@@ -29,6 +29,8 @@ pub struct Tokens {
     pub ok: Color32,
     pub warn: Color32,
     pub danger: Color32,
+    /// The Magia agent's border gradient (a loop: the last colour blends back into the first).
+    pub magic: [Color32; 4],
 }
 
 pub const DARK: Tokens = Tokens {
@@ -44,6 +46,12 @@ pub const DARK: Tokens = Tokens {
     ok: Color32::from_rgb(0x4c, 0xc3, 0x8a),
     warn: Color32::from_rgb(0xe3, 0xad, 0x52),
     danger: Color32::from_rgb(0xf0, 0x76, 0x70),
+    magic: [
+        Color32::from_rgb(0xa7, 0x8b, 0xfa),
+        Color32::from_rgb(0x6e, 0x9b, 0xff),
+        Color32::from_rgb(0x5e, 0xe0, 0xd6),
+        Color32::from_rgb(0xf4, 0x72, 0xb6),
+    ],
 };
 
 pub const LIGHT: Tokens = Tokens {
@@ -59,6 +67,12 @@ pub const LIGHT: Tokens = Tokens {
     ok: Color32::from_rgb(0x17, 0x78, 0x4d),
     warn: Color32::from_rgb(0x93, 0x5c, 0x00),
     danger: Color32::from_rgb(0xc2, 0x3b, 0x34),
+    magic: [
+        Color32::from_rgb(0x7c, 0x3a, 0xed),
+        Color32::from_rgb(0x2f, 0x5f, 0xd0),
+        Color32::from_rgb(0x0e, 0x9f, 0x97),
+        Color32::from_rgb(0xdb, 0x27, 0x77),
+    ],
 };
 
 /// Type scale (points).

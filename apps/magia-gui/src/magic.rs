@@ -1,0 +1,127 @@
+//! The Magia agent's mark: a gradient border around the agent picker. It spins for a few
+//! seconds when Magia is picked or starts a request (easing out to a stop), then stays still,
+//! so there is no continuous animation.
+
+use egui::{Color32, Pos2, Rect, Stroke};
+use std::f32::consts::TAU;
+
+/// How long the border spins.
+pub const SPIN_SECONDS: f32 = 5.0;
+/// Whole turns in one spin, so it stops exactly where the still border is.
+const TURNS: f32 = 3.0;
+
+#[derive(Default)]
+pub struct Spin {
+    /// `ctx` time when the current spin started.
+    started: Option<f64>,
+}
+
+impl Spin {
+    pub fn start(&mut self, ctx: &egui::Context) {
+        self.started = Some(ctx.input(|i| i.time));
+        ctx.request_repaint();
+    }
+
+    /// Rotation now (radians) and how strong the glow is (0 when still).
+    fn phase(&mut self, ctx: &egui::Context) -> (f32, f32) {
+        let Some(t0) = self.started else {
+            return (0.0, 0.0);
+        };
+        let p = ((ctx.input(|i| i.time) - t0) as f32 / SPIN_SECONDS).clamp(0.0, 1.0);
+        if p >= 1.0 {
+            self.started = None;
+            return (0.0, 0.0);
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        let eased = 1.0 - (1.0 - p).powi(3); // fast start, slows to a stop
+        (TURNS * TAU * eased, 1.0 - p)
+    }
+
+    /// Paint the border over `rect` (drawn after the widget, so it sits on top).
+    pub fn paint(&mut self, ui: &egui::Ui, rect: Rect, colors: &[Color32; 4]) {
+        let (phase, glow) = self.phase(ui.ctx());
+        let radius = ui.visuals().widgets.inactive.corner_radius.nw as f32;
+        let points = rounded_rect_path(rect.shrink(0.5), radius);
+        let center = rect.center();
+        let color_at = |p: Pos2| {
+            // Angle around the centre, with the box squashed to a square so the colours
+            // sweep evenly instead of bunching on the short sides.
+            let a = ((p.y - center.y) / rect.height()).atan2((p.x - center.x) / rect.width());
+            gradient(colors, (a + phase).rem_euclid(TAU) / TAU)
+        };
+        let painter = ui.painter();
+        for w in points.windows(2) {
+            let c = color_at(w[0].lerp(w[1], 0.5));
+            if glow > 0.0 {
+                painter.line_segment(
+                    [w[0], w[1]],
+                    Stroke::new(5.0, c.gamma_multiply(0.35 * glow)),
+                );
+            }
+            painter.line_segment([w[0], w[1]], Stroke::new(1.6, c));
+        }
+    }
+}
+
+/// Colour at `x` (0..1, wrapping) on a loop through `colors`.
+fn gradient(colors: &[Color32; 4], x: f32) -> Color32 {
+    let n = colors.len() as f32;
+    let f = x * n;
+    let i = f.floor() as usize % colors.len();
+    let j = (i + 1) % colors.len();
+    let t = f - f.floor();
+    let l = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    let (a, b) = (colors[i], colors[j]);
+    Color32::from_rgb(l(a.r(), b.r()), l(a.g(), b.g()), l(a.b(), b.b()))
+}
+
+/// Closed outline of a rounded rectangle, in short steps (so the gradient is smooth).
+fn rounded_rect_path(r: Rect, radius: f32) -> Vec<Pos2> {
+    let rad = radius.min(r.width() / 2.0).min(r.height() / 2.0);
+    // Corner centres, clockwise from top-right, with the angle each arc starts at.
+    let corners = [
+        (Pos2::new(r.right() - rad, r.top() + rad), -TAU / 4.0),
+        (Pos2::new(r.right() - rad, r.bottom() - rad), 0.0),
+        (Pos2::new(r.left() + rad, r.bottom() - rad), TAU / 4.0),
+        (Pos2::new(r.left() + rad, r.top() + rad), TAU / 2.0),
+    ];
+    let mut outline = Vec::new();
+    for (c, a0) in corners {
+        for k in 0..=6 {
+            let a = a0 + TAU / 4.0 * k as f32 / 6.0;
+            outline.push(c + rad * egui::vec2(a.cos(), a.sin()));
+        }
+    }
+    outline.push(outline[0]);
+    let mut out = vec![outline[0]];
+    for w in outline.windows(2) {
+        let steps = ((w[1] - w[0]).length() / 4.0).ceil().max(1.0) as usize;
+        for s in 1..=steps {
+            out.push(w[0].lerp(w[1], s as f32 / steps as f32));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gradient_loops_through_the_colours() {
+        let c = [Color32::RED, Color32::GREEN, Color32::BLUE, Color32::WHITE];
+        assert_eq!(gradient(&c, 0.0), Color32::RED);
+        assert_eq!(gradient(&c, 0.25), Color32::GREEN);
+        assert_eq!(gradient(&c, 0.999), gradient(&c, 0.999)); // no panic at the wrap
+        assert_eq!(gradient(&c, 1.0), Color32::RED);
+    }
+
+    #[test]
+    fn outline_is_closed_and_hugs_the_box() {
+        let r = Rect::from_min_size(Pos2::new(10.0, 10.0), egui::vec2(120.0, 26.0));
+        let p = rounded_rect_path(r, 6.0);
+        assert!(p.first().unwrap().distance(*p.last().unwrap()) < 0.01);
+        assert!(p.iter().all(|q| r.expand(0.01).contains(*q)));
+        assert!(p.windows(2).all(|w| w[0].distance(w[1]) <= 4.01));
+    }
+}
