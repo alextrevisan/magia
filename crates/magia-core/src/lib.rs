@@ -10,7 +10,10 @@ pub mod magia_mode;
 pub mod media;
 pub mod review;
 
-pub use agent::{Agent, AgentEvent, Approver, AutoApprove, UserInput, build_system_prompt};
+pub use agent::{
+    Agent, AgentEvent, Approver, AutoApprove, MagiaPhase, REVIEW_PARENT, UserInput,
+    build_system_prompt,
+};
 pub use config::{Config, ProviderOverride, config_dir, config_path};
 pub use ext::{
     Skill, SlashEntry, SlashKind, discover_skills, expand_command, expand_mentions, filter_files,

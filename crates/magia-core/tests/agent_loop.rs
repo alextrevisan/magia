@@ -1192,3 +1192,53 @@ async fn client_errors_are_not_retried() {
     assert!(retries(&ev).is_empty());
     assert!(ev.iter().any(|e| matches!(e, AgentEvent::Error(_))));
 }
+
+#[tokio::test]
+async fn magia_reports_its_phases_and_what_subagents_do() {
+    use magia_core::{MagiaPhase, REVIEW_PARENT};
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("hello.txt"), "hi\n").unwrap();
+    let (url, _server) = serve(vec![
+        tool_reply(&[(
+            "t1",
+            "task",
+            r#"{"description":"look","prompt":"read hello"}"#,
+        )]),
+        tool_reply(&[("r1", "read", r#"{"file_path":"hello.txt"}"#)]), // the subagent
+        text_reply("hello.txt says hi"),
+        tool_reply(&[
+            ("w1", "write", r#"{"file_path":"x.txt","content":"hi"}"#),
+            ("t2", "todo", &todos(&[("copy", "completed")])),
+        ]),
+        text_reply("done"),
+        tool_reply(&[("r2", "read", r#"{"file_path":"x.txt"}"#)]), // the reviewer
+        text_reply(r#"{"verdict":"pass","issues":[]}"#),
+    ])
+    .await;
+    let mut agent = magia_agent(url, dir.path(), PermissionMode::Yolo);
+    let ev = run(&mut agent, "copy hello.txt to x.txt").await;
+    no_errors(&ev);
+    let phases: Vec<_> = ev
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Magia(p) => Some(p.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        phases,
+        vec![
+            MagiaPhase::Working { round: 1 },
+            MagiaPhase::Reviewing { n: 1 },
+            MagiaPhase::Finished("finished · review passed".into()),
+        ]
+    );
+    let subs: Vec<_> = ev
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::SubTool { parent, name, .. } => Some((parent.as_str(), name.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(subs, vec![("t1", "read"), (REVIEW_PARENT, "read")]);
+}

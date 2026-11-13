@@ -298,6 +298,21 @@ async fn real_main() -> Result<()> {
                 AgentEvent::Usage(u) => {
                     eprintln!("\n[tokens in {} / out {}]", u.input_tokens, u.output_tokens)
                 }
+                AgentEvent::SubTool {
+                    parent,
+                    name,
+                    input,
+                } => {
+                    let who = if parent == magia_core::REVIEW_PARENT {
+                        "reviewer"
+                    } else {
+                        "subagent"
+                    };
+                    eprintln!("  ↳ {who}: {name} {input}")
+                }
+                AgentEvent::Magia(magia_core::MagiaPhase::Finished(why)) => {
+                    eprintln!("\n[magia: {why}]")
+                }
                 AgentEvent::TurnDone => break,
                 _ => {}
             }

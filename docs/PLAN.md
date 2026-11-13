@@ -226,6 +226,7 @@ Também: as continuações ficam fora do revisor do modo Auto (`review::user_req
 6. Revisão independente (subagente revisor com veredito JSON).
 7. Config `magia.magia_mode` + `docs/magia.example.jsonc` + teste de config.
 8. Front-ends: "Magia" no seletor de agentes da GUI (sai do Plan como o Build), divisória "↻ round N · motivo" no transcript; CLI `--agent magia` imprime os rounds.
+9. Visibilidade: `AgentEvent::Magia(MagiaPhase)` (Working/Reviewing/ReviewFailed/Finished com motivo) e `AgentEvent::SubTool { parent, name, input }` (cada ferramenta de um subagente `task` ou do revisor, `parent` = id do call ou `"review"`, repassada ao vivo). A GUI junta isso em `activity.rs`: a barra lateral mostra "Magia round N" + fase + problemas da revisão, e "Subagents" (rótulo, passos, última ferramenta, resultado) acima de "Tasks"; em janela estreita vai no cartão colapsável. O CLI imprime `↳ subagent:`/`↳ reviewer:` e o motivo final.
 9. Testes com o servidor SSE falso: continua com tarefas pendentes; para sem progresso; para quando o usuário nega; limite de passos continua; revisão `fail` reabre e `pass` encerra; rewind ignora continuações; Build não muda.
 10. Docs: status aqui e no CLAUDE.md.
 

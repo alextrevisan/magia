@@ -48,8 +48,31 @@ pub enum AgentEvent {
         n: u32,
         reason: String,
     },
+    /// Magia mode's state, for a status panel (rounds also come as `Round`).
+    Magia(MagiaPhase),
+    /// A subagent (`task` call `parent`, or the reviewer: `parent` = `"review"`) used a tool.
+    SubTool {
+        parent: String,
+        name: String,
+        input: Value,
+    },
     /// Turn finished (completed, cancelled or failed).
     TurnDone,
+}
+
+/// `parent` of the reviewer's `SubTool` events.
+pub const REVIEW_PARENT: &str = "review";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MagiaPhase {
+    /// Round `round` is running.
+    Working { round: u32 },
+    /// The reviewer is checking the changed files (`n`-th review of this request).
+    Reviewing { n: u32 },
+    /// The reviewer found these problems; the next round fixes them.
+    ReviewFailed { issues: Vec<String> },
+    /// The request ended, and why.
+    Finished(String),
 }
 
 /// The user side of a turn: approving tool calls and answering the model's questions.
@@ -451,15 +474,21 @@ It can read/search the project but not modify it; it returns a concise report."
     ) {
         let magia = self.magia.filter(|_| self.magia_active());
         let todos_at_start = self.todos();
+        let phase = |p: MagiaPhase| {
+            let _ = events.send(AgentEvent::Magia(p));
+        };
+        if magia.is_some() {
+            phase(MagiaPhase::Working { round: 1 });
+        }
         let (mut n, mut idle, mut reviews) = (1u32, 0u32, 0u32);
-        loop {
+        let reason: String = loop {
             let todos_before = self.todos();
             self.denied.store(false, Ordering::Relaxed);
             let round = match self.run_loop(events, cancel, approver).await {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = events.send(AgentEvent::Error(format!("{e:#}")));
-                    return;
+                    break "the request failed".into();
                 }
             };
             let Some(cfg) = magia else {
@@ -472,7 +501,7 @@ It can read/search the project but not modify it; it returns a concise report."
                 return;
             };
             if round.end == End::Cancelled {
-                return;
+                break "cancelled".into();
             }
             let todos = self.todos();
             let open = magia_mode::open_tasks(&todos);
@@ -487,49 +516,65 @@ It can read/search the project but not modify it; it returns a concise report."
             };
             let why = if self.denied.load(Ordering::Relaxed) {
                 notice("stopped because a tool call was denied");
-                return;
+                break "stopped: a tool call was denied".into();
             } else if round.end == End::StepLimit {
                 Continue::StepLimit
             } else if round.calls == 0 {
-                return; // only talked: an answer, or something for the user to decide
+                // only talked: an answer, or something for the user to decide
+                break "finished".into();
             } else if open > 0 && list_is_ours {
                 Continue::OpenTasks
             } else if cfg.review && reviews < magia_mode::MAX_REVIEWS && !changed.is_empty() {
                 reviews += 1;
                 notice("reviewing the changes…");
-                match self.review_work(request, &todos, &changed, cancel).await {
-                    magia_mode::Verdict::Fail(issues) => Continue::Review(issues),
+                phase(MagiaPhase::Reviewing { n: reviews });
+                match self
+                    .review_work(request, &todos, &changed, events, cancel)
+                    .await
+                {
+                    magia_mode::Verdict::Fail(issues) => {
+                        phase(MagiaPhase::ReviewFailed {
+                            issues: issues.clone(),
+                        });
+                        Continue::Review(issues)
+                    }
                     magia_mode::Verdict::Pass => {
                         notice("review passed");
-                        return;
+                        break "finished · review passed".into();
                     }
                     magia_mode::Verdict::Unreadable => {
                         notice("the reviewer gave no clear verdict; finishing");
-                        return;
+                        break "finished · reviewer gave no clear verdict".into();
                     }
                 }
             } else {
-                return;
+                break "finished".into();
             };
             if cancel.is_cancelled() {
-                return;
+                break "cancelled".into();
             }
             if idle >= magia_mode::MAX_IDLE_ROUNDS && !matches!(why, Continue::Review(_)) {
                 notice(&format!("stopped after {idle} rounds without progress"));
-                return;
+                break format!("stopped: {idle} rounds without progress");
             }
             if n >= cfg.max_rounds {
                 notice(&format!("stopped after {n} rounds; ask again to continue"));
-                return;
+                break format!("stopped: {n} rounds (the limit)");
             }
             n += 1;
             let _ = events.send(AgentEvent::Round {
                 n,
                 reason: why.label(open),
             });
+            if !matches!(why, Continue::Review(_)) {
+                phase(MagiaPhase::Working { round: n });
+            }
             self.push(Message::user(magia_mode::continuation(
                 request, &todos, &why,
             )));
+        };
+        if magia.is_some() {
+            phase(MagiaPhase::Finished(reason));
         }
     }
 
@@ -551,6 +596,7 @@ It can read/search the project but not modify it; it returns a concise report."
         request: &str,
         todos: &[magia_tools::Todo],
         changed: &[PathBuf],
+        events: &UnboundedSender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> magia_mode::Verdict {
         let files: Vec<String> = changed
@@ -578,6 +624,7 @@ It can read/search the project but not modify it; it returns a concise report."
             magia_mode::review_prompt(request, todos, &files, claim),
             magia_mode::REVIEWER,
             cancel.clone(),
+            Some((events.clone(), REVIEW_PARENT.into())),
         )
         .await;
         magia_mode::parse_review(&report)
@@ -905,6 +952,7 @@ It can read/search the project but not modify it; it returns a concise report."
                     prompt,
                     RESEARCHER,
                     self.cx.cancel.clone(),
+                    Some((events.clone(), call.id.clone())),
                 )
                 .await)
             }
@@ -1240,6 +1288,8 @@ fn run_subagent(
     prompt: String,
     role: &'static str,
     cancel: CancellationToken,
+    // Where to report the child's tool calls live, under which parent id.
+    forward: Option<(UnboundedSender<AgentEvent>, String)>,
 ) -> BoxFuture<'static, String> {
     async move {
         let mut child = Agent::new(client, model, PermissionMode::Plan, cwd);
@@ -1248,15 +1298,29 @@ fn run_subagent(
         child.system.push_str("\n\n");
         child.system.push_str(role);
         let (tx, mut rx) = unbounded_channel();
-        child
-            .run_turn(prompt, tx, cancel, &AutoApprove(false))
-            .await;
         let mut error = None;
-        while let Ok(ev) = rx.try_recv() {
-            if let AgentEvent::Error(e) = ev {
-                error = Some(e);
+        // `tx` is dropped when the turn ends, which ends the receiving side.
+        let watch = async {
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    AgentEvent::Error(e) => error = Some(e),
+                    AgentEvent::ToolStart { name, input, .. } => {
+                        if let Some((parent_tx, parent)) = &forward {
+                            let _ = parent_tx.send(AgentEvent::SubTool {
+                                parent: parent.clone(),
+                                name,
+                                input,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
             }
-        }
+        };
+        tokio::join!(
+            child.run_turn(prompt, tx, cancel, &AutoApprove(false)),
+            watch
+        );
         let report = child
             .history
             .iter()

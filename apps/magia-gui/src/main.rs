@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
+mod activity;
 mod clipboard;
 mod composer;
 mod magic;
@@ -148,6 +149,8 @@ struct App {
     retrying: bool,
     /// Spins the Magia agent picker's border.
     magic: magic::Spin,
+    /// Magia rounds/review and subagents of the current request (side panel).
+    activity: activity::Activity,
     status: String,
     tokens: (u64, u64),
     /// Cached rendered height per item (0 = not measured yet); drives the virtualized list.
@@ -263,6 +266,7 @@ impl App {
             queue: vec![],
             retrying: false,
             magic: Default::default(),
+            activity: Default::default(),
             status,
             tokens: (0, 0),
             heights: vec![],
@@ -542,6 +546,7 @@ impl App {
 
     fn reset_items(&mut self, history: &[Message]) {
         // Resume, rewind and /clear all change which session (or how much of it) is open.
+        self.activity.clear();
         self.session_title = sent_messages(history)
             .first()
             .map(|t| magia_store::title_of(t))
@@ -691,6 +696,7 @@ impl App {
         ));
         self.running = true;
         self.status.clear();
+        self.activity.clear();
         if self.cfg.agent == agents::MAGIA && self.cfg.permission_mode != PermissionMode::Plan {
             self.magic.start(ctx);
         }
@@ -778,81 +784,89 @@ impl App {
                     self.pending = Some((call, reason, reply));
                     self.notify(ctx, "magia needs your approval", &body);
                 }
-                UiMsg::Agent(ev) => match ev {
-                    AgentEvent::TextDelta(t) => match self.items.last_mut() {
-                        Some(Item::Assistant { text, .. }) => text.push_str(&t),
-                        _ => self.items.push(Item::Assistant {
-                            text: t,
-                            reasoning: String::new(),
+                UiMsg::Agent(ev) => {
+                    let cwd = &self.cwd;
+                    self.activity
+                        .on_event(&ev, |n, i| relative(&tool_summary(n, i), cwd));
+                    match ev {
+                        AgentEvent::TextDelta(t) => match self.items.last_mut() {
+                            Some(Item::Assistant { text, .. }) => text.push_str(&t),
+                            _ => self.items.push(Item::Assistant {
+                                text: t,
+                                reasoning: String::new(),
+                            }),
+                        },
+                        AgentEvent::ReasoningDelta(t) => match self.items.last_mut() {
+                            Some(Item::Assistant { reasoning, .. }) => reasoning.push_str(&t),
+                            _ => self.items.push(Item::Assistant {
+                                text: String::new(),
+                                reasoning: t,
+                            }),
+                        },
+                        AgentEvent::ToolStart { id, name, input } => self.items.push(Item::Tool {
+                            id,
+                            summary: relative(&tool_summary(&name, &input), &self.cwd),
+                            name,
+                            input: input.to_string(),
+                            output: None,
                         }),
-                    },
-                    AgentEvent::ReasoningDelta(t) => match self.items.last_mut() {
-                        Some(Item::Assistant { reasoning, .. }) => reasoning.push_str(&t),
-                        _ => self.items.push(Item::Assistant {
-                            text: String::new(),
-                            reasoning: t,
-                        }),
-                    },
-                    AgentEvent::ToolStart { id, name, input } => self.items.push(Item::Tool {
-                        id,
-                        summary: relative(&tool_summary(&name, &input), &self.cwd),
-                        name,
-                        input: input.to_string(),
-                        output: None,
-                    }),
-                    AgentEvent::ToolEnd {
-                        id,
-                        output,
-                        is_error,
-                    } => {
-                        for it in self.items.iter_mut().rev() {
-                            if let Item::Tool {
-                                id: i, output: o, ..
-                            } = it
-                                && *i == id
-                            {
-                                *o = Some((output, is_error));
-                                break;
+                        AgentEvent::ToolEnd {
+                            id,
+                            output,
+                            is_error,
+                        } => {
+                            for it in self.items.iter_mut().rev() {
+                                if let Item::Tool {
+                                    id: i, output: o, ..
+                                } = it
+                                    && *i == id
+                                {
+                                    *o = Some((output, is_error));
+                                    break;
+                                }
                             }
                         }
-                    }
-                    AgentEvent::Usage(u) => {
-                        self.tokens.0 += u.input_tokens;
-                        self.tokens.1 += u.output_tokens;
-                    }
-                    AgentEvent::Notice(n) => self.status = n,
-                    AgentEvent::Error(e) => self.items.push(Item::Error(e)),
-                    AgentEvent::Round { n, reason } => {
-                        self.items
-                            .push(Item::Round(format!("round {n} · {reason}")));
-                    }
-                    AgentEvent::TurnDone => {
-                        self.running = false;
-                        self.pending = None;
-                        self.question = None;
-                        if let Some((text, images)) = self.take_queue() {
-                            self.start_turn(text, images, ctx);
-                        } else {
-                            self.notify(ctx, "magia", "finished");
+                        AgentEvent::Usage(u) => {
+                            self.tokens.0 += u.input_tokens;
+                            self.tokens.1 += u.output_tokens;
+                        }
+                        AgentEvent::Notice(n) => self.status = n,
+                        AgentEvent::Error(e) => self.items.push(Item::Error(e)),
+                        AgentEvent::Magia(_) | AgentEvent::SubTool { .. } => {}
+                        AgentEvent::Round { n, reason } => {
+                            self.items
+                                .push(Item::Round(format!("round {n} · {reason}")));
+                        }
+                        AgentEvent::TurnDone => {
+                            self.running = false;
+                            self.pending = None;
+                            self.question = None;
+                            if let Some((text, images)) = self.take_queue() {
+                                self.start_turn(text, images, ctx);
+                            } else {
+                                self.notify(ctx, "magia", "finished");
+                            }
+                        }
+                        AgentEvent::Retry {
+                            attempt,
+                            max,
+                            wait_secs,
+                            error,
+                            discarded,
+                        } => {
+                            if discarded
+                                && matches!(self.items.last(), Some(Item::Assistant { .. }))
+                            {
+                                self.items.pop();
+                                self.heights.truncate(self.items.len());
+                            }
+                            self.status = format!(
+                                "request failed ({error}); trying again in {wait_secs}s ({attempt}/{max})"
+                            );
+                            self.retrying = true;
                         }
                     }
-                    AgentEvent::Retry {
-                        attempt,
-                        max,
-                        wait_secs,
-                        error,
-                        discarded,
-                    } => {
-                        if discarded && matches!(self.items.last(), Some(Item::Assistant { .. })) {
-                            self.items.pop();
-                            self.heights.truncate(self.items.len());
-                        }
-                        self.status = format!(
-                            "request failed ({error}); trying again in {wait_secs}s ({attempt}/{max})"
-                        );
-                        self.retrying = true;
-                    }
-                },
+                }
             }
         }
     }
@@ -1188,7 +1202,7 @@ impl App {
             return;
         }
         let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
-        if todos.is_empty() {
+        if todos.is_empty() && self.activity.is_empty() {
             return;
         }
         let t = *theme::tokens(ui);
@@ -1203,16 +1217,21 @@ impl App {
                     .stroke(egui::Stroke::new(1.0, t.line)),
             )
             .show(ui, |ui| {
-                ui.label(
-                    egui::RichText::new(tasks_title(&todos))
-                        .font(theme::semibold(theme::SMALL + 1.0))
-                        .color(t.fg),
-                );
-                ui.add_space(6.0);
                 egui::ScrollArea::vertical()
                     .id_salt("tasks_side")
                     .auto_shrink(false)
-                    .show(ui, |ui| todo_list(ui, &todos));
+                    .show(ui, |ui| {
+                        activity::show(ui, &self.activity);
+                        if !todos.is_empty() {
+                            ui.label(
+                                egui::RichText::new(tasks_title(&todos))
+                                    .font(theme::semibold(theme::SMALL + 1.0))
+                                    .color(t.fg),
+                            );
+                            ui.add_space(6.0);
+                            todo_list(ui, &todos);
+                        }
+                    });
             });
     }
 
@@ -1227,8 +1246,8 @@ impl App {
             .show(ui, |ui| {
                 if !self.tasks_on_side(ui.ctx()) {
                     let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
-                    if !todos.is_empty() {
-                        column(ui, |ui| todo_card(ui, &todos));
+                    if !todos.is_empty() || !self.activity.is_empty() {
+                        column(ui, |ui| todo_card(ui, &todos, &self.activity));
                     }
                 }
                 if self.items.is_empty() {
@@ -1587,7 +1606,7 @@ fn todo_list(ui: &mut egui::Ui, todos: &[magia_tools::Todo]) {
 }
 
 /// Narrow windows: a collapsible card with a few lines visible; the rest scrolls.
-fn todo_card(ui: &mut egui::Ui, todos: &[magia_tools::Todo]) {
+fn todo_card(ui: &mut egui::Ui, todos: &[magia_tools::Todo], act: &activity::Activity) {
     let t = *theme::tokens(ui);
     egui::Frame::new()
         .fill(t.surface)
@@ -1598,15 +1617,23 @@ fn todo_card(ui: &mut egui::Ui, todos: &[magia_tools::Todo]) {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::CollapsingHeader::new(
-                egui::RichText::new(tasks_title(todos)).font(theme::semibold(theme::SMALL + 1.0)),
+                egui::RichText::new(if todos.is_empty() {
+                    "Activity".to_owned()
+                } else {
+                    tasks_title(todos)
+                })
+                .font(theme::semibold(theme::SMALL + 1.0)),
             )
             .id_salt("todos")
             .default_open(true)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical()
                     .id_salt("todos_scroll")
-                    .max_height(120.0)
-                    .show(ui, |ui| todo_list(ui, todos));
+                    .max_height(160.0)
+                    .show(ui, |ui| {
+                        activity::show(ui, act);
+                        todo_list(ui, todos);
+                    });
             });
         });
 }
