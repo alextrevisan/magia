@@ -1,10 +1,10 @@
 ; Inno Setup script for the Windows installer.
-; usage: iscc /DVersion=0.3.1 /DSrc=<dir with magia.exe and magia-gui.exe> /O<outdir> packaging\magia.iss
+; usage: iscc /DVersion=0.3.2 /DSrc=<dir with magia.exe and magia-gui.exe> /O<outdir> packaging\magia.iss
 ; Installs per user (no admin rights): the desktop app, the `magia` CLI (optionally on PATH),
 ; Start menu and desktop shortcuts, and an uninstaller.
 
 #ifndef Version
-  #define Version "0.3.1"
+  #define Version "0.3.2"
 #endif
 #ifndef Src
   #define Src "..\target\release"
