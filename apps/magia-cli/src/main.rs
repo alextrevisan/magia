@@ -281,6 +281,20 @@ async fn real_main() -> Result<()> {
                 }
                 AgentEvent::Notice(n) => eprintln!("\n[{n}]"),
                 AgentEvent::Round { n, reason } => eprintln!("\n── round {n} · {reason} ──"),
+                AgentEvent::Retry {
+                    attempt,
+                    max,
+                    wait_secs,
+                    error,
+                    discarded,
+                } => {
+                    if discarded {
+                        eprintln!("\n[the partial reply above is discarded]");
+                    }
+                    eprintln!(
+                        "\n[request failed ({error}); trying again in {wait_secs}s ({attempt}/{max})]"
+                    );
+                }
                 AgentEvent::Usage(u) => {
                     eprintln!("\n[tokens in {} / out {}]", u.input_tokens, u.output_tokens)
                 }

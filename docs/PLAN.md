@@ -125,7 +125,8 @@ trait Provider: Send + Sync {
 - Um adaptador por `Wire` (3 no total) converte o `ChatRequest` interno ↔ JSON do fio e normaliza os eventos SSE em `StreamEvent { TextDelta, ReasoningDelta, ToolCallStart, ToolCallArgsDelta, ToolCallEnd, Usage, Done }`.
 - Zen, Go e OpenRouter são **configurações** (base URL + escolha de `Wire` por modelo), não código novo. Regra: modelos `gpt-*` no Zen → `Responses`; `claude-*` (e os listados pelo Go como Messages-only) → `AnthropicMessages`; o resto → `ChatCompletions`. Permitir override por modelo na config.
 - OpenRouter: enviar `HTTP-Referer`/`X-Title`, suportar `provider` routing e `reasoning` no corpo.
-- Retry com backoff exponencial em 429/5xx/erros de conexão, respeitando `retry-after`.
+- Retry no agente (`Agent::run_loop`), não no `Client`: qualquer falha recuperável — conexão, 408/409/425/429/5xx, erro de decode, evento de erro do provedor no meio do SSE, stream que termina sem `finish_reason`/`[DONE]` — espera 5 s (ou o `retry-after`, até 60 s) e repete o request, até 10 vezes, cancelável. Cota esgotada, contexto longo demais e 4xx não repetem. Texto parcial já mostrado é descartado (`AgentEvent::Retry { discarded }`). A GUI mostra "trying again in Ns"; o CLI imprime a tentativa.
+- Fila na GUI: Enter durante um turno enfileira a mensagem (lista acima do composer, × remove); ao terminar, todas vão juntas num só pedido, separadas por linha em branco, com as imagens. Esc/Parar cancela e devolve a fila ao composer.
 - `base_url` e headers extras sobrescrevíveis por provedor na config.
 
 ### 2.2 Agent loop e concorrência com egui

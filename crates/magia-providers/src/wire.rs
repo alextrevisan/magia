@@ -19,6 +19,10 @@ pub trait Decoder: Send {
     fn feed(&mut self, ev: &SseEvent) -> Vec<StreamEvent>;
     /// Called when the byte stream ends; flushes anything still pending.
     fn finish(&mut self) -> Vec<StreamEvent>;
+    /// An error event the provider sent inside the stream (taken once).
+    fn error(&mut self) -> Option<String>;
+    /// Whether the provider said the response was finished (otherwise the connection dropped).
+    fn complete(&self) -> bool;
 }
 
 pub fn decoder(wire: Wire) -> Box<dyn Decoder> {
@@ -159,6 +163,9 @@ struct PartialCall {
 pub struct ChatDecoder {
     calls: BTreeMap<u64, PartialCall>,
     flushed: bool,
+    /// `[DONE]` or a `finish_reason` arrived.
+    finished: bool,
+    error: Option<String>,
 }
 
 impl ChatDecoder {
@@ -183,6 +190,7 @@ impl ChatDecoder {
 impl Decoder for ChatDecoder {
     fn feed(&mut self, ev: &SseEvent) -> Vec<StreamEvent> {
         if ev.data.trim() == "[DONE]" {
+            self.finished = true;
             let mut out = self.flush();
             out.push(StreamEvent::Done);
             return out;
@@ -190,6 +198,16 @@ impl Decoder for ChatDecoder {
         let Ok(v) = serde_json::from_str::<Value>(&ev.data) else {
             return vec![];
         };
+        // OpenRouter and others send `{"error": {...}}` mid-stream.
+        if let Some(e) = v.get("error").filter(|e| !e.is_null()) {
+            self.error = Some(
+                e.get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| e.to_string()),
+            );
+            return vec![];
+        }
         let mut out = Vec::new();
         if let Some(delta) = v.pointer("/choices/0/delta") {
             if let Some(t) = delta.get("content").and_then(Value::as_str)
@@ -223,6 +241,7 @@ impl Decoder for ChatDecoder {
         if v.pointer("/choices/0/finish_reason")
             .is_some_and(|f| !f.is_null())
         {
+            self.finished = true;
             out.extend(self.flush());
         }
         if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
@@ -241,6 +260,14 @@ impl Decoder for ChatDecoder {
         let mut out = self.flush();
         out.push(StreamEvent::Done);
         out
+    }
+
+    fn error(&mut self) -> Option<String> {
+        self.error.take()
+    }
+
+    fn complete(&self) -> bool {
+        self.finished
     }
 }
 
@@ -294,6 +321,7 @@ fn responses_body(req: &ChatRequest) -> Value {
 #[derive(Default)]
 pub struct ResponsesDecoder {
     done: bool,
+    error: Option<String>,
 }
 
 impl Decoder for ResponsesDecoder {
@@ -342,13 +370,13 @@ impl Decoder for ResponsesDecoder {
                 out
             }
             "response.failed" | "error" => {
-                // Surfaced by the caller as an error through an empty Done; keep message in text.
-                let msg = s("/response/error/message")
-                    .or_else(|| s("/message"))
-                    .unwrap_or_default();
-                vec![StreamEvent::TextDelta(format!(
-                    "\n[provider error: {msg}]\n"
-                ))]
+                self.error = Some(
+                    s("/response/error/message")
+                        .or_else(|| s("/message"))
+                        .or_else(|| s("/error/message"))
+                        .unwrap_or_else(|| "request failed".into()),
+                );
+                vec![]
             }
             _ => vec![],
         }
@@ -360,6 +388,14 @@ impl Decoder for ResponsesDecoder {
         } else {
             vec![StreamEvent::Done]
         }
+    }
+
+    fn error(&mut self) -> Option<String> {
+        self.error.take()
+    }
+
+    fn complete(&self) -> bool {
+        self.done
     }
 }
 
@@ -441,6 +477,7 @@ pub struct MessagesDecoder {
     blocks: BTreeMap<u64, PartialCall>,
     usage: Usage,
     done: bool,
+    error: Option<String>,
 }
 
 impl Decoder for MessagesDecoder {
@@ -524,13 +561,13 @@ impl Decoder for MessagesDecoder {
                 vec![StreamEvent::Usage(self.usage), StreamEvent::Done]
             }
             "error" => {
-                let msg = v
-                    .pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                vec![StreamEvent::TextDelta(format!(
-                    "\n[provider error: {msg}]\n"
-                ))]
+                self.error = Some(
+                    v.pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("request failed")
+                        .to_owned(),
+                );
+                vec![]
             }
             _ => vec![],
         }
@@ -542,6 +579,14 @@ impl Decoder for MessagesDecoder {
         } else {
             vec![StreamEvent::Done]
         }
+    }
+
+    fn error(&mut self) -> Option<String> {
+        self.error.take()
+    }
+
+    fn complete(&self) -> bool {
+        self.done
     }
 }
 
@@ -559,6 +604,38 @@ mod tests {
         }
         out.extend(d.finish());
         out
+    }
+
+    /// Feed a fixture and report (complete, error) the way `decode_stream` checks them.
+    fn state(wire: Wire, fixture: &str) -> (bool, Option<String>) {
+        let mut p = SseParser::default();
+        let mut d = decoder(wire);
+        for ev in p.push(fixture.as_bytes()) {
+            d.feed(&ev);
+        }
+        (d.complete(), d.error())
+    }
+
+    #[test]
+    fn cut_streams_are_incomplete_and_error_events_are_errors() {
+        let cut = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n";
+        assert_eq!(state(Wire::ChatCompletions, cut), (false, None));
+        let done = concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        assert!(state(Wire::ChatCompletions, done).0);
+        let err = "data: {\"error\":{\"message\":\"overloaded\"}}\n\n";
+        assert!(
+            state(Wire::ChatCompletions, err)
+                .1
+                .unwrap()
+                .contains("overloaded")
+        );
+        let msg_err = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"busy\"}}\n\n";
+        assert!(state(Wire::Messages, msg_err).1.unwrap().contains("busy"));
+        let msg_cut = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\n";
+        assert!(!state(Wire::Messages, msg_cut).0);
     }
 
     #[test]

@@ -142,6 +142,10 @@ struct App {
     files: Vec<String>,
     models: Vec<String>,
     model_picker: model_picker::ModelPicker,
+    /// Messages sent while the agent works; they go out together when the turn ends.
+    queue: Vec<(String, Vec<magia_core::Image>)>,
+    /// The status line shows a "trying again" notice.
+    retrying: bool,
     /// Spins the Magia agent picker's border.
     magic: magic::Spin,
     status: String,
@@ -256,6 +260,8 @@ impl App {
             files: vec![],
             models: vec![],
             model_picker: Default::default(),
+            queue: vec![],
+            retrying: false,
             magic: Default::default(),
             status,
             tokens: (0, 0),
@@ -616,7 +622,7 @@ impl App {
 
     fn send(&mut self, ctx: &egui::Context) {
         let mut prompt = self.composer.input.trim().to_owned();
-        if (prompt.is_empty() && self.composer.attachments.is_empty()) || self.running {
+        if prompt.is_empty() && self.composer.attachments.is_empty() {
             return;
         }
         self.composer.remember(&prompt);
@@ -644,10 +650,41 @@ impl App {
             return;
         }
         self.composer.input.clear();
+        let images = self.composer.take_images();
+        if self.running {
+            // Sent (with anything else queued) as one message when the turn ends.
+            self.queue.push((prompt, images));
+            return;
+        }
         if self.session_title.is_empty() {
             self.session_title = magia_store::title_of(&typed);
         }
-        let images = self.composer.take_images();
+        self.start_turn(prompt, images, ctx);
+    }
+
+    /// Everything queued while the agent worked, as one message: texts in order, separated by
+    /// a blank line, with all their images.
+    fn take_queue(&mut self) -> Option<(String, Vec<magia_core::Image>)> {
+        merge_queue(std::mem::take(&mut self.queue))
+    }
+
+    /// Stop the turn. Queued messages go back into the box instead of being sent.
+    fn stop(&mut self, ctx: &egui::Context) {
+        self.cancel.cancel();
+        if let Some((text, images)) = self.take_queue() {
+            let typed = std::mem::take(&mut self.composer.input);
+            self.composer.input = [text, typed]
+                .into_iter()
+                .filter(|t| !t.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            for img in images {
+                self.composer.attach(ctx, img, None);
+            }
+        }
+    }
+
+    fn start_turn(&mut self, prompt: String, images: Vec<magia_core::Image>, ctx: &egui::Context) {
         self.items.push(Item::User(
             prompt.clone(),
             images.iter().map(composer::image_label).collect(),
@@ -698,6 +735,16 @@ impl App {
 
     fn drain(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
+            // The repeat is answering: the "trying again" line is no longer news.
+            if self.retrying
+                && matches!(
+                    msg,
+                    UiMsg::Agent(AgentEvent::TextDelta(_) | AgentEvent::ToolStart { .. })
+                )
+            {
+                self.retrying = false;
+                self.status.clear();
+            }
             match msg {
                 UiMsg::Models(Ok(m)) => self.models = m,
                 UiMsg::Models(Err(e)) => self.status = format!("models: {e}"),
@@ -783,7 +830,27 @@ impl App {
                         self.running = false;
                         self.pending = None;
                         self.question = None;
-                        self.notify(ctx, "magia", "finished");
+                        if let Some((text, images)) = self.take_queue() {
+                            self.start_turn(text, images, ctx);
+                        } else {
+                            self.notify(ctx, "magia", "finished");
+                        }
+                    }
+                    AgentEvent::Retry {
+                        attempt,
+                        max,
+                        wait_secs,
+                        error,
+                        discarded,
+                    } => {
+                        if discarded && matches!(self.items.last(), Some(Item::Assistant { .. })) {
+                            self.items.pop();
+                            self.heights.truncate(self.items.len());
+                        }
+                        self.status = format!(
+                            "request failed ({error}); trying again in {wait_secs}s ({attempt}/{max})"
+                        );
+                        self.retrying = true;
                     }
                 },
             }
@@ -806,7 +873,7 @@ impl eframe::App for App {
             && !self.composer.input.starts_with('/')
             && ctx.input(|i| i.key_pressed(egui::Key::Escape))
         {
-            self.cancel.cancel();
+            self.stop(&ctx);
         }
 
         // Before the panels: the picker takes ↑↓/Enter/Esc ahead of the composer.
@@ -1028,7 +1095,40 @@ impl App {
                                 .color(t.accent)
                                 .size(theme::SMALL + 0.5),
                             );
+                            ui.label(
+                                egui::RichText::new("Enter queues a message for when it finishes")
+                                    .color(t.muted)
+                                    .size(theme::SMALL),
+                            );
                         });
+                    }
+                    let mut unqueue = None;
+                    for (i, (text, images)) in self.queue.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .small_button("×")
+                                .on_hover_text("Remove from the queue")
+                                .clicked()
+                            {
+                                unqueue = Some(i);
+                            }
+                            ui.label(
+                                egui::RichText::new("queued")
+                                    .color(t.muted)
+                                    .size(theme::SMALL),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(queued_label(text, images.len()))
+                                        .color(t.fg)
+                                        .size(theme::SMALL + 0.5),
+                                )
+                                .truncate(),
+                            );
+                        });
+                    }
+                    if let Some(i) = unqueue {
+                        self.queue.remove(i);
                     }
                     // Enter sends, Shift+Enter inserts a newline. The plain-Enter event is removed
                     // before the TextEdit sees it (egui's consume_key would also swallow
@@ -1063,7 +1163,7 @@ impl App {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if self.running {
                                 if theme::secondary(ui, "Stop  Esc", Some(t.danger)).clicked() {
-                                    self.cancel.cancel();
+                                    self.stop(ctx);
                                 }
                             } else {
                                 let ready = !self.composer.input.trim().is_empty()
@@ -1442,6 +1542,20 @@ fn empty_state(ui: &mut egui::Ui, cwd: &std::path::Path) -> Option<&'static str>
 /// side panel, so the reading column keeps its width.
 const TASKS_SIDE_MIN_WIDTH: f32 = 1000.0;
 
+/// One line for a queued message: its first line, plus how many images it carries.
+fn queued_label(text: &str, images: usize) -> String {
+    let first = text
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    match images {
+        0 => first.to_owned(),
+        1 => format!("{first}  + 1 image"),
+        n => format!("{first}  + {n} images"),
+    }
+}
+
 fn tasks_title(todos: &[magia_tools::Todo]) -> String {
     let done = todos
         .iter()
@@ -1797,6 +1911,40 @@ fn window_icon() -> egui::IconData {
             }
         }
         Err(_) => egui::IconData::default(),
+    }
+}
+
+/// Queued messages become one request: texts joined by a blank line, images in order.
+fn merge_queue(
+    queue: Vec<(String, Vec<magia_core::Image>)>,
+) -> Option<(String, Vec<magia_core::Image>)> {
+    if queue.is_empty() {
+        return None;
+    }
+    let (texts, images): (Vec<String>, Vec<Vec<magia_core::Image>>) = queue.into_iter().unzip();
+    let text = texts
+        .into_iter()
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Some((text, images.into_iter().flatten().collect()))
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::merge_queue;
+
+    #[test]
+    fn queued_messages_go_out_as_one() {
+        assert!(merge_queue(vec![]).is_none());
+        let (t, i) = merge_queue(vec![
+            ("first".into(), vec![]),
+            (String::new(), vec![]),
+            ("second".into(), vec![]),
+        ])
+        .unwrap();
+        assert_eq!(t, "first\n\nsecond");
+        assert!(i.is_empty());
     }
 }
 

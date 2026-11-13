@@ -34,6 +34,15 @@ pub enum AgentEvent {
     /// Informational (e.g. "context compacted").
     Notice(String),
     Error(String),
+    /// A request failed and will be repeated after `wait_secs`. When `discarded`, the text
+    /// streamed so far in this response is thrown away (the repeat starts over).
+    Retry {
+        attempt: u32,
+        max: u32,
+        wait_secs: u64,
+        error: String,
+        discarded: bool,
+    },
     /// Magia mode started another round of the same request (`n` ≥ 2) and why.
     Round {
         n: u32,
@@ -81,6 +90,33 @@ enum End {
     Cancelled,
     /// The step limit was reached with the model still calling tools.
     StepLimit,
+}
+
+enum Streamed {
+    Done(String, Vec<ToolCall>),
+    Cancelled(String, Vec<ToolCall>),
+    Failed {
+        error: anyhow::Error,
+        text: String,
+        /// Text or reasoning already reached the UI (it will be discarded on a retry).
+        emitted: bool,
+    },
+}
+
+/// Pause before repeating a failed request (longer if the provider asks via `retry-after`).
+const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+const MAX_RETRIES: u32 = 10;
+
+/// The first line of an error, short enough for a status line.
+fn short_error(e: &anyhow::Error) -> String {
+    let s = format!("{e:#}");
+    let line = s.lines().next().unwrap_or("").trim();
+    if line.chars().count() > 160 {
+        format!("{}…", line.chars().take(160).collect::<String>())
+    } else {
+        line.to_owned()
+    }
 }
 
 struct RoundEnd {
@@ -136,6 +172,8 @@ pub struct Agent {
     /// The Magia agent is selected (`crate::magia_mode`): the request runs in rounds until the
     /// task list is closed. Ignored in plan mode and in subagents.
     pub magia: Option<MagiaMode>,
+    /// Pause before repeating a failed request (5 s; the provider's `retry-after` can raise it).
+    pub retry_delay: std::time::Duration,
     /// The root file already added as project instructions (`AGENTS.md`/`CLAUDE.md`), so picking
     /// it as the agent does not add it twice.
     project_instructions: Option<&'static str>,
@@ -178,6 +216,7 @@ impl Agent {
             auto_model: None,
             persona: None,
             magia: None,
+            retry_delay: RETRY_DELAY,
             project_instructions,
             reviewed: Default::default(),
             denied: AtomicBool::new(false),
@@ -562,49 +601,50 @@ It can read/search the project but not modify it; it returns a concise report."
                 max_tokens: None,
                 session_id: Some(self.session_id()),
             };
-            let mut stream = tokio::select! {
-                s = self.client.stream(&req) => s?,
-                _ = cancel.cancelled() => {
-                    self.cancelled(String::new(), vec![]);
-                    return done(End::Cancelled, calls_made, edits);
-                }
-            };
-            let mut text = String::new();
-            let mut calls: Vec<ToolCall> = Vec::new();
-            loop {
-                let ev = tokio::select! {
-                    ev = stream.next() => ev,
-                    _ = cancel.cancelled() => {
+            // Any failure (network, decode, an error event, a dropped stream, 429/5xx) is
+            // retried after a pause, from the start of this response.
+            let mut attempt = 0u32;
+            let (text, calls) = loop {
+                match self.stream_once(&req, events, cancel).await {
+                    Streamed::Done(text, calls) => break (text, calls),
+                    Streamed::Cancelled(text, calls) => {
                         self.cancelled(text, calls);
                         return done(End::Cancelled, calls_made, edits);
                     }
-                };
-                match ev {
-                    None => break,
-                    Some(Err(e)) => {
-                        self.push(Message::Assistant {
-                            text,
-                            tool_calls: calls,
+                    Streamed::Failed {
+                        error,
+                        text,
+                        emitted,
+                    } => {
+                        let Some(min) = magia_providers::retry_after(&error)
+                            .filter(|_| attempt < MAX_RETRIES && !cancel.is_cancelled())
+                        else {
+                            // Keep what was said; unfinished tool calls are dropped (they have
+                            // no results and would break the next request).
+                            if !text.is_empty() {
+                                self.push(Message::Assistant {
+                                    text,
+                                    tool_calls: vec![],
+                                });
+                            }
+                            return Err(error);
+                        };
+                        attempt += 1;
+                        let wait = min.max(self.retry_delay).min(MAX_RETRY_DELAY);
+                        let _ = events.send(AgentEvent::Retry {
+                            attempt,
+                            max: MAX_RETRIES,
+                            wait_secs: wait.as_secs(),
+                            error: short_error(&error),
+                            discarded: emitted,
                         });
-                        return Err(e);
+                        tokio::select! {
+                            _ = tokio::time::sleep(wait) => {}
+                            _ = cancel.cancelled() => return done(End::Cancelled, calls_made, edits),
+                        }
                     }
-                    Some(Ok(StreamEvent::TextDelta(t))) => {
-                        text.push_str(&t);
-                        let _ = events.send(AgentEvent::TextDelta(t));
-                    }
-                    Some(Ok(StreamEvent::ReasoningDelta(t))) => {
-                        let _ = events.send(AgentEvent::ReasoningDelta(t));
-                    }
-                    Some(Ok(StreamEvent::ToolCall(c))) => calls.push(c),
-                    Some(Ok(StreamEvent::Usage(u))) => {
-                        self.usage.add(u);
-                        self.last_input_tokens = u.input_tokens;
-                        let _ = events.send(AgentEvent::Usage(u));
-                    }
-                    Some(Ok(StreamEvent::Done)) => break,
                 }
-            }
-            drop(stream);
+            };
             self.push(Message::Assistant {
                 text,
                 tool_calls: calls.clone(),
@@ -649,6 +689,56 @@ It can read/search the project but not modify it; it returns a concise report."
             }
         }
         done(End::StepLimit, calls_made, edits)
+    }
+
+    /// One attempt at streaming a response. Text and reasoning are forwarded as they arrive.
+    async fn stream_once(
+        &mut self,
+        req: &ChatRequest,
+        events: &UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> Streamed {
+        let mut text = String::new();
+        let mut calls: Vec<ToolCall> = Vec::new();
+        let mut emitted = false;
+        let mut stream = tokio::select! {
+            s = self.client.stream(req) => match s {
+                Ok(s) => s,
+                Err(error) => return Streamed::Failed { error, text, emitted },
+            },
+            _ = cancel.cancelled() => return Streamed::Cancelled(text, calls),
+        };
+        loop {
+            let ev = tokio::select! {
+                ev = stream.next() => ev,
+                _ = cancel.cancelled() => return Streamed::Cancelled(text, calls),
+            };
+            match ev {
+                None | Some(Ok(StreamEvent::Done)) => return Streamed::Done(text, calls),
+                Some(Err(error)) => {
+                    return Streamed::Failed {
+                        error,
+                        text,
+                        emitted,
+                    };
+                }
+                Some(Ok(StreamEvent::TextDelta(t))) => {
+                    text.push_str(&t);
+                    emitted = true;
+                    let _ = events.send(AgentEvent::TextDelta(t));
+                }
+                Some(Ok(StreamEvent::ReasoningDelta(t))) => {
+                    emitted = true;
+                    let _ = events.send(AgentEvent::ReasoningDelta(t));
+                }
+                Some(Ok(StreamEvent::ToolCall(c))) => calls.push(c),
+                Some(Ok(StreamEvent::Usage(u))) => {
+                    self.usage.add(u);
+                    self.last_input_tokens = u.input_tokens;
+                    let _ = events.send(AgentEvent::Usage(u));
+                }
+            }
+        }
     }
 
     fn auto_allowed(&self, call: &ToolCall) -> bool {
@@ -932,13 +1022,29 @@ Do not call tools."
             max_tokens: Some(2048),
             session_id: Some(self.session_id()),
         };
-        let mut stream = self.client.stream(&req).await?;
-        let mut out = String::new();
-        while let Some(ev) = stream.next().await {
-            if let StreamEvent::TextDelta(t) = ev? {
-                out.push_str(&t);
+        let once = || async {
+            let mut stream = self.client.stream(&req).await?;
+            let mut out = String::new();
+            while let Some(ev) = stream.next().await {
+                if let StreamEvent::TextDelta(t) = ev? {
+                    out.push_str(&t);
+                }
             }
-        }
+            anyhow::Ok(out)
+        };
+        let mut attempt = 0;
+        let out = loop {
+            match once().await {
+                Ok(out) => break out,
+                Err(e) => match magia_providers::retry_after(&e) {
+                    Some(min) if attempt < 3 => {
+                        attempt += 1;
+                        tokio::time::sleep(min.max(self.retry_delay).min(MAX_RETRY_DELAY)).await;
+                    }
+                    _ => return Err(e),
+                },
+            }
+        };
         if out.trim().is_empty() {
             bail!("the model returned an empty summary");
         }

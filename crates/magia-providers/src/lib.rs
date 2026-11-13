@@ -163,8 +163,9 @@ impl Client {
         Ok(ids)
     }
 
-    /// Start a streaming completion. Retries transient failures (429/5xx/connect)
-    /// before the first byte, honouring `retry-after`.
+    /// Start a streaming completion (one attempt; the caller decides whether to retry, see
+    /// [`retry_after`]). A non-2xx answer is an [`HttpError`]; an error event inside the stream
+    /// is a [`StreamError`], and so is a stream that ends before the response is complete.
     pub async fn stream(
         &self,
         req: &ChatRequest,
@@ -178,43 +179,92 @@ impl Client {
             Auth::Bearer
         };
 
-        let mut attempt = 0u32;
-        let resp = loop {
-            let mut rb = self.request(reqwest::Method::POST, &url, auth).json(&body);
-            if let (Some(h), Some(id)) = (&self.config.session_header, &req.session_id) {
-                rb = rb.header(h, id);
+        let mut rb = self.request(reqwest::Method::POST, &url, auth).json(&body);
+        if let (Some(h), Some(id)) = (&self.config.session_header, &req.session_id) {
+            rb = rb.header(h, id);
+        }
+        let resp = rb.send().await.with_context(|| format!("POST {url}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let retry_after = resp
+                .headers()
+                .get("retry-after")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            let body = resp.text().await.unwrap_or_default();
+            return Err(HttpError {
+                url,
+                status,
+                quota: is_quota_error(&body),
+                body: truncate(&body, 800),
+                retry_after,
             }
-            let sent = rb.send().await;
-            match sent {
-                Ok(r) if r.status().is_success() => break r,
-                Ok(r) => {
-                    let status = r.status();
-                    let retry_after = r
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|h| h.to_str().ok())
-                        .and_then(|s| s.parse::<u64>().ok());
-                    let text = r.text().await.unwrap_or_default();
-                    // A 429 for an exhausted quota/plan will not clear by waiting: fail at once.
-                    let quota = is_quota_error(&text);
-                    let transient = (status.as_u16() == 429 && !quota) || status.is_server_error();
-                    if transient && attempt < 3 {
-                        let wait = retry_after.unwrap_or(1 << attempt).min(30);
-                        tokio::time::sleep(Duration::from_secs(wait)).await;
-                        attempt += 1;
-                        continue;
-                    }
-                    bail!("{} → {status}: {}", url, truncate(&text, 800));
-                }
-                Err(e) if (e.is_connect() || e.is_timeout()) && attempt < 3 => {
-                    tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
-                    attempt += 1;
-                }
-                Err(e) => return Err(e).with_context(|| format!("POST {url}")),
-            }
-        };
+            .into());
+        }
         Ok(decode_stream(resp.bytes_stream(), wire))
     }
+}
+
+/// The provider answered with a non-2xx status.
+#[derive(Debug)]
+pub struct HttpError {
+    pub url: String,
+    pub status: reqwest::StatusCode,
+    pub body: String,
+    /// `retry-after` header, in seconds.
+    pub retry_after: Option<u64>,
+    /// The body says the plan/credit is used up (a 429 that waiting will not clear).
+    pub quota: bool,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} → {}: {}", self.url, self.status, self.body)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+/// The provider reported an error inside the stream, or the stream ended early.
+#[derive(Debug)]
+pub struct StreamError(pub String);
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StreamError {}
+
+/// Whether a failed request is worth repeating, and the least time to wait first. Network,
+/// decode and in-stream errors, timeouts, 408/409/425/429 and 5xx are; a bad request, missing
+/// or wrong key, an exhausted quota or a context that does not fit are not.
+pub fn retry_after(e: &anyhow::Error) -> Option<Duration> {
+    if let Some(h) = e.downcast_ref::<HttpError>() {
+        let s = h.status.as_u16();
+        let transient = matches!(s, 408 | 409 | 425 | 429) || h.status.is_server_error();
+        return (transient && !h.quota && !too_long(&h.body))
+            .then(|| Duration::from_secs(h.retry_after.unwrap_or(0)));
+    }
+    if let Some(StreamError(m)) = e.downcast_ref::<StreamError>() {
+        return (!is_quota_error(m) && !too_long(m)).then_some(Duration::ZERO);
+    }
+    Some(Duration::ZERO)
+}
+
+/// The request itself is too big; repeating it gives the same answer.
+fn too_long(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    [
+        "context length",
+        "context_length",
+        "too long",
+        "maximum context",
+        "too many tokens",
+    ]
+    .iter()
+    .any(|k| b.contains(k))
 }
 
 fn decode_stream<S>(bytes: S, wire: Wire) -> BoxStream<'static, Result<StreamEvent>>
@@ -247,6 +297,14 @@ where
                 Some(Ok(chunk)) => {
                     for ev in st.parser.push(&chunk) {
                         st.pending.extend(st.dec.feed(&ev).into_iter().map(Ok));
+                        if let Some(msg) = st.dec.error() {
+                            st.ended = true;
+                            st.pending
+                                .push_back(Err(
+                                    StreamError(format!("provider error: {msg}")).into()
+                                ));
+                            break;
+                        }
                     }
                 }
                 Some(Err(e)) => {
@@ -255,7 +313,14 @@ where
                 }
                 None => {
                     st.ended = true;
-                    st.pending.extend(st.dec.finish().into_iter().map(Ok));
+                    if st.dec.complete() {
+                        st.pending.extend(st.dec.finish().into_iter().map(Ok));
+                    } else {
+                        st.pending.push_back(Err(StreamError(
+                            "the response stream ended before it was complete".into(),
+                        )
+                        .into()));
+                    }
                 }
             }
         }

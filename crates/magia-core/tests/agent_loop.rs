@@ -1119,3 +1119,76 @@ async fn build_and_plan_stop_with_open_tasks() {
         assert!(!bodies[0].contains("Magia mode"));
     }
 }
+
+// ───────────── retry after a failed request ─────────────
+
+fn retry_agent(url: String, dir: &std::path::Path) -> Agent {
+    let mut a = Agent::new(client(url), "m".into(), PermissionMode::Ask, dir.into());
+    a.retry_delay = std::time::Duration::from_millis(10);
+    a
+}
+
+fn retries(ev: &[AgentEvent]) -> Vec<(u32, bool)> {
+    ev.iter()
+        .filter_map(|e| match e {
+            AgentEvent::Retry {
+                attempt, discarded, ..
+            } => Some((*attempt, *discarded)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn server_errors_are_retried_and_the_answer_arrives() {
+    let dir = tempfile::tempdir().unwrap();
+    let e500 =
+        "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 4\r\nconnection: close\r\n\r\noops"
+            .to_string();
+    let e429 =
+        "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 4\r\nconnection: close\r\n\r\nslow"
+            .to_string();
+    let (url, server) = serve(vec![e500, e429, text_reply("hello")]).await;
+    let mut agent = retry_agent(url, dir.path());
+    let ev = run(&mut agent, "hi").await;
+    assert!(
+        !ev.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+        "{ev:?}"
+    );
+    assert_eq!(retries(&ev), vec![(1, false), (2, false)]);
+    assert_eq!(agent.history.len(), 2);
+    assert_eq!(server.await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn a_stream_cut_off_midway_is_retried_and_the_partial_text_discarded() {
+    let dir = tempfile::tempdir().unwrap();
+    // Text arrives, then the stream ends with no finish_reason and no [DONE].
+    let cut = sse(&[r#"{"choices":[{"delta":{"content":"half an ans"}}]}"#]);
+    let error_event = sse(&[r#"{"error":{"message":"upstream overloaded"}}"#]);
+    let (url, _server) = serve(vec![cut, error_event, text_reply("whole answer")]).await;
+    let mut agent = retry_agent(url, dir.path());
+    let ev = run(&mut agent, "hi").await;
+    assert!(
+        !ev.iter().any(|e| matches!(e, AgentEvent::Error(_))),
+        "{ev:?}"
+    );
+    assert_eq!(retries(&ev), vec![(1, true), (2, false)]);
+    assert!(matches!(
+        agent.history.last(),
+        Some(Message::Assistant { text, .. }) if text == "whole answer"
+    ));
+    assert_eq!(agent.history.len(), 2, "the partial text is not kept");
+}
+
+#[tokio::test]
+async fn client_errors_are_not_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let e400 =
+        "HTTP/1.1 400 Bad Request\r\ncontent-length: 3\r\nconnection: close\r\n\r\nbad".to_string();
+    let (url, _server) = serve(vec![e400]).await;
+    let mut agent = retry_agent(url, dir.path());
+    let ev = run(&mut agent, "hi").await;
+    assert!(retries(&ev).is_empty());
+    assert!(ev.iter().any(|e| matches!(e, AgentEvent::Error(_))));
+}
