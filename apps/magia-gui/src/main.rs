@@ -1790,25 +1790,25 @@ impl App {
                         .color(t.warn),
                 );
             }
-            ui.add_space(4.0);
-            let args = serde_json::to_string_pretty(&call.arguments).unwrap_or_default();
-            let args: String = args.chars().take(3000).collect();
-            egui::ScrollArea::vertical()
-                .max_height(260.0)
-                .show(ui, |ui| {
-                    markdown::code_block(ui, "arguments", &args, "perm")
-                });
+            // Only what the summary line above does not already say.
+            if let Some((lang, body)) = permission_details(&call.name, &call.arguments) {
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| markdown::code_block(ui, &lang, &body, "perm"));
+            }
             ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new(if dirs.is_empty() {
+                    "Change the mode in the top bar to stop being asked."
+                } else {
+                    "\"Always\" lasts for this session (kept on /resume)."
+                })
+                .size(theme::SMALL)
+                .color(t.muted),
+            );
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(if dirs.is_empty() {
-                        "Change the mode in the top bar to stop being asked."
-                    } else {
-                        "\"Always\" lasts for this session (kept on /resume)."
-                    })
-                    .size(theme::SMALL)
-                    .color(t.muted),
-                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if dirs.is_empty() {
                         if theme::primary(ui, "Allow", true).clicked() {
@@ -1838,6 +1838,38 @@ impl App {
         {
             let _ = p.reply.send(a);
         }
+    }
+}
+
+/// Extra detail for the permission dialog, as (language, text), when the one-line summary
+/// does not show everything: a write's content, an edit's change, an unknown tool's input.
+fn permission_details(name: &str, args: &serde_json::Value) -> Option<(String, String)> {
+    let get = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("");
+    let clip = |s: &str| s.chars().take(3000).collect::<String>();
+    match name {
+        "read" | "ls" | "glob" | "grep" | "bash" | "webfetch" | "websearch" | "task" => None,
+        "write" => {
+            let lang = std::path::Path::new(get("file_path"))
+                .extension()
+                .map(|e| e.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Some((lang, clip(get("content"))))
+        }
+        "edit" => {
+            let mut diff = String::new();
+            for l in get("old_string").lines() {
+                diff.push_str(&format!("- {l}\n"));
+            }
+            for l in get("new_string").lines() {
+                diff.push_str(&format!("+ {l}\n"));
+            }
+            Some(("diff".into(), clip(diff.trim_end())))
+        }
+        _ if args.as_object().is_none_or(|o| o.is_empty()) => None,
+        _ => Some((
+            "json".into(),
+            clip(&serde_json::to_string_pretty(args).unwrap_or_default()),
+        )),
     }
 }
 
@@ -2401,6 +2433,37 @@ fn merge_queue(
         .collect::<Vec<_>>()
         .join("\n\n");
     Some((text, images.into_iter().flatten().collect()))
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use super::permission_details;
+    use serde_json::json;
+
+    #[test]
+    fn details_only_add_what_the_summary_lacks() {
+        assert!(permission_details("read", &json!({"file_path": "/x"})).is_none());
+        assert!(permission_details("bash", &json!({"command": "ls"})).is_none());
+        let (lang, body) = permission_details(
+            "write",
+            &json!({"file_path": "a.rs", "content": "fn main() {}"}),
+        )
+        .unwrap();
+        assert_eq!((lang.as_str(), body.as_str()), ("rs", "fn main() {}"));
+        let (lang, body) = permission_details(
+            "edit",
+            &json!({"file_path": "a", "old_string": "x = 1", "new_string": "x = 2"}),
+        )
+        .unwrap();
+        assert_eq!((lang.as_str(), body.as_str()), ("diff", "- x = 1\n+ x = 2"));
+        assert_eq!(
+            permission_details("mcp__gh__issue", &json!({"n": 1}))
+                .unwrap()
+                .0,
+            "json"
+        );
+        assert!(permission_details("mcp__gh__ping", &json!({})).is_none());
+    }
 }
 
 #[cfg(test)]
