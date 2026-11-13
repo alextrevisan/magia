@@ -1,14 +1,16 @@
-//! The Magia agent's mark: a gradient border around the agent picker. It spins for a few
-//! seconds when Magia is picked or starts a request (easing out to a stop), then stays still,
-//! so there is no continuous animation.
+//! The Magia agent's mark: a gradient border that spins around the agent picker for a few
+//! seconds when Magia is picked or starts a request, easing out and fading away. Otherwise the
+//! picker looks like any other, and nothing repaints continuously.
 
 use egui::{Color32, Pos2, Rect, Stroke};
 use std::f32::consts::TAU;
 
 /// How long the border spins.
 pub const SPIN_SECONDS: f32 = 5.0;
-/// Whole turns in one spin, so it stops exactly where the still border is.
+/// Whole turns in one spin.
 const TURNS: f32 = 3.0;
+/// The border fades out over the last part of the spin.
+const FADE_SECONDS: f32 = 1.2;
 
 #[derive(Default)]
 pub struct Spin {
@@ -25,7 +27,7 @@ impl Spin {
         ctx.request_repaint();
     }
 
-    /// Rotation now (radians) and how strong the glow is (0 when still).
+    /// Rotation now (radians) and opacity (0 when not spinning: nothing to draw).
     fn phase(&mut self, ctx: &egui::Context) -> (f32, f32) {
         if std::mem::take(&mut self.pending) {
             self.started = Some(ctx.input(|i| i.time));
@@ -33,19 +35,24 @@ impl Spin {
         let Some(t0) = self.started else {
             return (0.0, 0.0);
         };
-        let p = ((ctx.input(|i| i.time) - t0) as f32 / SPIN_SECONDS).clamp(0.0, 1.0);
-        if p >= 1.0 {
+        let elapsed = (ctx.input(|i| i.time) - t0) as f32;
+        if elapsed >= SPIN_SECONDS {
             self.started = None;
             return (0.0, 0.0);
         }
         ctx.request_repaint_after(std::time::Duration::from_millis(16));
-        let eased = 1.0 - (1.0 - p).powi(3); // fast start, slows to a stop
-        (TURNS * TAU * eased, 1.0 - p)
+        let p = elapsed / SPIN_SECONDS;
+        let eased = 1.0 - (1.0 - p).powi(3); // fast start, slows down
+        let alpha = ((SPIN_SECONDS - elapsed) / FADE_SECONDS).min(1.0);
+        (TURNS * TAU * eased, alpha)
     }
 
     /// Paint the border over `rect` (drawn after the widget, so it sits on top).
     pub fn paint(&mut self, ui: &egui::Ui, rect: Rect, colors: &[Color32; 4]) {
-        let (phase, glow) = self.phase(ui.ctx());
+        let (phase, alpha) = self.phase(ui.ctx());
+        if alpha <= 0.0 {
+            return; // not spinning: the picker keeps its normal look
+        }
         let radius = ui.visuals().widgets.inactive.corner_radius.nw as f32;
         let points = rounded_rect_path(rect.shrink(0.5), radius);
         let center = rect.center();
@@ -58,13 +65,11 @@ impl Spin {
         let painter = ui.painter();
         for w in points.windows(2) {
             let c = color_at(w[0].lerp(w[1], 0.5));
-            if glow > 0.0 {
-                painter.line_segment(
-                    [w[0], w[1]],
-                    Stroke::new(5.0, c.gamma_multiply(0.35 * glow)),
-                );
-            }
-            painter.line_segment([w[0], w[1]], Stroke::new(1.6, c));
+            painter.line_segment(
+                [w[0], w[1]],
+                Stroke::new(5.0, c.gamma_multiply(0.3 * alpha)),
+            );
+            painter.line_segment([w[0], w[1]], Stroke::new(1.6, c.gamma_multiply(alpha)));
         }
     }
 }
