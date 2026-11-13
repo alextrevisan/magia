@@ -1393,3 +1393,53 @@ async fn btw_answers_from_the_conversation_during_a_turn_and_keeps_nothing() {
     let idle = btw::SideContext::of(&agent, true).question("and then?");
     assert!(format!("{:?}", idle.messages).contains("the moon is far"));
 }
+
+#[tokio::test]
+async fn resume_and_rewind_bring_back_the_task_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let first = todos(&[("a", "pending")]);
+    let second = todos(&[("a", "completed"), ("b", "pending")]);
+    let (url, _s) = serve(vec![
+        tool_reply(&[("t1", "todo", &first)]),
+        text_reply("planned"),
+        tool_reply(&[("t2", "todo", &second)]),
+        // A broken list afterwards fails and does not count.
+        tool_reply(&[("t3", "todo", r#"{"todos":"oops"}"#)]),
+        text_reply("progress"),
+    ])
+    .await;
+    let mut agent = Agent::new(
+        client(url.clone()),
+        "m".into(),
+        PermissionMode::Yolo,
+        dir.path().into(),
+    );
+    agent.store = Some(magia_store::SessionFile::create_for(root.path(), dir.path()).unwrap());
+    run(&mut agent, "plan it").await;
+    run(&mut agent, "go on").await;
+    let path = agent.store.as_ref().unwrap().path().to_path_buf();
+    let status = |a: &Agent| -> Vec<(String, String)> {
+        a.cx.todos
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|t| (t.content.clone(), t.status.clone()))
+            .collect()
+    };
+    let pair = |c: &str, s: &str| (c.to_owned(), s.to_owned());
+
+    let mut resumed = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Yolo,
+        dir.path().into(),
+    );
+    resumed.resume(&path).unwrap();
+    assert_eq!(
+        status(&resumed),
+        vec![pair("a", "completed"), pair("b", "pending")]
+    );
+    resumed.rewind(1).unwrap();
+    assert_eq!(status(&resumed), vec![pair("a", "pending")]);
+}

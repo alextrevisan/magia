@@ -1172,6 +1172,7 @@ Do not call tools."
         }
         let start = turns[turns.len() - n];
         self.history.truncate(start);
+        self.restore_todos(); // the list as it was before those turns
         let restored = self
             .cx
             .checkpoints
@@ -1211,8 +1212,16 @@ Do not call tools."
         self.history = sf.load()?;
         self.last_input_tokens = 0;
         self.forget_session_state();
+        self.restore_todos();
         self.store = Some(sf);
         Ok(self.history.len())
+    }
+
+    /// The task list as the history left it: the last `todo` call that succeeded.
+    fn restore_todos(&mut self) {
+        if let Ok(mut t) = self.cx.todos.lock() {
+            *t = todos_in(&self.history);
+        }
     }
 
     /// Per-conversation state that must not leak into the next one: the task list and the
@@ -1258,6 +1267,26 @@ fn permission_key(call: &ToolCall) -> String {
 }
 
 /// Random-enough id without a `rand` dependency (std's per-process random hasher keys).
+/// The list sent by the last successful `todo` call in `history` (empty if none).
+fn todos_in(history: &[Message]) -> Vec<magia_tools::Todo> {
+    let ok = |id: &str| {
+        history.iter().any(
+            |m| matches!(m, Message::ToolResult { call_id, is_error: false, .. } if call_id == id),
+        )
+    };
+    history
+        .iter()
+        .rev()
+        .filter_map(|m| match m {
+            Message::Assistant { tool_calls, .. } => Some(tool_calls),
+            _ => None,
+        })
+        .flat_map(|calls| calls.iter().rev())
+        .filter(|c| c.name == "todo" && ok(&c.id))
+        .find_map(|c| serde_json::from_value(c.arguments.get("todos")?.clone()).ok())
+        .unwrap_or_default()
+}
+
 fn new_session_id() -> String {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
