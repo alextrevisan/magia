@@ -16,6 +16,8 @@ mod folder;
 mod magic;
 mod markdown;
 mod model_picker;
+#[cfg(target_os = "linux")]
+mod portal;
 mod resume;
 mod screenshot;
 mod sidebar;
@@ -2735,7 +2737,7 @@ fn sent_messages(history: &[Message]) -> Vec<String> {
         .iter()
         .filter_map(|m| match m {
             Message::User { text, .. }
-                if !text.starts_with("[Summary") && !magia_mode::is_continuation(m) =>
+                if magia_core::split_summary(text).is_none() && !magia_mode::is_continuation(m) =>
             {
                 // `@file` contents and hook output are appended after the typed text.
                 let typed = text.split("\n\n<file path=").next().unwrap_or(text);

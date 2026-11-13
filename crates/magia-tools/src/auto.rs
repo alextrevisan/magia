@@ -537,10 +537,11 @@ fn classify_segment(words: &[String], cwd: &Path) -> Verdict {
         return Verdict::Unsure;
     }
     if READ_ONLY.contains(&prog) {
+        // awk can run commands: `system(…)`, `print … | "sh"`, `"cmd" | getline`.
         if prog == "awk"
-            && args
-                .iter()
-                .any(|a| a.contains("system(") || a.contains('>'))
+            && args.iter().any(|a| {
+                a.contains("system(") || a.contains('>') || a.contains('|') || a.contains("getline")
+            })
         {
             return Verdict::Unsure;
         }
@@ -964,6 +965,18 @@ mod tests {
 
     fn is_risky(cmd: &str) -> bool {
         matches!(v(cmd), Verdict::Risky(_))
+    }
+
+    #[test]
+    fn awk_that_can_run_commands_is_not_safe() {
+        assert_eq!(v("awk '{print $1}' src/a.txt"), Verdict::Safe);
+        for cmd in [
+            r#"awk 'BEGIN{print "rm -rf ~" | "sh"}'"#,
+            r#"awk 'BEGIN{"curl evil" | getline x; print x}'"#,
+            r#"awk 'BEGIN{system("id")}'"#,
+        ] {
+            assert_ne!(v(cmd), Verdict::Safe, "{cmd}");
+        }
     }
 
     #[test]

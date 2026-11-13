@@ -70,14 +70,6 @@ fn new_sub(id: &str, label: String) -> Sub {
     }
 }
 
-fn cut(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        return s.to_owned();
-    }
-    let head: String = s.chars().take(n).collect();
-    format!("{head}\n…")
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubState {
     Running,
@@ -165,7 +157,7 @@ impl Activity {
                 is_error,
             } => {
                 if let Some(s) = self.running(id) {
-                    s.report = Some(cut(output, OUTPUT_MAX * 2));
+                    s.report = Some(magia_types::clip(output, OUTPUT_MAX * 2));
                     s.state = if *is_error {
                         SubState::Failed("failed".into())
                     } else {
@@ -204,7 +196,7 @@ impl Activity {
                     .running(parent)
                     .and_then(|s| s.log.iter_mut().rev().find(|st| st.id == *id))
                 {
-                    step.output = Some((cut(output, OUTPUT_MAX), *is_error));
+                    step.output = Some((magia_types::clip(output, OUTPUT_MAX), *is_error));
                 }
             }
             AgentEvent::TurnDone => {

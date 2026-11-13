@@ -257,12 +257,12 @@ async fn real_main() -> Result<()> {
             .find(|s| s.id() == *id)
             .ok_or_else(|| anyhow::anyhow!("no session `{id}` (see `magia --sessions --all`)"))?;
         let s = SessionFile::resume(&dir, &found.path, &cwd)?;
-        agent.history = s.load()?;
+        agent.set_history(s.load()?);
         Some(s)
     } else if args.resume {
         SessionFile::latest_for(&dir, &cwd).inspect(|s| {
             if let Ok(h) = s.load() {
-                agent.history = h;
+                agent.set_history(h);
             }
         })
     } else {

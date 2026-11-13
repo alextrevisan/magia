@@ -18,9 +18,7 @@ pub const MAX_BYTES: usize = 5 * 1024 * 1024;
 const EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp"];
 
 /// Media type from the file's magic bytes.
-pub fn sniff(bytes: &[u8]) -> Option<&'static str> {
-    magia_types::sniff_image(bytes)
-}
+pub use magia_types::sniff_image as sniff;
 
 /// Whether the path has an image extension (cheap pre-check before reading the file).
 pub fn is_image_path(p: &Path) -> bool {
@@ -51,12 +49,14 @@ pub fn image_from_bytes(bytes: Vec<u8>) -> Result<Image> {
 
 /// Raw RGBA pixels (e.g. from the X11 clipboard) → PNG attachment.
 pub fn image_from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Result<Image> {
+    finish("image/png", &png_from_rgba(width, height, rgba)?)
+}
+
+/// Raw RGBA pixels → PNG bytes (downscaled to [`MAX_EDGE`]).
+pub fn png_from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Result<Vec<u8>> {
     let buf = image::RgbaImage::from_raw(width, height, rgba)
         .context("pixel buffer does not match the image size")?;
-    finish(
-        "image/png",
-        &encode_png(image::DynamicImage::ImageRgba8(buf))?,
-    )
+    encode_png(image::DynamicImage::ImageRgba8(buf))
 }
 
 pub fn load_image_file(path: &Path) -> Result<Image> {

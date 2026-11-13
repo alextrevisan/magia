@@ -59,13 +59,24 @@ An image (PNG, JPEG, GIF, WebP) comes back as the picture itself, so you can loo
             .await
             .with_context(|| format!("reading {}", path.display()))?
             .len();
+        let offset = input
+            .get("offset")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .max(1) as usize;
+        let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(2000) as usize;
+        if size > WHOLE_READ_MAX {
+            // Big file: stream the asked lines instead of loading it all.
+            let p = path.clone();
+            let out =
+                tokio::task::spawn_blocking(move || numbered_lines(&p, offset, limit)).await??;
+            cx.read_files.lock().unwrap().insert(path);
+            return Ok(truncate_output(out, MAX_OUT).into());
+        }
         let bytes = tokio::fs::read(&path)
             .await
             .with_context(|| format!("reading {}", path.display()))?;
         if let Some(kind) = magia_types::sniff_image(&bytes) {
-            if size > 64 * 1024 * 1024 {
-                bail!("{}: image too large ({} MB)", path.display(), size >> 20);
-            }
             return Ok(ToolOutput {
                 text: format!(
                     "{} ({kind}, {} KB) is attached as an image.",
@@ -78,18 +89,39 @@ An image (PNG, JPEG, GIF, WebP) comes back as the picture itself, so you can loo
         let text = String::from_utf8(bytes)
             .map_err(|_| anyhow::anyhow!("{} is not valid UTF-8 text", path.display()))?;
         cx.read_files.lock().unwrap().insert(path);
-        let offset = input
-            .get("offset")
-            .and_then(Value::as_u64)
-            .unwrap_or(1)
-            .max(1) as usize;
-        let limit = input.get("limit").and_then(Value::as_u64).unwrap_or(2000) as usize;
         let mut out = String::new();
         for (i, line) in text.lines().enumerate().skip(offset - 1).take(limit) {
             out.push_str(&format!("{:>6}\t{}\n", i + 1, line));
         }
         Ok(truncate_output(out, MAX_OUT).into())
     }
+}
+
+/// Files up to this size are read at once (and may be images); bigger ones are streamed.
+const WHOLE_READ_MAX: u64 = 16 * 1024 * 1024;
+/// `grep` skips files bigger than this (logs, dumps, data sets).
+const GREP_FILE_MAX: u64 = 16 * 1024 * 1024;
+
+/// Lines `offset..offset+limit` of a big text file, numbered, read line by line.
+fn numbered_lines(path: &std::path::Path, offset: usize, limit: usize) -> Result<String> {
+    use std::io::BufRead;
+    let f = std::fs::File::open(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut out = String::new();
+    for (i, line) in std::io::BufReader::new(f)
+        .split(b'\n')
+        .enumerate()
+        .skip(offset - 1)
+        .take(limit)
+    {
+        let line = line?;
+        let line = String::from_utf8(line)
+            .map_err(|_| anyhow::anyhow!("{} is not valid UTF-8 text", path.display()))?;
+        out.push_str(&format!("{:>6}\t{}\n", i + 1, line.trim_end_matches('\r')));
+        if out.len() > MAX_OUT {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 // ───────────── write ─────────────
@@ -189,6 +221,7 @@ impl Tool for Edit {
         } else {
             text.replacen(old, new, 1)
         };
+        cx.checkpoints.snapshot(&path); // so `/rewind` can undo it
         tokio::fs::write(&path, updated).await?;
         Ok(format!(
             "edited {} ({n} replacement{})",
@@ -254,29 +287,36 @@ impl Tool for Bash {
             c.arg("-c").arg(cmd);
             c
         };
-        let mut child = command
+        command
             .current_dir(&cx.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .context("spawning bash")?;
-        let out_task = tokio::spawn(read_capped(child.stdout.take().unwrap()));
-        let err_task = tokio::spawn(read_capped(child.stderr.take().unwrap()));
+            .kill_on_drop(true);
+        // Its own process group, so a timeout or cancel stops what it started too.
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().context("spawning bash")?;
+        let (out_buf, err_buf) = (Shared::default(), Shared::default());
+        let out_task = tokio::spawn(read_capped(child.stdout.take().unwrap(), out_buf.clone()));
+        let err_task = tokio::spawn(read_capped(child.stderr.take().unwrap(), err_buf.clone()));
         let status = tokio::select! {
             s = child.wait() => s?,
             _ = tokio::time::sleep(Duration::from_millis(ms)) => {
-                let _ = child.kill().await;
+                kill_group(&mut child).await;
                 bail!("command timed out after {ms} ms");
             }
             _ = cx.cancel.cancelled() => {
-                let _ = child.kill().await;
+                kill_group(&mut child).await;
                 bail!("cancelled");
             }
         };
-        let out = out_task.await.unwrap_or_default();
-        let err = err_task.await.unwrap_or_default();
+        // A program started in the background (`godot &`) keeps the pipes open after bash
+        // exits; don't wait for it to close, take what was written so far.
+        let (a, b) = tokio::join!(drain(out_task), drain(err_task));
+        let background = a || b;
+        let out = std::mem::take(&mut *out_buf.lock().unwrap());
+        let err = std::mem::take(&mut *err_buf.lock().unwrap());
         let mut text = String::from_utf8_lossy(&out).into_owned();
         if !err.is_empty() {
             text.push_str("\n[stderr]\n");
@@ -285,8 +325,43 @@ impl Tool for Bash {
         let code = status
             .code()
             .map_or("signal".to_string(), |c| c.to_string());
-        Ok(format!("{}\n[exit {code}]", truncate_output(text, MAX_OUT)))
+        let note = if background {
+            "\n[a program it started is still running in the background; its later output is not shown]"
+        } else {
+            ""
+        };
+        Ok(format!(
+            "{}\n[exit {code}]{note}",
+            truncate_output(text, MAX_OUT)
+        ))
     }
+}
+
+/// How long to keep reading after bash exits, for output still in the pipe.
+const DRAIN: Duration = Duration::from_millis(1500);
+
+type Shared = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+
+/// Let the reader finish; `true` when the pipe was still open (a background program holds
+/// it). Its bytes so far are in the shared buffer either way.
+async fn drain(mut task: tokio::task::JoinHandle<()>) -> bool {
+    if tokio::time::timeout(DRAIN, &mut task).await.is_ok() {
+        return false;
+    }
+    task.abort();
+    true
+}
+
+async fn kill_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // SIGKILL to the whole group (negative pid); `kill` is always there on Unix.
+        let _ = tokio::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pid}")])
+            .status()
+            .await;
+    }
+    let _ = child.kill().await;
 }
 
 fn which_bwrap() -> bool {
@@ -295,17 +370,19 @@ fn which_bwrap() -> bool {
 }
 
 /// Keep draining (so the child never blocks on a full pipe) but cap memory.
-async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R) -> Vec<u8> {
-    let mut buf = Vec::new();
+async fn read_capped<R: tokio::io::AsyncRead + Unpin>(mut r: R, buf: Shared) {
     let mut chunk = [0u8; 8192];
     loop {
         match r.read(&mut chunk).await {
             Ok(0) | Err(_) => break,
-            Ok(n) if buf.len() < 4 * MAX_OUT => buf.extend_from_slice(&chunk[..n]),
-            Ok(_) => {}
+            Ok(n) => {
+                let mut b = buf.lock().unwrap();
+                if b.len() < 4 * MAX_OUT {
+                    b.extend_from_slice(&chunk[..n]);
+                }
+            }
         }
     }
-    buf
 }
 
 // ───────────── todo ─────────────
@@ -448,6 +525,9 @@ impl Tool for Grep {
                 if gm.as_ref().is_some_and(|g| !g.is_match(rel)) {
                     continue;
                 }
+                if e.metadata().is_ok_and(|m| m.len() > GREP_FILE_MAX) {
+                    continue;
+                }
                 let Ok(text) = std::fs::read_to_string(e.path()) else {
                     continue;
                 };
@@ -579,5 +659,61 @@ mod tests {
             .await
             .unwrap();
         assert!(out.images.is_empty() && out.text.contains("hi"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_program_left_in_the_background_does_not_hold_the_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let cx = ToolCx::new(dir.path().into());
+        let start = std::time::Instant::now();
+        let out = Bash
+            .call(json!({"command": "echo started; sleep 30 &"}), &cx)
+            .await
+            .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(out.contains("started") && out.contains("[exit 0]"), "{out}");
+        assert!(out.contains("still running in the background"), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timeout_stops_what_the_command_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let cx = ToolCx::new(dir.path().into());
+        let marker = dir.path().join("alive");
+        let cmd = format!("(sleep 2; touch {}) & sleep 30", marker.display());
+        let err = Bash
+            .call(json!({"command": cmd, "timeout_ms": 300}), &cx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("timed out"));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !marker.exists(),
+            "the background child was killed with the group"
+        );
+    }
+
+    #[tokio::test]
+    async fn big_files_are_read_line_by_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let cx = ToolCx::new(dir.path().into());
+        let line = "x".repeat(99) + "\n";
+        let big = line.repeat((WHOLE_READ_MAX as usize / line.len()) + 10);
+        std::fs::write(dir.path().join("big.log"), &big).unwrap();
+        let out = Read
+            .call(
+                json!({"file_path": "big.log", "offset": 3, "limit": 2}),
+                &cx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.lines().count(), 2);
+        assert!(out.starts_with("     3\t"), "{out}");
     }
 }

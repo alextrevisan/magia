@@ -41,6 +41,14 @@ pub struct Image {
     pub data: String,
 }
 
+/// `s` cut to its first `n` characters, with " […]" when something was cut.
+pub fn clip(s: &str, n: usize) -> String {
+    match s.char_indices().nth(n) {
+        None => s.to_owned(),
+        Some((i, _)) => format!("{} […]", &s[..i]),
+    }
+}
+
 /// Media type of encoded image bytes, from their magic bytes.
 pub fn sniff_image(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {

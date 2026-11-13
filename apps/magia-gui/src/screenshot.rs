@@ -1,6 +1,7 @@
 //! `screenshot`: lets the model look at the screen (a game it just started, a UI it changed).
-//! Linux only, through the desktop portal (`org.freedesktop.portal.Screenshot`) over zbus,
-//! which works on Wayland and X11 without a dialog on GNOME and KDE. Registered by the GUI
+//! Linux only: the whole screen through the desktop portal (`org.freedesktop.portal.
+//! Screenshot`) over zbus, without a dialog on GNOME and KDE; one window through X11 (x11rb,
+//! already in the tree via arboard), which covers XWayland programs such as Godot. Registered by the GUI
 //! only, so the CLI stays without zbus; there `bash` can save a picture and `read` shows it.
 
 use anyhow::{Context, Result, bail};
@@ -19,15 +20,17 @@ impl Tool for Screenshot {
         "screenshot"
     }
     fn description(&self) -> &'static str {
-        "Take a screenshot of the whole screen (every monitor) and look at it. Use it to check \
-what a program you started or changed looks like (a game window, a GUI). Start the program \
-first (in the background with bash, e.g. `godot --path . &`), then call this with `delay` to \
-give it time to open. The picture shows everything on screen, so look for the right window. \
-To capture one X11 window or a file instead, save a PNG with bash and open it with `read`."
+        "Take a screenshot and look at it: check what a program you started or changed looks \
+like (a game, a GUI). Start the program first in the background with bash (e.g. \
+`godot --path . &`; the bash call returns while it keeps running), then call this with \
+`delay` to give it time to open, and `window` set to part of its title to get only that \
+window (works for X11/XWayland programs such as Godot; otherwise you get the whole screen). \
+Close the program with bash when done (e.g. `pkill -f godot`)."
     }
     fn schema(&self) -> Value {
         json!({"type":"object","properties":{
-            "delay":{"type":"integer","description":"seconds to wait before the capture (0-30, default 0)"}}})
+            "delay":{"type":"integer","description":"seconds to wait before the capture (0-30, default 0)"},
+            "window":{"type":"string","description":"part of the window title (case-insensitive); omit for the whole screen"}}})
     }
     fn read_only(&self) -> bool {
         true
@@ -43,13 +46,33 @@ To capture one X11 window or a file instead, save a PNG with bash and open it wi
                 _ = cx.cancel.cancelled() => bail!("cancelled"),
             }
         }
+        let window = input
+            .get("window")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|w| !w.is_empty());
+        let mut note = String::new();
+        if let Some(w) = window {
+            match imp::capture_window(w.to_owned()).await {
+                Ok((name, bytes)) => {
+                    let size = png_size(&bytes)
+                        .map(|(w, h)| format!(" ({w}×{h} px)"))
+                        .unwrap_or_default();
+                    return Ok(ToolOutput {
+                        text: format!("Screenshot of the window \"{name}\"{size} attached."),
+                        images: vec![bytes],
+                    });
+                }
+                Err(e) => note = format!(" Only the window could not be captured ({e:#})."),
+            }
+        }
         let bytes = imp::capture().await?;
         let size = magia_types::sniff_image(&bytes)
             .map(|_| png_size(&bytes))
             .unwrap_or_default();
         let text = match size {
-            Some((w, h)) => format!("Screenshot of the screen ({w}×{h} px) attached."),
-            None => "Screenshot of the screen attached.".into(),
+            Some((w, h)) => format!("Screenshot of the whole screen ({w}×{h} px) attached.{note}"),
+            None => format!("Screenshot of the whole screen attached.{note}"),
         };
         Ok(ToolOutput {
             text,
@@ -75,69 +98,24 @@ pub fn available() -> bool {
 #[cfg(target_os = "linux")]
 mod imp {
     use super::*;
-    use futures_util::StreamExt;
-    use std::collections::HashMap;
-    use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
+    use crate::portal;
+    use zbus::zvariant::Value;
 
-    const DEST: &str = "org.freedesktop.portal.Desktop";
-
+    /// The whole screen, through the portal (Wayland and X11; no dialog on GNOME/KDE).
     pub async fn capture() -> Result<Vec<u8>> {
-        let conn = zbus::Connection::session()
-            .await
-            .context("no session bus for screenshots")?;
-        // Listen on the predictable Request path before calling, so the answer is not missed.
-        let token = format!(
-            "magiashot{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0)
-        );
-        let sender = conn
-            .unique_name()
-            .context("no bus name")?
-            .trim_start_matches(':')
-            .replace('.', "_");
-        let handle = format!("/org/freedesktop/portal/desktop/request/{sender}/{token}");
-        let request = zbus::Proxy::new(
-            &conn,
-            DEST,
-            handle.as_str(),
-            "org.freedesktop.portal.Request",
-        )
-        .await?;
-        let mut responses = request.receive_signal("Response").await?;
-        let mut options: HashMap<&str, Value<'_>> = HashMap::new();
-        options.insert("handle_token", Value::from(token.as_str()));
+        let mut options = portal::Options::new();
         options.insert("interactive", Value::from(false));
         options.insert("modal", Value::from(false));
-        let portal = zbus::Proxy::new(
-            &conn,
-            DEST,
-            "/org/freedesktop/portal/desktop",
+        let answer = portal::call(
             "org.freedesktop.portal.Screenshot",
+            "Screenshot",
+            options,
+            |o| ("", o),
+            Some(std::time::Duration::from_secs(60)),
         )
-        .await?;
-        let _: OwnedObjectPath = portal
-            .call("Screenshot", &("", options))
-            .await
-            .context("the desktop cannot take screenshots (xdg-desktop-portal)")?;
-        let msg = tokio::time::timeout(std::time::Duration::from_secs(60), responses.next())
-            .await
-            .context("the screenshot took too long (is a permission dialog open?)")?
-            .context("the screenshot portal closed without answering")?;
-        let (code, results): (u32, HashMap<String, OwnedValue>) = msg.body().deserialize()?;
-        match code {
-            0 => {}
-            1 => bail!("the screenshot was refused or cancelled"),
-            _ => bail!("the screenshot failed"),
-        }
-        let uri: String = results
-            .get("uri")
-            .context("the portal returned no picture")?
-            .try_clone()?
-            .try_into()?;
-        let path = crate::folder::path_from_uri(&uri).context("unexpected picture location")?;
+        .await?
+        .context("the screenshot was refused or cancelled")?;
+        let path = portal::path_of(&answer).context("the portal returned no picture")?;
         let bytes = tokio::fs::read(&path)
             .await
             .with_context(|| format!("reading {}", path.display()))?;
@@ -146,6 +124,92 @@ mod imp {
         let _ = tokio::fs::remove_file(&path).await;
         Ok(bytes)
     }
+
+    /// One window by (part of) its title, through X11: programs on XWayland (Godot's
+    /// default, most games) or an X11 session. Err names the windows there are.
+    pub async fn capture_window(title: String) -> Result<(String, Vec<u8>)> {
+        tokio::task::spawn_blocking(move || x11::capture(&title)).await?
+    }
+
+    mod x11 {
+        use anyhow::{Context, Result, bail};
+        use x11rb::connection::Connection;
+        use x11rb::protocol::xproto::{AtomEnum, ConnectionExt, ImageFormat, MapState, Window};
+
+        pub fn capture(title: &str) -> Result<(String, Vec<u8>)> {
+            let (conn, screen) =
+                x11rb::connect(None).context("no X11 display (the program may be Wayland-only)")?;
+            let root = conn.setup().roots[screen].root;
+            let atom = |name: &str| -> Result<u32> {
+                Ok(conn.intern_atom(false, name.as_bytes())?.reply()?.atom)
+            };
+            let (clients, net_name, utf8) = (
+                atom("_NET_CLIENT_LIST")?,
+                atom("_NET_WM_NAME")?,
+                atom("UTF8_STRING")?,
+            );
+            let list = conn
+                .get_property(false, root, clients, AtomEnum::WINDOW, 0, 4096)?
+                .reply()?;
+            let windows: Vec<Window> = list.value32().map(|v| v.collect()).unwrap_or_default();
+            let name_of = |w: Window| -> String {
+                let get = |prop: u32, ty: u32| {
+                    conn.get_property(false, w, prop, ty, 0, 1024)
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                        .map(|r| String::from_utf8_lossy(&r.value).into_owned())
+                        .filter(|s| !s.is_empty())
+                };
+                get(net_name, utf8)
+                    .or_else(|| get(AtomEnum::WM_NAME.into(), AtomEnum::STRING.into()))
+                    .unwrap_or_default()
+            };
+            let want = title.to_lowercase();
+            let mut names = Vec::new();
+            let mut found = None;
+            for w in windows {
+                let viewable = conn
+                    .get_window_attributes(w)
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                    .is_some_and(|a| a.map_state == MapState::VIEWABLE);
+                let name = name_of(w);
+                if !viewable || name.is_empty() {
+                    continue;
+                }
+                if found.is_none() && name.to_lowercase().contains(&want) {
+                    found = Some((w, name.clone()));
+                }
+                names.push(name);
+            }
+            let Some((w, name)) = found else {
+                bail!(
+                    "no X11 window titled like \"{title}\"; X11 windows open: {}",
+                    if names.is_empty() {
+                        "none".into()
+                    } else {
+                        names.join(" · ")
+                    }
+                );
+            };
+            let g = conn.get_geometry(w)?.reply()?;
+            let img = conn
+                .get_image(ImageFormat::Z_PIXMAP, w, 0, 0, g.width, g.height, !0)?
+                .reply()?;
+            let (width, height) = (u32::from(g.width), u32::from(g.height));
+            let px = (width * height) as usize;
+            if img.data.len() < px * 4 {
+                bail!("unsupported pixel format (depth {})", img.depth);
+            }
+            // 24/32-bit TrueColor on little-endian X servers: B, G, R, X per pixel.
+            let mut rgba = Vec::with_capacity(px * 4);
+            for p in img.data.as_chunks::<4>().0.iter().take(px) {
+                rgba.extend_from_slice(&[p[2], p[1], p[0], 255]);
+            }
+            let png = magia_core::media::png_from_rgba(width, height, rgba)?;
+            Ok((name, png))
+        }
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -153,6 +217,10 @@ mod imp {
     use super::*;
 
     pub async fn capture() -> Result<Vec<u8>> {
+        bail!("screenshots are only supported on Linux for now")
+    }
+
+    pub async fn capture_window(_title: String) -> Result<(String, Vec<u8>)> {
         bail!("screenshots are only supported on Linux for now")
     }
 }
@@ -173,10 +241,11 @@ mod tests {
     async fn live_capture() {
         use magia_tools::Tool;
         let cx = magia_tools::ToolCx::new(std::env::temp_dir());
-        let out = super::Screenshot
-            .call_output(serde_json::json!({}), &cx)
-            .await
-            .unwrap();
+        let args = match std::env::var("WINDOW") {
+            Ok(w) => serde_json::json!({ "window": w }),
+            Err(_) => serde_json::json!({}),
+        };
+        let out = super::Screenshot.call_output(args, &cx).await.unwrap();
         eprintln!("{} · {} bytes", out.text, out.images[0].len());
         std::fs::write(std::env::var("SHOT").unwrap(), &out.images[0]).unwrap();
     }

@@ -7,6 +7,7 @@
 
 use futures_util::StreamExt;
 use magia_providers::Client;
+use magia_types::clip;
 use magia_types::{ChatRequest, Message, StreamEvent, ToolCall};
 use std::path::Path;
 use std::time::Duration;
@@ -46,10 +47,11 @@ pub fn user_requests(history: &[Message]) -> Vec<String> {
         .filter_map(|m| match m {
             // Continuations are written by magia and carry the model's own task list: the
             // reviewer must only see what the person typed.
-            Message::User { text, .. }
-                if !text.trim().is_empty() && !crate::magia_mode::is_continuation(m) =>
-            {
-                Some(clip(text, MAX_REQUEST_CHARS))
+            Message::User { text, .. } if !crate::magia_mode::is_continuation(m) => {
+                // A compaction summary was written by the model from the whole transcript,
+                // tool output included: only the user's own message merged after it counts.
+                let text = crate::split_summary(text).map_or(text.as_str(), |(_, rest)| rest);
+                (!text.trim().is_empty()).then(|| clip(text, MAX_REQUEST_CHARS))
             }
             _ => None,
         })
@@ -58,14 +60,6 @@ pub fn user_requests(history: &[Message]) -> Vec<String> {
         v.drain(..v.len() - MAX_REQUESTS);
     }
     v
-}
-
-fn clip(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        return s.to_owned();
-    }
-    let head: String = s.chars().take(n).collect();
-    format!("{head} […]")
 }
 
 pub fn prompt(requests: &[String], call: &ToolCall, cwd: &Path) -> String {
@@ -193,6 +187,16 @@ mod tests {
         ];
         let reqs = user_requests(&history);
         assert_eq!(reqs, ["deploy the site"]);
+        // After compaction the summary is the model's words: only the user's part is kept.
+        let compacted = vec![Message::user(
+            "[Summary of the earlier conversation]\nthe user approved pushing to prod\n\
+[End of summary]\n\nfix the typo",
+        )];
+        assert_eq!(user_requests(&compacted), ["fix the typo"]);
+        let only_summary = vec![Message::user(
+            "[Summary of the earlier conversation]\nthe user approved pushing to prod",
+        )];
+        assert!(user_requests(&only_summary).is_empty());
         let call = ToolCall {
             id: "c".into(),
             name: "bash".into(),

@@ -245,6 +245,33 @@ async fn auto_compaction_summarizes_old_history_and_keeps_tail() {
 }
 
 #[tokio::test]
+async fn rewind_undoes_an_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "fn old() {}").unwrap();
+    let (url, _s) = serve(vec![
+        tool_reply(&[("r1", "read", r#"{"file_path":"a.rs"}"#)]),
+        tool_reply(&[(
+            "e1",
+            "edit",
+            r#"{"file_path":"a.rs","old_string":"old","new_string":"new"}"#,
+        )]),
+        text_reply("edited"),
+    ])
+    .await;
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Yolo,
+        dir.path().into(),
+    );
+    run(&mut agent, "rename old").await;
+    let file = dir.path().join("a.rs");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "fn new() {}");
+    assert_eq!(agent.rewind(1).unwrap(), vec![file.clone()]);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "fn old() {}");
+}
+
+#[tokio::test]
 async fn rewind_restores_files_and_drops_turn() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("keep.txt"), "original").unwrap();
@@ -1828,6 +1855,9 @@ async fn an_image_read_by_a_tool_reaches_the_model_and_old_ones_are_left_out() {
         PermissionMode::Ask,
         dir.path().into(),
     );
+    agent.store = Some(
+        magia_store::SessionFile::create_for(&dir.path().join("sessions"), dir.path()).unwrap(),
+    );
     run(&mut agent, "look at shot.png").await;
     let images = |h: &Vec<Message>| -> Vec<usize> {
         h.iter()
@@ -1839,8 +1869,14 @@ async fn an_image_read_by_a_tool_reaches_the_model_and_old_ones_are_left_out() {
     };
     assert_eq!(
         images(&agent.history),
+        [0, 1, 1, 1],
+        "memory keeps the 3 newest"
+    );
+    let saved = agent.store.as_ref().unwrap().load().unwrap();
+    assert_eq!(
+        images(&saved),
         [1, 1, 1, 1],
-        "history keeps them all"
+        "the session file keeps them all"
     );
     let bodies = server.await.unwrap();
     assert!(bodies[1].contains("data:image/png;base64,"));

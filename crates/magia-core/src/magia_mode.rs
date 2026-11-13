@@ -6,6 +6,7 @@
 
 use magia_tools::Todo;
 use magia_types::Message;
+use magia_types::clip;
 use serde::Deserialize;
 
 /// Starts every continuation message (a `Message::User` the agent writes, not the person).
@@ -216,14 +217,6 @@ pub fn parse_review(reply: &str) -> Verdict {
     } else {
         Verdict::Pass
     }
-}
-
-fn clip(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        return s.to_owned();
-    }
-    let head: String = s.chars().take(n).collect();
-    format!("{head} […]")
 }
 
 #[cfg(test)]

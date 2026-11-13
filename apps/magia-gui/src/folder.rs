@@ -105,77 +105,27 @@ pub(crate) fn path_from_uri(uri: &str) -> Option<PathBuf> {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use anyhow::{Context, bail};
-    use futures_util::StreamExt;
-    use std::collections::HashMap;
+    use crate::portal;
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
-    use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
-
-    const DEST: &str = "org.freedesktop.portal.Desktop";
+    use zbus::zvariant::Value;
 
     pub async fn pick(start: &Path) -> anyhow::Result<Option<PathBuf>> {
-        let conn = zbus::Connection::session()
-            .await
-            .context("no session bus for the folder dialog")?;
-        // The portal answers on a Request object whose path we can predict from our bus name
-        // and a token; listening there before the call means the answer cannot be missed.
-        let token = format!(
-            "magia{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
-                .unwrap_or(0)
-        );
-        let sender = conn
-            .unique_name()
-            .context("no bus name")?
-            .trim_start_matches(':')
-            .replace('.', "_");
-        let handle = format!("/org/freedesktop/portal/desktop/request/{sender}/{token}");
-        let request = zbus::Proxy::new(
-            &conn,
-            DEST,
-            handle.as_str(),
-            "org.freedesktop.portal.Request",
-        )
-        .await?;
-        let mut responses = request.receive_signal("Response").await?;
-
         let mut folder = start.as_os_str().as_bytes().to_vec();
         folder.push(0); // the portal wants a NUL-terminated byte string
-        let mut options: HashMap<&str, Value<'_>> = HashMap::new();
-        options.insert("handle_token", Value::from(token.as_str()));
+        let mut options = portal::Options::new();
         options.insert("directory", Value::from(true));
         options.insert("modal", Value::from(true));
         options.insert("current_folder", Value::from(folder));
-        let chooser = zbus::Proxy::new(
-            &conn,
-            DEST,
-            "/org/freedesktop/portal/desktop",
+        let answer = portal::call(
             "org.freedesktop.portal.FileChooser",
+            "OpenFile",
+            options,
+            |o| ("", "Open folder", o),
+            None,
         )
         .await?;
-        let _: OwnedObjectPath = chooser
-            .call("OpenFile", &("", "Open folder", options))
-            .await
-            .context("the desktop has no folder dialog (xdg-desktop-portal)")?;
-
-        let msg = responses
-            .next()
-            .await
-            .context("the folder dialog closed without answering")?;
-        let (code, results): (u32, HashMap<String, OwnedValue>) = msg.body().deserialize()?;
-        match code {
-            0 => {}
-            1 => return Ok(None), // cancelled
-            _ => bail!("the folder dialog failed"),
-        }
-        let uris: Vec<String> = match results.get("uris") {
-            Some(v) => Vec::<String>::try_from(v.try_clone()?)?,
-            None => vec![],
-        };
-        Ok(uris.first().and_then(|u| super::path_from_uri(u)))
+        Ok(answer.as_ref().and_then(portal::path_of))
     }
 }
 

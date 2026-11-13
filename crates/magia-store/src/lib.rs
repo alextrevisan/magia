@@ -206,8 +206,17 @@ impl SessionFile {
         let mut f = OpenOptions::new()
             .create(true)
             .append(true)
+            .read(true)
             .open(&self.path)?;
-        writeln!(f, "{}", serde_json::to_string(m)?)?;
+        // A write torn by a crash leaves a line without its newline; start a fresh line so
+        // this message is not glued onto it (and lost with it).
+        let mut line = String::new();
+        if !ends_with_newline(&mut f)? {
+            line.push('\n');
+        }
+        line.push_str(&serde_json::to_string(m)?);
+        line.push('\n');
+        f.write_all(line.as_bytes())?;
         {
             let mut meta = self.meta.lock().unwrap();
             meta.messages += 1;
@@ -227,10 +236,8 @@ impl SessionFile {
             return Ok(Vec::new()); // created but nothing written yet
         }
         let f = File::open(&self.path)?;
-        Ok(BufReader::new(f)
-            .lines()
-            .map_while(Result::ok)
-            .filter_map(|l| serde_json::from_str(&l).ok())
+        Ok(lines(f)
+            .filter_map(|l| serde_json::from_slice(&l).ok())
             .collect())
     }
 
@@ -281,6 +288,26 @@ impl SessionFile {
     }
 }
 
+/// The file's lines as bytes. A damaged line (cut by a crash, not UTF-8) is one bad item,
+/// not the end of the file: the lines after it still load.
+fn lines(f: File) -> impl Iterator<Item = Vec<u8>> {
+    BufReader::new(f)
+        .split(b'\n')
+        .map_while(Result::ok)
+        .filter(|l| !l.is_empty())
+}
+
+fn ends_with_newline(f: &mut File) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    if f.metadata()?.len() == 0 {
+        return Ok(true);
+    }
+    f.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    f.read_exact(&mut last)?;
+    Ok(last[0] == b'\n')
+}
+
 fn meta_path(jsonl: &Path) -> PathBuf {
     jsonl.with_extension("meta.json")
 }
@@ -318,10 +345,10 @@ fn read_meta(path: &Path) -> SessionMeta {
         ..Default::default()
     };
     if let Ok(f) = File::open(path) {
-        for line in BufReader::new(f).lines().map_while(Result::ok) {
+        for line in lines(f) {
             meta.messages += 1;
             if meta.title.is_empty()
-                && let Ok(Message::User { text, .. }) = serde_json::from_str(&line)
+                && let Ok(Message::User { text, .. }) = serde_json::from_slice(&line)
             {
                 meta.title = title_of(&text);
             }
@@ -421,8 +448,8 @@ pub fn search(root: &Path, scope: Scope, query: &str) -> Vec<Hit> {
             found[i] = title.contains(t.as_str());
         }
         if let Ok(f) = File::open(&session.path) {
-            for line in BufReader::new(f).lines().map_while(Result::ok) {
-                let text = match serde_json::from_str::<Message>(&line) {
+            for line in lines(f) {
+                let text = match serde_json::from_slice::<Message>(&line) {
                     Ok(Message::User { text, .. }) | Ok(Message::Assistant { text, .. }) => text,
                     _ => continue,
                 };
@@ -505,6 +532,33 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn messages_after_a_damaged_line_still_load() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let s = SessionFile::create_for(d.path(), cwd.path()).unwrap();
+        s.append(&Message::user("one")).unwrap();
+        // A crash cut a write in the middle of a multi-byte character, without its newline.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(s.path())
+            .unwrap()
+            .write_all(b"{\"role\":\"user\",\"text\":\"caf\xC3")
+            .unwrap();
+        s.append(&Message::user("two")).unwrap();
+        s.append(&Message::user("three")).unwrap();
+        let texts: Vec<String> = s
+            .load()
+            .unwrap()
+            .into_iter()
+            .filter_map(|m| match m {
+                Message::User { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["one", "two", "three"]);
+    }
 
     #[test]
     fn roundtrip_and_torn_line() {

@@ -40,6 +40,8 @@ pub fn folders(tool: &str, args: &Value, cwd: &Path, granted: &[PathBuf]) -> Vec
     let cwd = normal(cwd);
     let mut out: Vec<PathBuf> = paths
         .into_iter()
+        // Where it really is: a symlink in the project can point anywhere.
+        .map(|p| real(&p))
         .filter(|p| !p.starts_with(&cwd))
         .map(|p| {
             if p.is_dir() {
@@ -56,6 +58,20 @@ pub fn folders(tool: &str, args: &Value, cwd: &Path, granted: &[PathBuf]) -> Vec
     let all = out.clone();
     out.retain(|d| !all.iter().any(|o| o != d && d.starts_with(o)));
     out
+}
+
+/// The real location of `p` (symlinks followed). A path that does not exist yet is its
+/// folder's real location plus the name.
+fn real(p: &Path) -> PathBuf {
+    if let Ok(r) = std::fs::canonicalize(p) {
+        return r;
+    }
+    match (p.parent(), p.file_name()) {
+        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+            .map(|d| d.join(name))
+            .unwrap_or_else(|_| p.to_path_buf()),
+        _ => p.to_path_buf(),
+    }
 }
 
 /// `cwd` itself may be a symlink or relative; compare the same way paths are resolved.
@@ -76,12 +92,9 @@ fn shell_paths(cmd: &str, cwd: &Path) -> Vec<PathBuf> {
                 Some((k, v)) if k.starts_with('-') => v,
                 _ => w.as_str(),
             };
-            let looks = w.starts_with('/')
-                || w == "~"
-                || w.starts_with("~/")
-                || w.starts_with("$HOME")
-                || w == ".."
-                || w.starts_with("../");
+            // Any word with a slash may be a path (`src/../../x`); URLs and regexes fall out
+            // below because they name nothing that exists.
+            let looks = w.contains('/') || w == "~" || w.starts_with("$HOME") || w == "..";
             if !looks || HARMLESS.contains(&w) {
                 continue;
             }
@@ -157,5 +170,35 @@ mod tests {
             bash(format!("echo hi > {}/out.log", ext.display())),
             vec![ext.clone()]
         );
+        // Climbing out from inside a project folder counts too.
+        std::fs::create_dir(cwd.join("src")).unwrap();
+        std::fs::write(ext.join("secret"), "x").unwrap();
+        let rel = pathdiff(&ext.join("secret"), &cwd.join("src"));
+        assert_eq!(bash(format!("cat src/{rel}")), vec![ext.clone()]);
+    }
+
+    /// `to` relative to `from`, through `..` (both absolute).
+    fn pathdiff(to: &Path, from: &Path) -> String {
+        let ups = from.components().count() - 1;
+        format!(
+            "{}{}",
+            "../".repeat(ups),
+            to.strip_prefix("/").unwrap().display()
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_the_project_counts_where_it_points() {
+        let project = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(project.path()).unwrap();
+        let ext = std::fs::canonicalize(other.path()).unwrap();
+        std::fs::write(ext.join("id_key"), "x").unwrap();
+        std::os::unix::fs::symlink(&ext, cwd.join("docs")).unwrap();
+        let read = json!({"file_path": cwd.join("docs/id_key").to_str().unwrap()});
+        assert_eq!(folders("read", &read, &cwd, &[]), vec![ext.clone()]);
+        let write = json!({"file_path": cwd.join("docs/new.txt").to_str().unwrap()});
+        assert_eq!(folders("write", &write, &cwd, &[]), vec![ext]);
     }
 }

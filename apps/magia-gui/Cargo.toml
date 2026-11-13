@@ -38,6 +38,8 @@ futures-util.workspace = true
 # fastframe; same version and features). Elsewhere: rfd, which uses the system API directly.
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "5.19", default-features = false, features = ["tokio"] }
+# One window for the `screenshot` tool (X11/XWayland); already in the tree through arboard.
+x11rb = "0.13"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 rfd = { version = "0.18", default-features = false }

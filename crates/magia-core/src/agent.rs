@@ -9,6 +9,7 @@ use magia_providers::Client;
 use magia_store::SessionFile;
 use magia_tools::auto::Verdict;
 use magia_tools::{Decision, Effect, PermissionMode, Registry, RuleSet, Tool, ToolCx, decide};
+use magia_types::clip;
 use magia_types::{ChatRequest, Image, Message, StreamEvent, ToolCall, ToolSpec, Usage};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -391,11 +392,21 @@ impl Agent {
         errors
     }
 
+    /// Continue from a saved history (old tool images are left out, as when it was live).
+    pub fn set_history(&mut self, mut history: Vec<Message>) {
+        trim_tool_images(&mut history);
+        self.history = history;
+    }
+
     fn push(&mut self, m: Message) {
         if let Some(s) = &self.store {
             let _ = s.append(&m);
         }
+        let image = matches!(&m, Message::ToolResult { images, .. } if !images.is_empty());
         self.history.push(m);
+        if image {
+            trim_tool_images(&mut self.history);
+        }
     }
 
     /// Whether the model is shown `tool` at all: hidden when no call to it could ever run
@@ -893,7 +904,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
         ChatRequest {
             model: self.model.clone(),
             system: Some(self.system_prompt()),
-            messages: recent_tool_images(self.history.clone()),
+            messages: self.history.clone(),
             tools: self.all_specs(interactive),
             max_tokens: None,
             session_id: Some(self.session_id()),
@@ -1465,6 +1476,7 @@ Write the summary of the transcript above now. Do not continue the session or an
     pub fn resume(&mut self, path: &Path) -> Result<usize> {
         let sf = SessionFile::resume(&magia_store::sessions_dir(), path, &self.cx.cwd)?;
         self.history = sf.load()?;
+        trim_tool_images(&mut self.history);
         self.last_input_tokens = 0;
         self.forget_session_state();
         self.restore_todos();
@@ -1610,7 +1622,9 @@ fn new_session_id() -> String {
 /// that takes a screenshot per step would otherwise resend every one of them each request.
 const TOOL_IMAGES_KEPT: usize = 3;
 
-fn recent_tool_images(mut history: Vec<Message>) -> Vec<Message> {
+/// Drop the images of all but the newest `TOOL_IMAGES_KEPT` tool results, in place. The
+/// session file keeps them; memory, requests and the token estimate don't carry them.
+pub(crate) fn trim_tool_images(history: &mut [Message]) {
     let mut seen = 0;
     for m in history.iter_mut().rev() {
         if let Message::ToolResult {
@@ -1620,14 +1634,13 @@ fn recent_tool_images(mut history: Vec<Message>) -> Vec<Message> {
         {
             seen += 1;
             if seen > TOOL_IMAGES_KEPT {
-                images.clear();
+                *images = Vec::new();
                 content.push_str(
                     "\n(image no longer shown, to save context; call the tool again to see it)",
                 );
             }
         }
     }
-    history
 }
 
 fn estimate_tokens(h: &[Message]) -> u64 {
@@ -1649,14 +1662,6 @@ fn estimate_tokens(h: &[Message]) -> u64 {
         })
         .sum();
     (bytes / 4) as u64
-}
-
-fn clip(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        s.to_owned()
-    } else {
-        format!("{}…", &s[..s.floor_char_boundary(n)])
-    }
 }
 
 fn render_transcript(h: &[Message]) -> String {
