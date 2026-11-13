@@ -84,6 +84,34 @@ impl Approver for StdinApprover {
         self.approve(call).await
     }
 
+    async fn approve_folder(
+        &self,
+        call: &ToolCall,
+        dirs: &[std::path::PathBuf],
+    ) -> magia_core::FolderAnswer {
+        let call = call.clone();
+        let list: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+        tokio::task::spawn_blocking(move || {
+            eprintln!("\n! outside the project: {}", list.join(", "));
+            eprint!(
+                "? run {} {} [y = once / a = always this session / N] ",
+                call.name, call.arguments
+            );
+            let _ = std::io::stderr().flush();
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                return magia_core::FolderAnswer::Deny;
+            }
+            match line.trim() {
+                "y" | "Y" | "yes" => magia_core::FolderAnswer::Once,
+                "a" | "A" | "always" => magia_core::FolderAnswer::Always,
+                _ => magia_core::FolderAnswer::Deny,
+            }
+        })
+        .await
+        .unwrap_or(magia_core::FolderAnswer::Deny)
+    }
+
     async fn ask(&self, question: &str, options: &[String]) -> Option<String> {
         let (question, options) = (question.to_owned(), options.to_vec());
         tokio::task::spawn_blocking(move || {

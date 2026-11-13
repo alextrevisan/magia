@@ -3,6 +3,7 @@
 pub mod auto;
 mod builtin;
 mod checkpoint;
+pub mod outside;
 mod permissions;
 mod web;
 

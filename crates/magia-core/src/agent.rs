@@ -76,10 +76,30 @@ pub enum MagiaPhase {
     Finished(String),
 }
 
+/// The answer to "may this call reach these folders outside the project?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderAnswer {
+    /// This call only.
+    Once,
+    /// The folders, for the rest of the session (saved with it).
+    Always,
+    Deny,
+}
+
 /// The user side of a turn: approving tool calls and answering the model's questions.
 #[async_trait]
 pub trait Approver: Send + Sync {
     async fn approve(&self, call: &ToolCall) -> bool;
+    /// The call reaches `dirs`, outside the project. Without a richer UI: yes means once.
+    async fn approve_folder(&self, call: &ToolCall, dirs: &[PathBuf]) -> FolderAnswer {
+        let list: Vec<String> = dirs.iter().map(|d| d.display().to_string()).collect();
+        let why = format!("outside the project: {}", list.join(", "));
+        if self.approve_because(call, &why).await {
+            FolderAnswer::Once
+        } else {
+            FolderAnswer::Deny
+        }
+    }
     /// Like `approve`, with the reason `auto` mode flagged the call (shown to the user).
     async fn approve_because(&self, call: &ToolCall, _reason: &str) -> bool {
         self.approve(call).await
@@ -180,6 +200,8 @@ pub struct Agent {
     subagents: tokio::sync::Semaphore,
     /// The request being sent during a turn, for `/btw` questions (see `crate::btw`).
     pub side: crate::btw::SideSlot,
+    /// Folders outside the project allowed for this session (shared with subagents).
+    pub allowed_dirs: Arc<std::sync::Mutex<Vec<PathBuf>>>,
     pub client: Client,
     pub model: String,
     pub mode: PermissionMode,
@@ -248,6 +270,7 @@ impl Agent {
             magia: None,
             subagents: tokio::sync::Semaphore::new(MAX_PARALLEL_SUBAGENTS),
             side: Default::default(),
+            allowed_dirs: Default::default(),
             retry_delay: RETRY_DELAY,
             project_instructions,
             reviewed: Default::default(),
@@ -630,9 +653,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
             })
             .unwrap_or("");
         let report = run_subagent(
-            self.client.clone(),
-            self.model.clone(),
-            self.cx.cwd.clone(),
+            self.child_base(),
             magia_mode::review_prompt(request, todos, &files, claim),
             magia_mode::REVIEWER,
             cancel.clone(),
@@ -826,6 +847,15 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
         }
     }
 
+    fn child_base(&self) -> ChildBase {
+        ChildBase {
+            client: self.client.clone(),
+            model: self.model.clone(),
+            cwd: self.cx.cwd.clone(),
+            allowed_dirs: self.allowed_dirs.clone(),
+        }
+    }
+
     fn report_end(
         &self,
         call: &ToolCall,
@@ -846,6 +876,10 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
         if call.name == "task" {
             return !self.is_child;
         }
+        let outside = self.outside_folders(call);
+        if !outside.is_empty() && self.outside_rule(&outside) != Effect::Allow {
+            return false; // asks first
+        }
         self.tools
             .get(&call.name)
             .is_some_and(|t| match self.decision(call, t) {
@@ -856,6 +890,93 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
                 }
                 _ => false,
             })
+    }
+
+    /// Folders outside the project that `call` would reach and that are not allowed yet
+    /// (nothing in `yolo`).
+    fn outside_folders(&self, call: &ToolCall) -> Vec<PathBuf> {
+        if self.mode == PermissionMode::Yolo {
+            return vec![];
+        }
+        let granted = self
+            .allowed_dirs
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        magia_tools::outside::folders(&call.name, &call.arguments, &self.cx.cwd, &granted)
+    }
+
+    /// The `external_directory` rules (OpenCode's key) for these folders: any deny wins, all
+    /// allowed passes, anything else asks.
+    fn outside_rule(&self, dirs: &[PathBuf]) -> Effect {
+        let effects: Vec<Option<Effect>> = dirs
+            .iter()
+            .map(|d| {
+                self.rules
+                    .check("external_directory", &d.display().to_string())
+            })
+            .collect();
+        if effects.contains(&Some(Effect::Deny)) {
+            Effect::Deny
+        } else if effects.iter().all(|e| *e == Some(Effect::Allow)) {
+            Effect::Allow
+        } else {
+            Effect::Ask
+        }
+    }
+
+    /// Ask before a call reaches outside the project. `Ok(true)` = the user just approved this
+    /// call; `Ok(false)` = nothing outside (or allowed by the rules); `Err` = refused.
+    async fn outside_check(
+        &self,
+        call: &ToolCall,
+        approver: &dyn Approver,
+    ) -> Result<bool, String> {
+        let dirs = self.outside_folders(call);
+        if dirs.is_empty() {
+            return Ok(false);
+        }
+        let list = dirs
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        match self.outside_rule(&dirs) {
+            Effect::Allow => return Ok(false),
+            Effect::Deny => {
+                return Err(format!(
+                    "{list} is outside the project and the permission rules deny it. Do not try to reach it another way."
+                ));
+            }
+            Effect::Ask => {}
+        }
+        if self.is_child {
+            return Err(format!(
+                "{list} is outside the project; a subagent cannot ask for access. Report that the main agent needs it."
+            ));
+        }
+        match approver.approve_folder(call, &dirs).await {
+            FolderAnswer::Once => Ok(true),
+            FolderAnswer::Always => {
+                let all = {
+                    let mut g = self.allowed_dirs.lock().unwrap();
+                    g.extend(dirs);
+                    g.sort();
+                    g.dedup();
+                    g.clone()
+                };
+                if let Some(s) = &self.store {
+                    let _ = s.set_allowed_dirs(&all);
+                }
+                Ok(true)
+            }
+            FolderAnswer::Deny => {
+                self.denied.store(true, Ordering::Relaxed);
+                Err(format!(
+                    "the user denied access to {list} (outside the project). Do not try to reach it another way."
+                ))
+            }
+        }
     }
 
     /// `auto` mode: run safe calls, ask about risky ones, let the reviewer settle the rest.
@@ -999,9 +1120,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
                 // Waits here when MAX_PARALLEL_SUBAGENTS are already running.
                 let _slot = self.subagents.acquire().await;
                 Ok(run_subagent(
-                    self.client.clone(),
-                    self.model.clone(),
-                    self.cx.cwd.clone(),
+                    self.child_base(),
                     prompt,
                     RESEARCHER,
                     self.cx.cancel.clone(),
@@ -1013,13 +1132,31 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
             let Some(tool) = self.tools.get(&call.name) else {
                 return (format!("unknown tool `{}`", call.name), true);
             };
-            match self.decision(call, tool) {
-                Decision::Deny => {
-                    return (
-                        format!("`{}` is not allowed in {:?} mode", call.name, self.mode),
-                        true,
-                    );
+            let decision = self.decision(call, tool);
+            if decision == Decision::Deny {
+                return (
+                    format!("`{}` is not allowed in {:?} mode", call.name, self.mode),
+                    true,
+                );
+            }
+            // Reaching outside the project asks first; a yes there approves the call too. A
+            // call `auto` mode finds risky skips this question: its own warning asks instead
+            // (once), so "always allow this folder" never waves through `rm -rf ~`.
+            let risky = decision == Decision::Review
+                && matches!(
+                    magia_tools::auto::classify(&call.name, &call.arguments, &self.cx.cwd),
+                    Verdict::Risky(_)
+                );
+            let approved = if risky {
+                false
+            } else {
+                match self.outside_check(call, approver).await {
+                    Ok(asked) => asked,
+                    Err(msg) => return (msg, true),
                 }
+            };
+            match decision {
+                _ if approved => {}
                 Decision::Ask if !approver.approve(call).await => {
                     self.denied.store(true, Ordering::Relaxed);
                     return ("the user denied this tool call".into(), true);
@@ -1213,6 +1350,9 @@ Do not call tools."
         self.last_input_tokens = 0;
         self.forget_session_state();
         self.restore_todos();
+        if let Ok(mut g) = self.allowed_dirs.lock() {
+            *g = sf.meta().allowed_dirs;
+        }
         self.store = Some(sf);
         Ok(self.history.len())
     }
@@ -1233,12 +1373,23 @@ Do not call tools."
         if let Ok(mut r) = self.reviewed.lock() {
             r.clear();
         }
+        if let Ok(mut g) = self.allowed_dirs.lock() {
+            g.clear();
+        }
     }
 
     pub fn fork(&mut self) -> Result<PathBuf> {
         let new = SessionFile::create_for(&magia_store::sessions_dir(), &self.cx.cwd)?;
         for m in &self.history {
             new.append(m)?;
+        }
+        let dirs = self
+            .allowed_dirs
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        if !dirs.is_empty() {
+            new.set_allowed_dirs(&dirs)?;
         }
         let path = new.path().to_path_buf();
         self.store = Some(new);
@@ -1363,19 +1514,33 @@ fn render_transcript(h: &[Message]) -> String {
 const RESEARCHER: &str = "You are a read-only research subagent. Investigate, then reply with a concise report (no preamble).";
 
 /// A read-only child agent with a fresh context; returns its final report.
-fn run_subagent(
+/// What a subagent takes from its parent.
+struct ChildBase {
     client: Client,
     model: String,
     cwd: PathBuf,
+    /// The parent's folders outside the project that the user allowed.
+    allowed_dirs: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+}
+
+fn run_subagent(
+    base: ChildBase,
     prompt: String,
     role: &'static str,
     cancel: CancellationToken,
     // Where to report the child's tool calls live, under which parent id.
     forward: Option<(UnboundedSender<AgentEvent>, String)>,
 ) -> BoxFuture<'static, String> {
+    let ChildBase {
+        client,
+        model,
+        cwd,
+        allowed_dirs,
+    } = base;
     async move {
         let mut child = Agent::new(client, model, PermissionMode::Plan, cwd);
         child.is_child = true;
+        child.allowed_dirs = allowed_dirs;
         child.compact_at_tokens = 0;
         child.system.push_str("\n\n");
         child.system.push_str(role);

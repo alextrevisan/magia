@@ -38,16 +38,16 @@ fn risky(why: &str) -> Verdict {
 // ───────────────────────── shell parsing ─────────────────────────
 
 #[derive(Debug, Default, PartialEq, Eq)]
-struct Segment {
-    words: Vec<String>,
+pub(crate) struct Segment {
+    pub(crate) words: Vec<String>,
     /// (operator, target) for `>`, `>>`, `<`, `2>`, `&>`…; `2>&1`-style dups are dropped.
-    redirects: Vec<(String, String)>,
+    pub(crate) redirects: Vec<(String, String)>,
 }
 
 #[derive(Debug, Default)]
-struct Parsed {
+pub(crate) struct Parsed {
     /// Commands in order; `pipes[i]` is true when segment i feeds segment i+1 through `|`.
-    segments: Vec<Segment>,
+    pub(crate) segments: Vec<Segment>,
     pipes: Vec<bool>,
     /// `$(…)`, backticks, `<(…)` or `>(…)` outside single quotes: not followed.
     substitution: bool,
@@ -55,7 +55,7 @@ struct Parsed {
     background: bool,
 }
 
-fn parse(cmd: &str) -> Parsed {
+pub(crate) fn parse(cmd: &str) -> Parsed {
     let mut p = Parsed::default();
     let mut seg = Segment::default();
     let mut word = String::new();
@@ -212,7 +212,7 @@ fn home() -> Option<PathBuf> {
 }
 
 /// `arg` as an absolute, lexically normalized path (`~` and `$HOME` expanded).
-fn resolve(arg: &str, cwd: &Path) -> PathBuf {
+pub(crate) fn resolve(arg: &str, cwd: &Path) -> PathBuf {
     let expanded = if arg == "~" || arg == "$HOME" {
         home().unwrap_or_default()
     } else if let Some(rest) = arg

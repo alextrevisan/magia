@@ -271,6 +271,7 @@ mod tests {
                     updated: 0,
                     title: title.into(),
                     messages: 3,
+                    ..Default::default()
                 },
             },
             snippets: vec![],

@@ -1443,3 +1443,186 @@ async fn resume_and_rewind_bring_back_the_task_list() {
     resumed.rewind(1).unwrap();
     assert_eq!(status(&resumed), vec![pair("a", "pending")]);
 }
+
+// ───────────── folders outside the project ─────────────
+
+/// Answers folder prompts from a script and records them; plain approvals say yes.
+struct FolderApprover {
+    answers: std::sync::Mutex<Vec<magia_core::FolderAnswer>>,
+    asked: std::sync::Mutex<Vec<Vec<std::path::PathBuf>>>,
+}
+
+#[async_trait::async_trait]
+impl magia_core::Approver for FolderApprover {
+    async fn approve(&self, _: &magia_types::ToolCall) -> bool {
+        true
+    }
+    async fn approve_folder(
+        &self,
+        _: &magia_types::ToolCall,
+        dirs: &[std::path::PathBuf],
+    ) -> magia_core::FolderAnswer {
+        self.asked.lock().unwrap().push(dirs.to_vec());
+        self.answers.lock().unwrap().remove(0)
+    }
+    fn interactive(&self) -> bool {
+        true
+    }
+}
+
+async fn run_with(agent: &mut Agent, prompt: &str, a: &FolderApprover) -> Vec<AgentEvent> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_turn(prompt, tx, CancellationToken::new(), a)
+        .await;
+    let mut v = Vec::new();
+    while let Ok(e) = rx.try_recv() {
+        v.push(e);
+    }
+    v
+}
+
+fn tool_outputs(ev: &[AgentEvent]) -> Vec<(String, bool)> {
+    ev.iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolEnd {
+                output, is_error, ..
+            } => Some((output.clone(), *is_error)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn reaching_outside_the_project_asks_and_always_is_kept_with_the_session() {
+    use magia_core::FolderAnswer;
+    let project = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let ext = std::fs::canonicalize(other.path()).unwrap();
+    std::fs::write(ext.join("a.txt"), "outside-a").unwrap();
+    std::fs::write(ext.join("b.txt"), "outside-b").unwrap();
+    let read = |f: &str| format!(r#"{{"file_path":"{}"}}"#, ext.join(f).display());
+    let (url, _s) = serve(vec![
+        tool_reply(&[("r1", "read", &read("a.txt"))]), // denied
+        text_reply("ok"),
+        tool_reply(&[("r2", "read", &read("a.txt"))]), // once
+        tool_reply(&[("r3", "read", &read("b.txt"))]), // asks again: always
+        tool_reply(&[("r4", "read", &read("a.txt"))]), // no question
+        text_reply("done"),
+    ])
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(
+        client(url.clone()),
+        "m".into(),
+        PermissionMode::Ask,
+        project.path().into(),
+    );
+    agent.store = Some(magia_store::SessionFile::create_for(root.path(), project.path()).unwrap());
+    let a = FolderApprover {
+        answers: std::sync::Mutex::new(vec![
+            FolderAnswer::Deny,
+            FolderAnswer::Once,
+            FolderAnswer::Always,
+        ]),
+        asked: Default::default(),
+    };
+    let ev = run_with(&mut agent, "read the outside file", &a).await;
+    let out = tool_outputs(&ev);
+    assert!(out[0].1 && out[0].0.contains("denied access"), "{out:?}");
+    let ev = run_with(&mut agent, "read them", &a).await;
+    let out = tool_outputs(&ev);
+    assert_eq!(
+        out.iter()
+            .map(|(o, e)| (o.contains("outside-"), *e))
+            .collect::<Vec<_>>(),
+        vec![(true, false); 3],
+        "{out:?}"
+    );
+    assert_eq!(
+        a.asked.lock().unwrap().len(),
+        3,
+        "the last read did not ask"
+    );
+    assert_eq!(a.asked.lock().unwrap()[0], vec![ext.clone()]);
+
+    // Saved with the session: a resumed agent may read there without asking.
+    let path = agent.store.as_ref().unwrap().path().to_path_buf();
+    assert_eq!(
+        agent.store.as_ref().unwrap().meta().allowed_dirs,
+        vec![ext.clone()]
+    );
+    let mut resumed = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Ask,
+        project.path().into(),
+    );
+    resumed.resume(&path).unwrap();
+    assert_eq!(*resumed.allowed_dirs.lock().unwrap(), vec![ext.clone()]);
+    resumed.new_session().ok();
+    assert!(
+        resumed.allowed_dirs.lock().unwrap().is_empty(),
+        "a new session starts over"
+    );
+}
+
+#[tokio::test]
+async fn yolo_and_rules_skip_the_folder_question_and_subagents_cannot_ask() {
+    let project = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let ext = std::fs::canonicalize(other.path()).unwrap();
+    std::fs::write(ext.join("a.txt"), "outside-a").unwrap();
+    let read = format!(r#"{{"file_path":"{}"}}"#, ext.join("a.txt").display());
+    let nobody = || FolderApprover {
+        answers: Default::default(), // any question would panic
+        asked: Default::default(),
+    };
+
+    // yolo: no question.
+    let (url, _s) = serve(vec![tool_reply(&[("r1", "read", &read)]), text_reply("ok")]).await;
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Yolo,
+        project.path().into(),
+    );
+    let out = tool_outputs(&run_with(&mut agent, "x", &nobody()).await);
+    assert!(!out[0].1 && out[0].0.contains("outside-a"));
+
+    // `external_directory` allow rule: no question either.
+    let (url, _s) = serve(vec![tool_reply(&[("r1", "read", &read)]), text_reply("ok")]).await;
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Ask,
+        project.path().into(),
+    );
+    let cfg = magia_core::Config::from_value(&serde_json::json!({
+        "permission": {"external_directory": {"*": "ask", format!("{}*", ext.display()): "allow"}}
+    }));
+    agent.configure(&cfg);
+    let out = tool_outputs(&run_with(&mut agent, "x", &nobody()).await);
+    assert!(!out[0].1, "{out:?}");
+
+    // A subagent cannot ask: its read outside fails with a clear message.
+    let (url, _s) = serve(vec![
+        tool_reply(&[("t1", "task", r#"{"prompt":"read it"}"#)]),
+        tool_reply(&[("r1", "read", &read)]),
+        text_reply("could not"),
+        text_reply("ok"),
+    ])
+    .await;
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Ask,
+        project.path().into(),
+    );
+    let ev = run_with(&mut agent, "x", &nobody()).await;
+    assert!(no_question_asked(&ev));
+}
+
+fn no_question_asked(ev: &[AgentEvent]) -> bool {
+    !ev.iter().any(|e| matches!(e, AgentEvent::Error(_)))
+}

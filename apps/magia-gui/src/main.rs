@@ -29,8 +29,8 @@ use magia_types::{Image, Message, ToolCall};
 enum UiMsg {
     Agent(AgentEvent),
     Models(Result<Vec<String>, String>),
-    /// A call to approve, with the reason when `auto` mode flagged it.
-    Permission(ToolCall, Option<String>, tokio::sync::oneshot::Sender<bool>),
+    /// A call to approve.
+    Permission(Pending),
     Question(Question),
     Catalog(Vec<SlashEntry>),
     /// Root `.md` files that can be picked as the agent.
@@ -96,29 +96,52 @@ enum Item {
     Round(String),
 }
 
+/// A call waiting for the user's yes or no.
+struct Pending {
+    call: ToolCall,
+    /// Why `auto` mode flagged it.
+    reason: Option<String>,
+    /// Folders outside the project it would reach (then "always" is offered).
+    dirs: Vec<PathBuf>,
+    reply: tokio::sync::oneshot::Sender<magia_core::FolderAnswer>,
+}
+
 struct GuiApprover {
     tx: UnboundedSender<UiMsg>,
     ctx: egui::Context,
 }
 
+impl GuiApprover {
+    async fn request(
+        &self,
+        call: &ToolCall,
+        reason: Option<String>,
+        dirs: Vec<PathBuf>,
+    ) -> magia_core::FolderAnswer {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        let _ = self.tx.send(UiMsg::Permission(Pending {
+            call: call.clone(),
+            reason,
+            dirs,
+            reply,
+        }));
+        self.ctx.request_repaint();
+        answer.await.unwrap_or(magia_core::FolderAnswer::Deny)
+    }
+}
+
 #[async_trait]
 impl Approver for GuiApprover {
     async fn approve(&self, call: &ToolCall) -> bool {
-        let (reply, answer) = tokio::sync::oneshot::channel();
-        let _ = self.tx.send(UiMsg::Permission(call.clone(), None, reply));
-        self.ctx.request_repaint();
-        answer.await.unwrap_or(false)
+        self.request(call, None, vec![]).await != magia_core::FolderAnswer::Deny
     }
 
     async fn approve_because(&self, call: &ToolCall, reason: &str) -> bool {
-        let (reply, answer) = tokio::sync::oneshot::channel();
-        let _ = self.tx.send(UiMsg::Permission(
-            call.clone(),
-            Some(reason.to_owned()),
-            reply,
-        ));
-        self.ctx.request_repaint();
-        answer.await.unwrap_or(false)
+        self.request(call, Some(reason.to_owned()), vec![]).await != magia_core::FolderAnswer::Deny
+    }
+
+    async fn approve_folder(&self, call: &ToolCall, dirs: &[PathBuf]) -> magia_core::FolderAnswer {
+        self.request(call, None, dirs.to_vec()).await
     }
 
     async fn ask(&self, question: &str, options: &[String]) -> Option<String> {
@@ -155,7 +178,7 @@ struct App {
     resume: Option<resume::Picker>,
     running: bool,
     cancel: CancellationToken,
-    pending: Option<(ToolCall, Option<String>, tokio::sync::oneshot::Sender<bool>)>,
+    pending: Option<Pending>,
     /// Open question from the model and the user's typed answer.
     question: Option<(Question, String)>,
     /// `/` autocomplete: everything available (refreshed off the UI thread when the popup opens).
@@ -1041,9 +1064,13 @@ impl App {
                     self.question = Some((q, String::new()));
                     self.notify(ctx, "magia has a question", &body);
                 }
-                UiMsg::Permission(call, reason, reply) => {
-                    let body = format!("run `{}`?", call.name);
-                    self.pending = Some((call, reason, reply));
+                UiMsg::Permission(p) => {
+                    let body = if p.dirs.is_empty() {
+                        format!("run `{}`?", p.call.name)
+                    } else {
+                        format!("`{}` wants to reach outside the project", p.call.name)
+                    };
+                    self.pending = Some(p);
                     self.notify(ctx, "magia needs your approval", &body);
                 }
                 UiMsg::Agent(ev) => {
@@ -1677,9 +1704,13 @@ impl App {
     }
 
     fn permission_modal(&mut self, ctx: &egui::Context) {
-        let Some((call, reason, _)) = &self.pending else {
+        let Some(Pending {
+            call, reason, dirs, ..
+        }) = &self.pending
+        else {
             return;
         };
+        use magia_core::FolderAnswer;
         let mut answer = None;
         egui::Modal::new(egui::Id::new("permission")).show(ctx, |ui| {
             let t = *theme::tokens(ui);
@@ -1694,8 +1725,26 @@ impl App {
                         .font(theme::mono(theme::HEADING - 1.0))
                         .color(t.fg),
                 );
-                ui.label(egui::RichText::new("to run?").size(theme::HEADING));
+                ui.label(
+                    egui::RichText::new(if dirs.is_empty() {
+                        "to run?"
+                    } else {
+                        "to reach outside the project?"
+                    })
+                    .size(theme::HEADING),
+                );
             });
+            for d in dirs {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("▸").color(t.warn));
+                    ui.label(
+                        egui::RichText::new(tilde(d).display().to_string())
+                            .font(theme::mono(theme::MONO))
+                            .color(t.fg),
+                    )
+                    .on_hover_text(d.display().to_string());
+                });
+            }
             if !summary.is_empty() {
                 ui.label(
                     egui::RichText::new(&summary)
@@ -1722,24 +1771,42 @@ impl App {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new("Change the mode in the top bar to stop being asked.")
-                        .size(theme::SMALL)
-                        .color(t.muted),
+                    egui::RichText::new(if dirs.is_empty() {
+                        "Change the mode in the top bar to stop being asked."
+                    } else {
+                        "\"Always\" lasts for this session (kept on /resume)."
+                    })
+                    .size(theme::SMALL)
+                    .color(t.muted),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::primary(ui, "Allow", true).clicked() {
-                        answer = Some(true);
+                    if dirs.is_empty() {
+                        if theme::primary(ui, "Allow", true).clicked() {
+                            answer = Some(FolderAnswer::Once);
+                        }
+                    } else {
+                        let always = if dirs.len() == 1 {
+                            "Always allow this folder"
+                        } else {
+                            "Always allow these folders"
+                        };
+                        if theme::primary(ui, always, true).clicked() {
+                            answer = Some(FolderAnswer::Always);
+                        }
+                        if theme::secondary(ui, "Allow once", None).clicked() {
+                            answer = Some(FolderAnswer::Once);
+                        }
                     }
                     if theme::secondary(ui, "Deny", Some(t.danger)).clicked() {
-                        answer = Some(false);
+                        answer = Some(FolderAnswer::Deny);
                     }
                 });
             });
         });
         if let Some(a) = answer
-            && let Some((_, _, reply)) = self.pending.take()
+            && let Some(p) = self.pending.take()
         {
-            let _ = reply.send(a);
+            let _ = p.reply.send(a);
         }
     }
 }

@@ -94,6 +94,9 @@ pub struct SessionMeta {
     /// First user message, one line, truncated.
     pub title: String,
     pub messages: usize,
+    /// Folders outside `cwd` the user allowed for the whole session ("always").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_dirs: Vec<PathBuf>,
 }
 
 const TITLE_CHARS: usize = 80;
@@ -250,6 +253,12 @@ impl SessionFile {
             meta.messages = messages.len();
             meta.updated = now();
         }
+        self.save_meta()
+    }
+
+    /// Remember folders outside the project that the user allowed for this session.
+    pub fn set_allowed_dirs(&self, dirs: &[PathBuf]) -> Result<()> {
+        self.meta.lock().unwrap().allowed_dirs = dirs.to_vec();
         self.save_meta()
     }
 
