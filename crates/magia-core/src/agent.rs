@@ -83,7 +83,10 @@ pub enum FolderAnswer {
     Once,
     /// The folders, for the rest of the session (saved with it).
     Always,
+    /// Not this call.
     Deny,
+    /// Never these folders, for the rest of the session (saved with it).
+    DenyAlways,
 }
 
 /// The user side of a turn: approving tool calls and answering the model's questions.
@@ -202,6 +205,8 @@ pub struct Agent {
     pub side: crate::btw::SideSlot,
     /// Folders outside the project allowed for this session (shared with subagents).
     pub allowed_dirs: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    /// Folders outside the project refused for this session (shared with subagents).
+    pub denied_dirs: Arc<std::sync::Mutex<Vec<PathBuf>>>,
     pub client: Client,
     pub model: String,
     pub mode: PermissionMode,
@@ -271,6 +276,7 @@ impl Agent {
             subagents: tokio::sync::Semaphore::new(MAX_PARALLEL_SUBAGENTS),
             side: Default::default(),
             allowed_dirs: Default::default(),
+            denied_dirs: Default::default(),
             retry_delay: RETRY_DELAY,
             project_instructions,
             reviewed: Default::default(),
@@ -853,6 +859,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
             model: self.model.clone(),
             cwd: self.cx.cwd.clone(),
             allowed_dirs: self.allowed_dirs.clone(),
+            denied_dirs: self.denied_dirs.clone(),
         }
     }
 
@@ -941,6 +948,19 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
             .map(|d| d.display().to_string())
             .collect::<Vec<_>>()
             .join(", ");
+        let refused = self
+            .denied_dirs
+            .lock()
+            .map(|d| d.clone())
+            .unwrap_or_default();
+        if dirs
+            .iter()
+            .any(|d| refused.iter().any(|r| d.starts_with(r)))
+        {
+            return Err(format!(
+                "the user blocked {list} (outside the project) for this session. Do not try to reach it another way; work without it or tell the user what you needed."
+            ));
+        }
         match self.outside_rule(&dirs) {
             Effect::Allow => return Ok(false),
             Effect::Deny => {
@@ -974,6 +994,22 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
                 self.denied.store(true, Ordering::Relaxed);
                 Err(format!(
                     "the user denied access to {list} (outside the project). Do not try to reach it another way."
+                ))
+            }
+            FolderAnswer::DenyAlways => {
+                self.denied.store(true, Ordering::Relaxed);
+                let all = {
+                    let mut d = self.denied_dirs.lock().unwrap();
+                    d.extend(dirs);
+                    d.sort();
+                    d.dedup();
+                    d.clone()
+                };
+                if let Some(s) = &self.store {
+                    let _ = s.set_denied_dirs(&all);
+                }
+                Err(format!(
+                    "the user blocked {list} (outside the project) for this session. Do not try to reach it another way."
                 ))
             }
         }
@@ -1350,8 +1386,12 @@ Do not call tools."
         self.last_input_tokens = 0;
         self.forget_session_state();
         self.restore_todos();
+        let meta = sf.meta();
         if let Ok(mut g) = self.allowed_dirs.lock() {
-            *g = sf.meta().allowed_dirs;
+            *g = meta.allowed_dirs;
+        }
+        if let Ok(mut d) = self.denied_dirs.lock() {
+            *d = meta.denied_dirs;
         }
         self.store = Some(sf);
         Ok(self.history.len())
@@ -1376,6 +1416,9 @@ Do not call tools."
         if let Ok(mut g) = self.allowed_dirs.lock() {
             g.clear();
         }
+        if let Ok(mut d) = self.denied_dirs.lock() {
+            d.clear();
+        }
     }
 
     pub fn fork(&mut self) -> Result<PathBuf> {
@@ -1390,6 +1433,14 @@ Do not call tools."
             .unwrap_or_default();
         if !dirs.is_empty() {
             new.set_allowed_dirs(&dirs)?;
+        }
+        let refused = self
+            .denied_dirs
+            .lock()
+            .map(|d| d.clone())
+            .unwrap_or_default();
+        if !refused.is_empty() {
+            new.set_denied_dirs(&refused)?;
         }
         let path = new.path().to_path_buf();
         self.store = Some(new);
@@ -1519,8 +1570,9 @@ struct ChildBase {
     client: Client,
     model: String,
     cwd: PathBuf,
-    /// The parent's folders outside the project that the user allowed.
+    /// The parent's folders outside the project that the user allowed or refused.
     allowed_dirs: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    denied_dirs: Arc<std::sync::Mutex<Vec<PathBuf>>>,
 }
 
 fn run_subagent(
@@ -1536,11 +1588,13 @@ fn run_subagent(
         model,
         cwd,
         allowed_dirs,
+        denied_dirs,
     } = base;
     async move {
         let mut child = Agent::new(client, model, PermissionMode::Plan, cwd);
         child.is_child = true;
         child.allowed_dirs = allowed_dirs;
+        child.denied_dirs = denied_dirs;
         child.compact_at_tokens = 0;
         child.system.push_str("\n\n");
         child.system.push_str(role);

@@ -94,7 +94,7 @@ impl Approver for StdinApprover {
         tokio::task::spawn_blocking(move || {
             eprintln!("\n! outside the project: {}", list.join(", "));
             eprint!(
-                "? run {} {} [y = once / a = always this session / N] ",
+                "? run {} {} [y = once / a = always this session / N = no / d = never this session] ",
                 call.name, call.arguments
             );
             let _ = std::io::stderr().flush();
@@ -105,6 +105,7 @@ impl Approver for StdinApprover {
             match line.trim() {
                 "y" | "Y" | "yes" => magia_core::FolderAnswer::Once,
                 "a" | "A" | "always" => magia_core::FolderAnswer::Always,
+                "d" | "D" | "never" => magia_core::FolderAnswer::DenyAlways,
                 _ => magia_core::FolderAnswer::Deny,
             }
         })

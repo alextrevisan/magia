@@ -97,6 +97,9 @@ pub struct SessionMeta {
     /// Folders outside `cwd` the user allowed for the whole session ("always").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_dirs: Vec<PathBuf>,
+    /// Folders outside `cwd` the user refused for the whole session ("always deny").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_dirs: Vec<PathBuf>,
 }
 
 const TITLE_CHARS: usize = 80;
@@ -259,6 +262,12 @@ impl SessionFile {
     /// Remember folders outside the project that the user allowed for this session.
     pub fn set_allowed_dirs(&self, dirs: &[PathBuf]) -> Result<()> {
         self.meta.lock().unwrap().allowed_dirs = dirs.to_vec();
+        self.save_meta()
+    }
+
+    /// Remember folders outside the project that the user refused for this session.
+    pub fn set_denied_dirs(&self, dirs: &[PathBuf]) -> Result<()> {
+        self.meta.lock().unwrap().denied_dirs = dirs.to_vec();
         self.save_meta()
     }
 

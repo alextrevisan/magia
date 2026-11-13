@@ -1626,3 +1626,51 @@ async fn yolo_and_rules_skip_the_folder_question_and_subagents_cannot_ask() {
 fn no_question_asked(ev: &[AgentEvent]) -> bool {
     !ev.iter().any(|e| matches!(e, AgentEvent::Error(_)))
 }
+
+#[tokio::test]
+async fn always_deny_refuses_the_folder_for_the_session_without_asking_again() {
+    use magia_core::FolderAnswer;
+    let project = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let ext = std::fs::canonicalize(other.path()).unwrap();
+    std::fs::create_dir(ext.join("sub")).unwrap();
+    std::fs::write(ext.join("sub/b.txt"), "b").unwrap();
+    std::fs::write(ext.join("a.txt"), "a").unwrap();
+    let read = |f: &str| format!(r#"{{"file_path":"{}"}}"#, ext.join(f).display());
+    let (url, _s) = serve(vec![
+        tool_reply(&[("r1", "read", &read("a.txt"))]), // always deny
+        tool_reply(&[("r2", "read", &read("sub/b.txt"))]), // inside it: refused, no question
+        text_reply("ok"),
+    ])
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(
+        client(url.clone()),
+        "m".into(),
+        PermissionMode::Ask,
+        project.path().into(),
+    );
+    agent.store = Some(magia_store::SessionFile::create_for(root.path(), project.path()).unwrap());
+    let a = FolderApprover {
+        answers: std::sync::Mutex::new(vec![FolderAnswer::DenyAlways]),
+        asked: Default::default(),
+    };
+    // The model is told and tries the subfolder in the same turn: refused without a question.
+    let out = tool_outputs(&run_with(&mut agent, "read them", &a).await);
+    assert_eq!(out.len(), 2);
+    assert!(
+        out.iter().all(|(o, e)| *e && o.contains("blocked")),
+        "{out:?}"
+    );
+    assert_eq!(a.asked.lock().unwrap().len(), 1, "asked only once");
+
+    let path = agent.store.as_ref().unwrap().path().to_path_buf();
+    let mut resumed = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Ask,
+        project.path().into(),
+    );
+    resumed.resume(&path).unwrap();
+    assert_eq!(*resumed.denied_dirs.lock().unwrap(), vec![ext]);
+}

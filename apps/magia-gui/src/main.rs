@@ -1802,7 +1802,7 @@ impl App {
                 egui::RichText::new(if dirs.is_empty() {
                     "Change the mode in the top bar to stop being asked."
                 } else {
-                    "\"Always\" lasts for this session (kept on /resume)."
+                    "\"Always\" (allow or deny) lasts for this session, kept on /resume."
                 })
                 .size(theme::SMALL)
                 .color(t.muted),
@@ -1829,6 +1829,13 @@ impl App {
                     }
                     if theme::secondary(ui, "Deny", Some(t.danger)).clicked() {
                         answer = Some(FolderAnswer::Deny);
+                    }
+                    if !dirs.is_empty()
+                        && theme::secondary(ui, "Always deny", Some(t.danger))
+                            .on_hover_text("Refuse these folders for the rest of this session")
+                            .clicked()
+                    {
+                        answer = Some(FolderAnswer::DenyAlways);
                     }
                 });
             });
