@@ -259,10 +259,33 @@ impl Config {
                         command: program.clone(),
                         args: args.to_vec(),
                         env,
+                        ..Default::default()
                     });
                 }
-                Some("remote") => cfg.warnings.push(format!(
-                    "mcp `{name}`: remote (HTTP) servers are not supported yet"
+                // OpenCode says `remote`; other tools write `http` / `streamable-http`.
+                Some("remote" | "http" | "streamable-http" | "streamableHttp") => {
+                    let Some(url) = s.get("url").and_then(Value::as_str).map(str::trim) else {
+                        cfg.warnings.push(format!("mcp `{name}`: remote server without `url`"));
+                        continue;
+                    };
+                    if !(url.starts_with("http://") || url.starts_with("https://")) {
+                        cfg.warnings
+                            .push(format!("mcp `{name}`: `url` must start with http(s)://"));
+                        continue;
+                    }
+                    let headers = obj(s.get("headers").unwrap_or(&Value::Null))
+                        .into_iter()
+                        .filter_map(|(k, v)| Some((k, v.as_str()?.to_owned())))
+                        .collect();
+                    cfg.mcp.push(McpServerConfig {
+                        name,
+                        url: Some(url.to_owned()),
+                        headers,
+                        ..Default::default()
+                    });
+                }
+                Some("sse") => cfg.warnings.push(format!(
+                    "mcp `{name}`: the old HTTP+SSE transport is not supported; most servers also serve Streamable HTTP (often at /mcp) — use \"type\": \"remote\""
                 )),
                 _ => {}
             }
@@ -513,7 +536,8 @@ mod tests {
             },
             "mcp": {"fs": {"type": "local", "command": ["npx", "-y", "srv", "."], "environment": {"A": "b"}},
                     "off": {"type": "local", "command": ["x"], "enabled": false},
-                    "web": {"type": "remote", "url": "https://m"}},
+                    "web": {"type": "remote", "url": "https://m/mcp", "headers": {"Authorization": "Bearer t"}},
+                    "old": {"type": "sse", "url": "https://o/sse"}},
             "permission": {"bash": {"*": "ask", "git status*": "allow"}, "edit": "allow", "list": "deny"},
             "instructions": ["CONTRIBUTING.md"],
             "command": {"review": {"template": "Review $ARGUMENTS"}},
@@ -543,9 +567,11 @@ mod tests {
             c.provider_config("anthro").unwrap().wire_for("any"),
             Wire::Messages
         );
-        assert_eq!(c.mcp.len(), 1);
+        assert_eq!(c.mcp.len(), 2);
         assert_eq!((c.mcp[0].command.as_str(), c.mcp[0].args.len()), ("npx", 3));
-        assert!(c.warnings.iter().any(|w| w.contains("remote")));
+        assert_eq!(c.mcp[1].url.as_deref(), Some("https://m/mcp"));
+        assert_eq!(c.mcp[1].headers["Authorization"], "Bearer t");
+        assert!(c.warnings.iter().any(|w| w.contains("`old`")));
         assert_eq!(c.rules.check("bash", "git status -s"), Some(Effect::Allow));
         assert_eq!(c.rules.check("bash", "rm x"), Some(Effect::Ask));
         assert_eq!(c.rules.check("write", "a.rs"), Some(Effect::Allow));
@@ -617,7 +643,11 @@ mod tests {
             ("zen", "big-pickle")
         );
         assert_eq!(c.declared_models("local"), vec!["my-model"]);
-        assert_eq!(c.mcp.len(), 1);
+        assert_eq!(c.mcp.len(), 2, "fs + deepwiki (github is disabled)");
+        assert_eq!(
+            c.mcp[1].url.as_deref(),
+            Some("https://mcp.deepwiki.com/mcp")
+        );
         assert_eq!(c.hooks.len(), 1);
         assert_eq!(c.rules.check("bash", "rm -rf x"), Some(Effect::Deny));
         assert!(c.warnings.is_empty(), "{:?}", c.warnings);

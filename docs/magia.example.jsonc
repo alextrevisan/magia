@@ -28,10 +28,19 @@
     }
   },
 
-  // MCP servers (stdio). Tools appear as mcp__<name>__<tool> and always ask for approval.
+  // MCP servers: local (stdio) or remote (Streamable HTTP). Tools appear as
+  // mcp__<name>__<tool> and always ask for approval.
   "mcp": {
     "servers": {
-      "fs": { "type": "local", "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."] }
+      "fs": { "type": "local", "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "."] },
+      "deepwiki": { "type": "remote", "url": "https://mcp.deepwiki.com/mcp" },
+      // Credentials go in headers, read from the environment (keep tokens out of git).
+      "github": {
+        "type": "remote",
+        "url": "https://api.githubcopilot.com/mcp/",
+        "headers": { "Authorization": "Bearer {env:GITHUB_TOKEN}" },
+        "enabled": false
+      }
     }
   },
 

@@ -33,7 +33,7 @@ async fn discovers_and_calls_tools() {
         name: "fake".into(),
         command: "python3".into(),
         args: vec!["-c".into(), SERVER.into()],
-        env: Default::default(),
+        ..Default::default()
     };
     let client = McpClient::connect(&cfg).await.unwrap();
     let tools = client.tools().await.unwrap();
