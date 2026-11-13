@@ -32,8 +32,14 @@ pub enum AgentEvent {
         is_error: bool,
     },
     Usage(Usage),
-    /// Informational (e.g. "context compacted").
+    /// Informational (e.g. "auto: allowed").
     Notice(String),
+    /// The older history was replaced by a summary: `history` is what is left (the summary
+    /// message first, then the recent messages kept verbatim); there were `before` messages.
+    Compacted {
+        before: usize,
+        history: Vec<Message>,
+    },
     Error(String),
     /// A request failed and will be repeated after `wait_secs`. When `discarded`, the text
     /// streamed so far in this response is thrown away (the repeat starts over).
@@ -133,6 +139,18 @@ const CHILD_MAX_STEPS: usize = 25;
 /// Subagents running at once; more `task` calls in one response wait for a free slot.
 pub const MAX_PARALLEL_SUBAGENTS: usize = 3;
 const SUMMARY_PREFIX: &str = "[Summary of the earlier conversation]";
+/// Ends the summary inside the first message; what follows is the user's own message, merged
+/// in to keep roles alternating. Sessions compacted before this existed have no marker.
+const SUMMARY_END: &str = "[End of summary]";
+
+/// A compaction summary message → `(summary, the user's message merged after it)`.
+pub fn split_summary(text: &str) -> Option<(&str, &str)> {
+    let body = text.strip_prefix(SUMMARY_PREFIX)?;
+    Some(match body.split_once(SUMMARY_END) {
+        Some((sum, rest)) => (sum.trim(), rest.trim()),
+        None => (body.trim(), ""),
+    })
+}
 
 /// How a round of the agent loop ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1264,10 +1282,11 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
             return;
         }
         match self.compact().await {
-            Ok(Some((before, after))) => {
-                let _ = events.send(AgentEvent::Notice(format!(
-                    "context compacted: {before} → {after} messages"
-                )));
+            Ok(Some((before, _))) => {
+                let _ = events.send(AgentEvent::Compacted {
+                    before,
+                    history: self.history.clone(),
+                });
             }
             Ok(None) => {}
             Err(e) => {
@@ -1292,7 +1311,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
             .summarize(render_transcript(&self.history[..cut]))
             .await?;
         let mut tail = self.history.split_off(cut);
-        let mut head = format!("{SUMMARY_PREFIX}\n{summary}");
+        let mut head = format!("{SUMMARY_PREFIX}\n{}\n{SUMMARY_END}", summary.trim());
         let mut images = Vec::new();
         if matches!(tail.first(), Some(Message::User { .. }))
             && let Message::User { text, images: i } = tail.remove(0)

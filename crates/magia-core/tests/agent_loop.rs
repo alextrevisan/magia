@@ -219,8 +219,9 @@ async fn auto_compaction_summarizes_old_history_and_keeps_tail() {
     }
     let ev = run(&mut agent, "latest question").await;
     assert!(
-        ev.iter()
-            .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("compacted")))
+        ev.iter().any(
+            |e| matches!(e, AgentEvent::Compacted { before: 11, history } if history.len() < 10)
+        )
     );
     assert!(
         matches!(&agent.history[0], Message::User { text, .. } if text.starts_with("[Summary") && text.contains("SUMMARY-OF-OLD"))
@@ -234,6 +235,11 @@ async fn auto_compaction_summarizes_old_history_and_keeps_tail() {
         matches!(agent.history.last(), Some(Message::Assistant { text, .. }) if text == "done")
     );
     let bodies = server.await.unwrap();
+    let Message::User { text, .. } = &agent.history[0] else {
+        panic!("summary first")
+    };
+    let (summary, _) = magia_core::split_summary(text).unwrap();
+    assert!(summary.contains("SUMMARY-OF-OLD") && !summary.contains("[End of summary]"));
     assert!(bodies[0].contains("<transcript>") && bodies[0].contains("Write the summary"));
     assert!(bodies[1].contains("SUMMARY-OF-OLD"));
 }

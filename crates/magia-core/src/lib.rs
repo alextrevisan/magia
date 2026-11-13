@@ -14,7 +14,7 @@ pub mod review;
 
 pub use agent::{
     Agent, AgentEvent, Approver, AutoApprove, FolderAnswer, MagiaPhase, REVIEW_PARENT, UserInput,
-    build_system_prompt,
+    build_system_prompt, split_summary,
 };
 pub use config::{Config, ProviderOverride, config_dir, config_path};
 pub use ext::{

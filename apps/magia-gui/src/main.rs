@@ -101,6 +101,8 @@ enum Item {
     Error(String),
     /// Magia mode started another round of the same request: "round N · why".
     Round(String),
+    /// What compaction wrote in place of the older messages.
+    Summary(String),
 }
 
 /// A call waiting for the user's yes or no.
@@ -1030,12 +1032,17 @@ impl App {
                 let (agent, tx, ctx) = (self.agent.clone(), self.tx.clone(), ctx.clone());
                 self.running = true;
                 self.rt.spawn(async move {
-                    let msg = match agent.lock().await.compact().await {
-                        Ok(Some((a, b))) => format!("context compacted: {a} → {b} messages"),
-                        Ok(None) => "nothing to compact yet".into(),
-                        Err(e) => format!("compaction failed: {e:#}"),
+                    let mut agent = agent.lock().await;
+                    let ev = match agent.compact().await {
+                        Ok(Some((before, _))) => AgentEvent::Compacted {
+                            before,
+                            history: agent.history.clone(),
+                        },
+                        Ok(None) => AgentEvent::Notice("nothing to compact yet".into()),
+                        Err(e) => AgentEvent::Notice(format!("compaction failed: {e:#}")),
                     };
-                    let _ = tx.send(UiMsg::Agent(AgentEvent::Notice(msg)));
+                    drop(agent);
+                    let _ = tx.send(UiMsg::Agent(ev));
                     let _ = tx.send(UiMsg::Agent(AgentEvent::TurnDone));
                     ctx.request_repaint();
                 });
@@ -1404,6 +1411,13 @@ impl App {
                             self.tokens.1 += u.output_tokens;
                         }
                         AgentEvent::Notice(n) => self.status = n,
+                        AgentEvent::Compacted { before, history } => {
+                            // Show what the model sees now: the summary, then what was kept.
+                            self.status =
+                                format!("context compacted: {before} → {} messages", history.len());
+                            self.items = items_from_history(&history, &self.cwd);
+                            self.heights.clear();
+                        }
                         AgentEvent::Error(e) => self.items.push(Item::Error(e)),
                         AgentEvent::Magia(_) | AgentEvent::SubTool { .. } => {}
                         AgentEvent::Round { n, reason } => {
@@ -2539,6 +2553,25 @@ fn render_item(ui: &mut egui::Ui, n: usize, it: &Item, prev: Option<&Item>) {
                     }
                 });
         }
+        Item::Summary(text) => {
+            ui.add_space(10.0);
+            let head = egui::RichText::new("Summary of the earlier conversation")
+                .size(theme::SMALL)
+                .color(t.accent);
+            egui::CollapsingHeader::new(head)
+                .id_salt(("summary", n))
+                .show(ui, |ui| {
+                    egui::Frame::new()
+                        .stroke(egui::Stroke::new(1.0, t.line))
+                        .corner_radius(egui::CornerRadius::same(8))
+                        .inner_margin(egui::Margin::symmetric(14, 10))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            markdown::show(ui, text, n);
+                        });
+                });
+            ui.add_space(4.0);
+        }
         Item::Round(label) => {
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -2650,6 +2683,17 @@ fn items_from_history(history: &[Message], cwd: &std::path::Path) -> Vec<Item> {
             Message::User { .. } if magia_mode::is_continuation(m) => {
                 round += 1;
                 items.push(Item::Round(format!("round {round} · continued")));
+            }
+            Message::User { text, images } if magia_core::split_summary(text).is_some() => {
+                let (summary, rest) = magia_core::split_summary(text).unwrap_or_default();
+                round = 1;
+                items.push(Item::Summary(summary.to_owned()));
+                if !rest.is_empty() || !images.is_empty() {
+                    items.push(Item::User(
+                        rest.to_owned(),
+                        images.iter().map(composer::image_label).collect(),
+                    ));
+                }
             }
             Message::User { text, images } => {
                 round = 1;
@@ -2825,6 +2869,27 @@ mod tests {
             Message::user(format!("{}\nkeep going", magia_mode::CONTINUE_PREFIX)),
         ];
         assert_eq!(sent_messages(&h), ["look at @a.txt", "next"]);
+    }
+
+    #[test]
+    fn a_compacted_history_shows_the_summary_then_what_was_kept() {
+        let h = vec![
+            Message::user(
+                "[Summary of the earlier conversation]\nwe fixed X\n[End of summary]\n\nnow do Y",
+            ),
+            Message::Assistant {
+                text: "ok".into(),
+                tool_calls: vec![],
+            },
+        ];
+        let items = items_from_history(&h, std::path::Path::new("/p"));
+        assert!(matches!(&items[0], Item::Summary(s) if s == "we fixed X"));
+        assert!(matches!(&items[1], Item::User(t, _) if t == "now do Y"));
+        assert!(matches!(&items[2], Item::Assistant { text, .. } if text == "ok"));
+        // Older sessions have no end marker: all of it is the summary.
+        let old = [Message::user("[Summary of the earlier conversation]\nlots")];
+        let items = items_from_history(&old, std::path::Path::new("/p"));
+        assert!(matches!(&items[..], [Item::Summary(s)] if s == "lots"));
     }
 
     #[test]

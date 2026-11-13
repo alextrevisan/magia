@@ -309,6 +309,10 @@ async fn real_main() -> Result<()> {
                     eprintln!("\nerror: {e}")
                 }
                 AgentEvent::Notice(n) => eprintln!("\n[{n}]"),
+                AgentEvent::Compacted { before, history } => eprintln!(
+                    "\n[context compacted: {before} → {} messages]",
+                    history.len()
+                ),
                 AgentEvent::Round { n, reason } => eprintln!("\n── round {n} · {reason} ──"),
                 AgentEvent::Retry {
                     attempt,
