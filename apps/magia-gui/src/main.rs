@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 mod clipboard;
 mod composer;
 mod markdown;
+mod model_picker;
 mod resume;
 mod theme;
 
@@ -137,6 +138,7 @@ struct App {
     /// Project files for `@` (loaded when the list opens).
     files: Vec<String>,
     models: Vec<String>,
+    model_picker: model_picker::ModelPicker,
     status: String,
     tokens: (u64, u64),
     /// Cached rendered height per item (0 = not measured yet); drives the virtualized list.
@@ -247,6 +249,7 @@ impl App {
             catalog: vec![],
             files: vec![],
             models: vec![],
+            model_picker: Default::default(),
             status,
             tokens: (0, 0),
             heights: vec![],
@@ -840,41 +843,14 @@ impl App {
                             })
                             .response
                             .on_hover_text("Provider");
-                        let r = ui.add(
-                            egui::TextEdit::singleline(&mut self.cfg.model)
-                                .font(theme::mono(theme::MONO))
-                                .hint_text("model id")
-                                .vertical_align(egui::Align::Center)
-                                .min_size(egui::vec2(200.0, BAR_H))
-                                .desired_width(200.0),
-                        );
-                        changed |= r.lost_focus() && r.changed();
-                        let models = egui::Button::new("▾").min_size(egui::vec2(BAR_H, BAR_H));
-                        egui::containers::menu::MenuButton::from_button(models)
-                            .ui(ui, |ui| {
-                                ui.set_min_width(260.0);
-                                if self.models.is_empty() {
-                                    ui.weak("No model list yet: check the provider key");
-                                }
-                                egui::ScrollArea::vertical()
-                                    .max_height(360.0)
-                                    .show(ui, |ui| {
-                                        for m in self.models.clone() {
-                                            let label = egui::RichText::new(&m)
-                                                .font(theme::mono(theme::MONO));
-                                            if ui
-                                                .selectable_label(self.cfg.model == m, label)
-                                                .clicked()
-                                            {
-                                                self.cfg.model = m;
-                                                changed = true;
-                                                ui.close();
-                                            }
-                                        }
-                                    });
-                            })
-                            .0
-                            .on_hover_text("Models offered by the provider");
+                        if let Some(m) =
+                            self.model_picker
+                                .show(ui, &self.cfg.model, &self.models, 230.0)
+                            && m != self.cfg.model
+                        {
+                            self.cfg.model = m;
+                            changed = true;
+                        }
                         let mut picked = None;
                         let opened = egui::ComboBox::from_id_salt("agent")
                             .selected_text(
