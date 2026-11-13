@@ -927,10 +927,12 @@ impl App {
                         if opened {
                             self.refresh_catalog(ctx); // pick up .md files added since
                         }
-                        if let Some(name) = picked
-                            && name != self.cfg.agent
-                        {
-                            self.select_agent(name, ctx);
+                        if let Some(name) = picked {
+                            if name != self.cfg.agent {
+                                self.select_agent(name, ctx);
+                            } else if name == agents::MAGIA {
+                                self.magic.start(ctx); // picked again: cast it again
+                            }
                         }
                         let before = self.cfg.permission_mode;
                         let (mode_name, mode_color) = mode_style(self.cfg.permission_mode, &t);

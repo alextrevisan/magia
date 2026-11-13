@@ -14,16 +14,22 @@ const TURNS: f32 = 3.0;
 pub struct Spin {
     /// `ctx` time when the current spin started.
     started: Option<f64>,
+    /// Asked to spin; the clock starts at the next painted frame, so a slow first frame (the
+    /// app opening) does not eat the animation.
+    pending: bool,
 }
 
 impl Spin {
     pub fn start(&mut self, ctx: &egui::Context) {
-        self.started = Some(ctx.input(|i| i.time));
+        self.pending = true;
         ctx.request_repaint();
     }
 
     /// Rotation now (radians) and how strong the glow is (0 when still).
     fn phase(&mut self, ctx: &egui::Context) -> (f32, f32) {
+        if std::mem::take(&mut self.pending) {
+            self.started = Some(ctx.input(|i| i.time));
+        }
         let Some(t0) = self.started else {
             return (0.0, 0.0);
         };
@@ -123,5 +129,69 @@ mod tests {
         assert!(p.first().unwrap().distance(*p.last().unwrap()) < 0.01);
         assert!(p.iter().all(|q| r.expand(0.01).contains(*q)));
         assert!(p.windows(2).all(|w| w[0].distance(w[1]) <= 4.01));
+    }
+}
+
+#[cfg(test)]
+mod spin_tests {
+    use super::*;
+    use egui_kittest::Harness;
+    use egui_kittest::kittest::Queryable;
+
+    #[derive(Default)]
+    struct S {
+        spin: Spin,
+        agent: String,
+        phases: Vec<f32>,
+    }
+
+    #[test]
+    fn picking_magia_again_spins() {
+        let mut h = Harness::new_ui_state(
+            |ui, s: &mut S| {
+                let mut picked = None;
+                let r = egui::ComboBox::from_id_salt("agent")
+                    .selected_text(s.agent.clone())
+                    .show_ui(ui, |ui| {
+                        for n in ["build", "magia"] {
+                            if ui.selectable_label(s.agent == n, n).clicked() {
+                                picked = Some(n.to_owned());
+                            }
+                        }
+                    })
+                    .response;
+                if s.agent == "magia" {
+                    let (p, _) = s.spin.phase(ui.ctx());
+                    s.phases.push(p);
+                    s.spin.paint(ui, r.rect, &[Color32::RED; 4]);
+                }
+                // Same rule as the app: picking Magia spins, even when it is already selected.
+                if let Some(n) = picked {
+                    if n == "magia" {
+                        s.spin.start(ui.ctx());
+                    }
+                    s.agent = n;
+                }
+            },
+            S {
+                agent: "magia".into(),
+                ..Default::default()
+            },
+        );
+        h.run();
+        assert!(
+            h.state().phases.iter().all(|x| *x == 0.0),
+            "still until asked"
+        );
+        h.state_mut().phases.clear();
+        h.get_by_role(egui::accesskit::Role::ComboBox).click();
+        h.run();
+        h.get_by_label("magia").click();
+        for _ in 0..30 {
+            h.step();
+        }
+        let p = &h.state().phases;
+        assert!(p.iter().any(|x| *x > 0.0), "spins: {p:?}");
+        assert_eq!(p.last(), Some(&0.0), "and stops: {p:?}");
     }
 }
