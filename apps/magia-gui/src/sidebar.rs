@@ -23,6 +23,10 @@ pub enum Action {
     AddProject,
     /// Search every conversation (`/resume` over all folders).
     Search,
+    /// Pick a reference folder for this project.
+    AddReference(PathBuf),
+    /// Stop using a reference folder: (project, folder).
+    RemoveReference(PathBuf, PathBuf),
 }
 
 #[derive(Default)]
@@ -33,6 +37,8 @@ pub struct Sidebar {
     toggled: HashSet<PathBuf>,
     /// Projects (and `chats_root` for the chat list) showing every conversation.
     expanded: HashSet<PathBuf>,
+    /// Reference folders per project.
+    refs: std::collections::HashMap<PathBuf, Vec<PathBuf>>,
 }
 
 /// A project folder and its conversations, most recent first.
@@ -96,6 +102,27 @@ impl Sidebar {
         self.sessions = Some(sessions);
     }
 
+    pub fn set_references(&mut self, refs: Vec<(PathBuf, Vec<PathBuf>)>) {
+        self.refs = refs.into_iter().collect();
+    }
+
+    pub fn references_of(&self, project: &Path) -> Vec<PathBuf> {
+        self.refs
+            .get(&magia_store::canonical(project))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Show a change at once, before the file is saved and read back.
+    pub fn set_project_references(&mut self, project: &Path, refs: Vec<PathBuf>) {
+        let key = magia_store::canonical(project);
+        if refs.is_empty() {
+            self.refs.remove(&key);
+        } else {
+            self.refs.insert(key, refs);
+        }
+    }
+
     /// Draw the bar. `current` = the open session file.
     pub fn show(
         &mut self,
@@ -139,19 +166,45 @@ impl Sidebar {
                     let open = (p.dir == here) != self.toggled.contains(&p.dir);
                     let label = format!("{}  {}", if open { "▾" } else { "▸" }, name_of(&p.dir));
                     let (r, plus) = row(ui, &label, 0.0, false, t.fg, Some("＋"));
+                    let r = r.on_hover_text(format!(
+                        "{}\n＋ starts a new conversation here · right-click for reference folders",
+                        p.dir.display()
+                    ));
+                    r.context_menu(|ui| {
+                        if ui.button("Add reference folder…").clicked() {
+                            act = Some(Action::AddReference(p.dir.clone()));
+                            ui.close();
+                        }
+                        ui.label(
+                            egui::RichText::new("Read without asking; writing there asks.")
+                                .size(theme::SMALL)
+                                .color(t.muted),
+                        );
+                    });
                     if plus {
                         act = Some(Action::NewIn(p.dir.clone()));
-                    } else if r
-                        .on_hover_text(format!(
-                            "{}\n＋ starts a new conversation here",
-                            p.dir.display()
-                        ))
-                        .clicked()
-                    {
+                    } else if r.clicked() {
                         toggle(&mut self.toggled, &p.dir);
                     }
                     if !open {
                         continue;
+                    }
+                    for rd in self.refs.get(&p.dir).into_iter().flatten() {
+                        let label = format!("⧉  {}", name_of(rd));
+                        let (rr, remove) = row(ui, &label, INDENT, false, t.muted, Some("×"));
+                        let rr = rr.on_hover_text(format!(
+                            "Reference folder (read freely, writes ask)\n{}\n× stops using it",
+                            rd.display()
+                        ));
+                        if remove {
+                            act = Some(Action::RemoveReference(p.dir.clone(), rd.clone()));
+                        }
+                        rr.context_menu(|ui| {
+                            if ui.button("Stop using this reference folder").clicked() {
+                                act = Some(Action::RemoveReference(p.dir.clone(), rd.clone()));
+                                ui.close();
+                            }
+                        });
                     }
                     if p.sessions.is_empty() {
                         ui.label(

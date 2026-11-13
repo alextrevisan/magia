@@ -112,12 +112,16 @@ pub fn config_path() -> PathBuf {
     first_existing(&config_dir(), "magia").unwrap_or_else(|| config_dir().join("magia.json"))
 }
 
-fn state_path() -> PathBuf {
+/// magia's own state (`~/.local/state/magia`): last GUI choices, per-project settings.
+pub(crate) fn state_dir() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".local/state"))
         .join("magia")
-        .join("state.json")
+}
+
+fn state_path() -> PathBuf {
+    state_dir().join("state.json")
 }
 
 fn first_existing(dir: &Path, stem: &str) -> Option<PathBuf> {

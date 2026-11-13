@@ -1733,3 +1733,64 @@ async fn a_deny_is_for_one_call_and_reset_forgets_always_answers() {
     let bodies = server.await.unwrap();
     assert!(bodies[2].contains("asks for it again"));
 }
+
+#[tokio::test]
+async fn reference_folders_are_read_freely_but_writing_there_asks() {
+    use magia_core::FolderAnswer;
+    let project = tempfile::tempdir().unwrap();
+    let refs = tempfile::tempdir().unwrap();
+    let r = std::fs::canonicalize(refs.path()).unwrap();
+    std::fs::write(r.join("spec.md"), "the spec").unwrap();
+    let (url, server) = serve(vec![
+        tool_reply(&[
+            (
+                "r1",
+                "read",
+                &format!(r#"{{"file_path":"{}"}}"#, r.join("spec.md").display()),
+            ),
+            (
+                "g1",
+                "grep",
+                &format!(r#"{{"pattern":"spec","path":"{}"}}"#, r.display()),
+            ),
+        ]),
+        tool_reply(&[(
+            "w1",
+            "write",
+            &format!(
+                r#"{{"file_path":"{}","content":"x"}}"#,
+                r.join("new.md").display()
+            ),
+        )]),
+        text_reply("done"),
+    ])
+    .await;
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::AcceptEdits,
+        project.path().into(),
+    );
+    agent.reference_dirs = vec![r.clone()];
+    let a = FolderApprover {
+        answers: std::sync::Mutex::new(vec![FolderAnswer::Deny]),
+        asked: Default::default(),
+    };
+    let out = tool_outputs(&run_with(&mut agent, "use the spec", &a).await);
+    assert!(
+        !out[0].1 && out[0].0.contains("the spec"),
+        "read without asking: {out:?}"
+    );
+    assert!(!out[1].1, "grep without asking: {out:?}");
+    assert!(out[2].1, "the write was refused: {out:?}");
+    assert_eq!(
+        *a.asked.lock().unwrap(),
+        vec![vec![r.clone()]],
+        "only the write asked"
+    );
+    assert!(!r.join("new.md").exists());
+    let bodies = server.await.unwrap();
+    assert!(
+        bodies[0].contains("Reference folders") && bodies[0].contains(&r.display().to_string())
+    );
+}

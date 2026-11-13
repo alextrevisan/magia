@@ -9,6 +9,7 @@ mod hooks;
 mod jsonc;
 pub mod magia_mode;
 pub mod media;
+pub mod projects;
 pub mod review;
 
 pub use agent::{

@@ -50,6 +50,10 @@ enum UiMsg {
     Recent(Vec<PathBuf>),
     /// Every saved session, for the left bar.
     SessionList(Vec<magia_store::SessionInfo>),
+    /// Reference folders of every project, for the left bar.
+    References(Vec<(PathBuf, Vec<PathBuf>)>),
+    /// The folder dialog's answer when picking a reference folder for (project).
+    ReferencePicked(PathBuf, Result<Option<PathBuf>, String>),
     /// The folder dialog's answer (`None` = cancelled).
     Folder(Result<Option<PathBuf>, String>),
     /// A `/btw` answer, by question number: a piece of text, or the end (with any error).
@@ -465,6 +469,7 @@ impl App {
         self.rt.spawn_blocking(move || {
             let list = magia_store::list(&sessions_dir(), magia_store::Scope::All);
             let _ = tx.send(UiMsg::SessionList(list));
+            let _ = tx.send(UiMsg::References(magia_core::projects::all_references()));
             ctx.request_repaint();
         });
     }
@@ -512,11 +517,69 @@ impl App {
                 self.resume_path(&path, ctx);
             }
             sidebar::Action::AddProject => self.pick_folder(ctx),
+            sidebar::Action::AddReference(project) => {
+                let (tx, ctx, start) = (self.tx.clone(), ctx.clone(), project.clone());
+                self.rt.spawn(async move {
+                    let r = folder::pick(&start).await.map_err(|e| format!("{e:#}"));
+                    let _ = tx.send(UiMsg::ReferencePicked(project, r));
+                    ctx.request_repaint();
+                });
+            }
+            sidebar::Action::RemoveReference(project, dir) => {
+                let mut refs = self.nav.references_of(&project);
+                refs.retain(|r| *r != dir);
+                self.save_references(project, refs);
+                self.status = format!("stopped using {} as a reference", dir.display());
+            }
             sidebar::Action::Search => {
                 let current = self.current_session.clone();
                 self.resume = Some(resume::Picker::new(&self.cwd, "", current));
             }
         }
+    }
+
+    /// Add `dir` to `project`'s reference folders (unless it is the project or inside it).
+    fn add_reference(&mut self, project: PathBuf, refs: &mut Vec<PathBuf>, dir: PathBuf) {
+        let dir = magia_store::canonical(&dir);
+        let proj = magia_store::canonical(&project);
+        if dir.starts_with(&proj) {
+            self.status = "that folder is already part of the project".into();
+            return;
+        }
+        if refs.contains(&dir) {
+            self.status = format!("{} is already a reference folder", dir.display());
+            return;
+        }
+        refs.push(dir.clone());
+        self.save_references(project, refs.clone());
+        self.status = format!(
+            "{} is a reference folder of {}: read freely, writing there asks",
+            tilde(&dir).display(),
+            sidebar::name_of(&proj)
+        );
+    }
+
+    /// Save a project's reference folders (off the UI thread) and give them to the open
+    /// agent when it is that project. Not while a request runs: the agent is busy.
+    fn save_references(&mut self, project: PathBuf, refs: Vec<PathBuf>) {
+        if magia_store::canonical(&project) == magia_store::canonical(&self.cwd) {
+            match self.agent.try_lock() {
+                Ok(mut a) => a.reference_dirs = refs.clone(),
+                Err(_) => {
+                    self.status = "busy — change reference folders when the request ends".into();
+                    return;
+                }
+            }
+        }
+        self.nav.set_project_references(&project, refs.clone());
+        let tx = self.tx.clone();
+        self.rt.spawn_blocking(move || {
+            if let Err(e) = magia_core::projects::set_references(&project, &refs) {
+                let _ = tx.send(UiMsg::Status(format!(
+                    "could not save reference folders: {e:#}"
+                )));
+            }
+        });
     }
 
     /// Show or hide the left bar (remembered for the next start).
@@ -977,6 +1040,44 @@ impl App {
                     ctx.request_repaint();
                 });
             }
+            "reference" => {
+                let rest = input.trim_start()["/reference".len()..].trim();
+                let project = self.cwd.clone();
+                let mut refs = self.nav.references_of(&project);
+                if let Some(path) = rest.strip_prefix("add ") {
+                    match folder::resolve(path, &self.cwd) {
+                        Ok(dir) => self.add_reference(project, &mut refs, dir),
+                        Err(e) => self.status = format!("{e:#}"),
+                    }
+                } else if let Some(path) = rest.strip_prefix("remove ") {
+                    let target = folder::resolve(path, &self.cwd)
+                        .unwrap_or_else(|_| PathBuf::from(path.trim()));
+                    let before = refs.len();
+                    refs.retain(|r| *r != target);
+                    if refs.len() == before {
+                        self.status = format!("{} is not a reference folder", target.display());
+                    } else {
+                        self.save_references(project, refs);
+                        self.status = format!("stopped using {} as a reference", target.display());
+                    }
+                } else if rest == "add" || rest.is_empty() && refs.is_empty() {
+                    let (tx, ctx2, start) = (self.tx.clone(), ctx.clone(), project.clone());
+                    self.rt.spawn(async move {
+                        let r = folder::pick(&start).await.map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(UiMsg::ReferencePicked(project, r));
+                        ctx2.request_repaint();
+                    });
+                } else {
+                    let list: Vec<String> = refs
+                        .iter()
+                        .map(|r| tilde(r).display().to_string())
+                        .collect();
+                    self.status = format!(
+                        "reference folders: {} · /reference add <path> · /reference remove <path>",
+                        list.join(", ")
+                    );
+                }
+            }
             "permissions" => {
                 let Ok(mut a) = self.agent.try_lock() else {
                     self.status = busy.into();
@@ -1202,6 +1303,15 @@ impl App {
                 UiMsg::History(h) => self.composer.load_history(h),
                 UiMsg::Recent(r) => self.recent = r,
                 UiMsg::SessionList(list) => self.nav.set_sessions(list),
+                UiMsg::References(r) => self.nav.set_references(r),
+                UiMsg::ReferencePicked(project, Ok(Some(dir))) => {
+                    let mut refs = self.nav.references_of(&project);
+                    self.add_reference(project, &mut refs, dir);
+                }
+                UiMsg::ReferencePicked(_, Ok(None)) => {}
+                UiMsg::ReferencePicked(_, Err(e)) => {
+                    self.status = format!("{e}; type /reference add <path> instead");
+                }
                 UiMsg::Btw(n, update) => {
                     if let Some(b) = self.btw.as_mut().filter(|b| b.n == n) {
                         match update {
@@ -2297,6 +2407,11 @@ const BUILTINS: &[(&str, &str, &str)] = &[
         "open",
         "Work in another folder (no path: the folder dialog)",
         "[path]",
+    ),
+    (
+        "reference",
+        "Reference folders of this project: read freely, writing there asks (no argument: list, or pick one)",
+        "[add|remove <path>]",
     ),
     (
         "permissions",

@@ -210,6 +210,9 @@ pub struct Agent {
     pub allowed_dirs: Arc<std::sync::Mutex<Vec<PathBuf>>>,
     /// Folders outside the project refused for this session (shared with subagents).
     pub denied_dirs: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    /// The project's reference folders (`crate::projects`): read without asking; writing or
+    /// running commands there asks like any folder outside the project.
+    pub reference_dirs: Vec<PathBuf>,
     pub client: Client,
     pub model: String,
     pub mode: PermissionMode,
@@ -280,6 +283,7 @@ impl Agent {
             side: Default::default(),
             allowed_dirs: Default::default(),
             denied_dirs: Default::default(),
+            reference_dirs: Vec::new(),
             retry_delay: RETRY_DELAY,
             project_instructions,
             reviewed: Default::default(),
@@ -297,6 +301,7 @@ impl Agent {
         self.cx.sandbox = cfg.sandbox;
         self.rules = cfg.rules.clone();
         self.auto_model = cfg.auto_model.clone();
+        self.reference_dirs = crate::projects::references(&self.cx.cwd);
         self.add_instructions(&cfg.instructions);
     }
 
@@ -413,7 +418,18 @@ impl Agent {
                 .and_then(|v| v.as_str().map(str::to_owned))
                 .unwrap_or_default(),
             self.cx.cwd.display()
-        )
+        ) + &self.references_note()
+    }
+
+    fn references_note(&self) -> String {
+        if self.reference_dirs.is_empty() {
+            return String::new();
+        }
+        let mut s = "\n- Reference folders (read them freely for context; they are not part of the project: do not write there unless the user asks, and any write asks the user first):".to_owned();
+        for d in &self.reference_dirs {
+            s.push_str(&format!("\n  - {}", d.display()));
+        }
+        s
     }
 
     /// Whether this request runs in Magia rounds.
@@ -863,6 +879,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
             cwd: self.cx.cwd.clone(),
             allowed_dirs: self.allowed_dirs.clone(),
             denied_dirs: self.denied_dirs.clone(),
+            reference_dirs: self.reference_dirs.clone(),
         }
     }
 
@@ -908,11 +925,19 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
         if self.mode == PermissionMode::Yolo {
             return vec![];
         }
-        let granted = self
+        let mut granted = self
             .allowed_dirs
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
+        // Reference folders are open for reading only.
+        if self.tools.get(&call.name).is_some_and(|t| t.read_only()) {
+            granted.extend(
+                self.reference_dirs
+                    .iter()
+                    .map(|d| magia_store::canonical(d)),
+            );
+        }
         magia_tools::outside::folders(&call.name, &call.arguments, &self.cx.cwd, &granted)
     }
 
@@ -1599,6 +1624,7 @@ struct ChildBase {
     /// The parent's folders outside the project that the user allowed or refused.
     allowed_dirs: Arc<std::sync::Mutex<Vec<PathBuf>>>,
     denied_dirs: Arc<std::sync::Mutex<Vec<PathBuf>>>,
+    reference_dirs: Vec<PathBuf>,
 }
 
 fn run_subagent(
@@ -1615,12 +1641,14 @@ fn run_subagent(
         cwd,
         allowed_dirs,
         denied_dirs,
+        reference_dirs,
     } = base;
     async move {
         let mut child = Agent::new(client, model, PermissionMode::Plan, cwd);
         child.is_child = true;
         child.allowed_dirs = allowed_dirs;
         child.denied_dirs = denied_dirs;
+        child.reference_dirs = reference_dirs;
         child.compact_at_tokens = 0;
         child.system.push_str("\n\n");
         child.system.push_str(role);
