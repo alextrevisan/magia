@@ -256,6 +256,8 @@ Medições (release, x86-64 baseline = sse2): CLI 4,5 MB / 8 MB RSS; GUI ≈20 M
 
 Config JSON: implementados `model`, `provider(s)` (baseURL/apiKey/headers/npm/env/models), `mcp` local, `permission(s)` com padrões, `instructions` (arquivos/globs), `command(s)`. Ignorados: `agent(s)`, `lsp`, `formatter`, `plugin`, `mcp` remoto (aviso), `skills.urls`, URLs em `instructions`.
 
+Pasta do projeto na GUI (2026-11-13): o nome da pasta no topo é um menu com "Open folder…" (diálogo do sistema: no Linux o portal `FileChooser` via zbus, que já vinha do fastframe; no Windows/macOS `rfd`, sem a feature GTK) e as pastas de sessões anteriores. `/open [caminho]` (aceita `~` e caminho relativo) e `magia-gui <pasta>` também abrem. Trocar de pasta recarrega config, agentes, MCP e começa uma sessão nova lá (`apps/magia-gui/src/folder.rs`, `App::open_folder`).
+
 Modo Magia (2026-11-12): agente `magia` (GUI, `--agent magia` no CLI) que trabalha em rounds até a lista de tarefas fechar, com revisão independente dos arquivos alterados; detalhes em §3.1. Seletor de modelos da GUI agora é um botão com lista pesquisável (`model_picker.rs`; Enter sem resultado usa o id digitado).
 
 Ferramentas (2026-11-11): adicionadas `webfetch` (HTML→texto próprio, corpo limitado a 2 MB), `websearch` (página HTML do DuckDuckGo; pode exigir captcha sob uso intenso) e `question`; a lista enviada ao modelo agora é filtrada pelo modo, pelas regras e por ser subagente.

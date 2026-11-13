@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 mod activity;
 mod clipboard;
 mod composer;
+mod folder;
 mod magic;
 mod markdown;
 mod model_picker;
@@ -44,6 +45,10 @@ enum UiMsg {
     History(Vec<String>),
     /// Results of a `/resume` search: (generation, hits).
     Sessions(u64, Vec<magia_store::Hit>),
+    /// Folders of earlier sessions, for the folder menu.
+    Recent(Vec<PathBuf>),
+    /// The folder dialog's answer (`None` = cancelled).
+    Folder(Result<Option<PathBuf>, String>),
 }
 
 /// RGBA preview: width, height, pixels.
@@ -163,6 +168,69 @@ struct App {
     agents: Vec<FileAgent>,
     /// Mode to go back to when leaving the `plan` agent.
     mode_before_plan: PermissionMode,
+    /// Folders of earlier sessions (the folder menu).
+    recent: Vec<PathBuf>,
+}
+
+/// What depends on the project folder: its config layers, agent files and a fresh agent.
+struct Loaded {
+    agent: Agent,
+    cfg: Config,
+    file_agents: Vec<FileAgent>,
+    status: String,
+    mode_before_plan: PermissionMode,
+}
+
+impl Loaded {
+    /// Reads the folder's config and agent files: call before the first frame or off it.
+    fn new(cwd: &std::path::Path) -> Self {
+        let (cfg, status) = match Config::load_from(cwd) {
+            Ok(c) => {
+                let w = c.warnings.join("; ");
+                (c, w)
+            }
+            Err(e) => (Config::default(), format!("config error: {e:#}")),
+        };
+        let client = Client::new(
+            cfg.provider_config(&cfg.provider)
+                .or_else(|_| cfg.provider_config("zen"))
+                .expect("zen preset"),
+        )
+        .expect("http client");
+        let mut agent = Agent::new(client, cfg.model.clone(), cfg.permission_mode, cwd.into());
+        agent.configure(&cfg);
+        agent.store = SessionFile::create_for(&sessions_dir(), cwd).ok();
+        let mut status = status;
+        let mut cfg = cfg;
+        let file_agents = agents::discover_agents(cwd);
+        match cfg.agent.as_str() {
+            agents::BUILD => {}
+            agents::PLAN => agent.mode = PermissionMode::Plan,
+            agents::MAGIA => agent.magia = Some(cfg.magia_mode),
+            name => match file_agents.iter().find(|a| a.name == name) {
+                Some(fa) => match agents::load_agent(fa) {
+                    Ok(text) => agent.persona = Some((fa.name.clone(), text)),
+                    Err(e) => status = format!("{e:#}"),
+                },
+                // Last used in another folder: this one has no such file.
+                None => cfg.agent = agents::BUILD.into(),
+            },
+        }
+        let mode_before_plan = match cfg.permission_mode {
+            PermissionMode::Plan => PermissionMode::Ask,
+            m => m,
+        };
+        if cfg.agent == agents::PLAN {
+            cfg.permission_mode = PermissionMode::Plan;
+        }
+        Self {
+            agent,
+            cfg,
+            file_agents,
+            status,
+            mode_before_plan,
+        }
+    }
 }
 
 const PROVIDERS: [&str; 3] = ["zen", "go", "openrouter"];
@@ -200,47 +268,20 @@ impl App {
                 .build()
                 .expect("tokio runtime"),
         );
-        let (cfg, status) = match Config::load() {
-            Ok(c) => {
-                let w = c.warnings.join("; ");
-                (c, w)
-            }
-            Err(e) => (Config::default(), format!("config error: {e:#}")),
-        };
+        // `magia-gui <folder>` opens that folder.
+        if let Some(dir) = std::env::args().skip(1).find(|a| !a.starts_with("--"))
+            && let Err(e) = std::env::set_current_dir(&dir)
+        {
+            eprintln!("magia-gui: {dir}: {e}");
+        }
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let client = Client::new(
-            cfg.provider_config(&cfg.provider)
-                .or_else(|_| cfg.provider_config("zen"))
-                .expect("zen preset"),
-        )
-        .expect("http client");
-        let mut agent = Agent::new(client, cfg.model.clone(), cfg.permission_mode, cwd.clone());
-        agent.configure(&cfg);
-        agent.store = SessionFile::create_for(&sessions_dir(), &cwd).ok();
-        let mut status = status;
-        let mut cfg = cfg;
-        // Before the first frame, so reading the file here does not stall `update()`.
-        let file_agents = agents::discover_agents(&cwd);
-        match cfg.agent.as_str() {
-            agents::BUILD => {}
-            agents::PLAN => agent.mode = PermissionMode::Plan,
-            agents::MAGIA => agent.magia = Some(cfg.magia_mode),
-            name => match file_agents.iter().find(|a| a.name == name) {
-                Some(fa) => match agents::load_agent(fa) {
-                    Ok(text) => agent.persona = Some((fa.name.clone(), text)),
-                    Err(e) => status = format!("{e:#}"),
-                },
-                // Last used in another folder: this one has no such file.
-                None => cfg.agent = agents::BUILD.into(),
-            },
-        }
-        let mode_before_plan = match cfg.permission_mode {
-            PermissionMode::Plan => PermissionMode::Ask,
-            m => m,
-        };
-        if cfg.agent == agents::PLAN {
-            cfg.permission_mode = PermissionMode::Plan;
-        }
+        let Loaded {
+            agent,
+            cfg,
+            file_agents,
+            status,
+            mode_before_plan,
+        } = Loaded::new(&cwd);
         let todos = agent.cx.todos.clone();
         let (tx, rx) = unbounded_channel();
         let mut app = Self {
@@ -275,24 +316,9 @@ impl App {
             todos,
             agents: file_agents,
             mode_before_plan,
+            recent: vec![],
         };
-        app.refresh_models(&cc.egui_ctx);
-        if app.cfg.agent == agents::MAGIA {
-            app.magic.start(&cc.egui_ctx);
-        }
-        app.start_mcp(&cc.egui_ctx);
-        app.refresh_catalog(&cc.egui_ctx);
-        // ↑ works from the first frame: earlier messages of this folder's latest session.
-        {
-            let (tx, ctx, cwd) = (app.tx.clone(), cc.egui_ctx.clone(), app.cwd.clone());
-            app.rt.spawn_blocking(move || {
-                let latest = magia_store::SessionFile::latest_for(&sessions_dir(), &cwd);
-                if let Some(h) = latest.and_then(|s| s.load().ok()) {
-                    let _ = tx.send(UiMsg::History(sent_messages(&h)));
-                    ctx.request_repaint();
-                }
-            });
-        }
+        app.folder_opened(&cc.egui_ctx);
         // `magia-gui --resume`: reopen this folder's most recent session.
         if std::env::args().any(|a| a == "--resume")
             && let Some(latest) = magia_store::SessionFile::latest_for(&sessions_dir(), &app.cwd)
@@ -309,6 +335,71 @@ impl App {
             }
         }
         app
+    }
+
+    /// Background work after a folder is (re)opened: models, MCP servers, `/` catalog, the
+    /// composer history of the folder's latest session and the recent-folders menu.
+    fn folder_opened(&mut self, ctx: &egui::Context) {
+        self.refresh_models(ctx);
+        if self.cfg.agent == agents::MAGIA {
+            self.magic.start(ctx);
+        }
+        self.start_mcp(ctx);
+        self.refresh_catalog(ctx);
+        let (tx, ctx, cwd) = (self.tx.clone(), ctx.clone(), self.cwd.clone());
+        self.rt.spawn_blocking(move || {
+            // ↑ works from the first frame: earlier messages of this folder's latest session.
+            let latest = magia_store::SessionFile::latest_for(&sessions_dir(), &cwd);
+            if let Some(h) = latest.and_then(|s| s.load().ok()) {
+                let _ = tx.send(UiMsg::History(sent_messages(&h)));
+            }
+            let _ = tx.send(UiMsg::Recent(folder::recent(&sessions_dir(), &cwd)));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Show the system folder dialog; the answer comes back as `UiMsg::Folder`.
+    fn pick_folder(&mut self, ctx: &egui::Context) {
+        let (tx, ctx, start) = (self.tx.clone(), ctx.clone(), self.cwd.clone());
+        self.rt.spawn(async move {
+            let r = folder::pick(&start).await.map_err(|e| format!("{e:#}"));
+            let _ = tx.send(UiMsg::Folder(r));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Make `dir` the project: a new session there, with that folder's config and agents.
+    fn open_folder(&mut self, dir: PathBuf, ctx: &egui::Context) {
+        if self.running {
+            self.status = "busy — stop or wait for the current request first".into();
+            return;
+        }
+        if magia_store::canonical(&dir) == magia_store::canonical(&self.cwd) {
+            return;
+        }
+        if let Err(e) = std::env::set_current_dir(&dir) {
+            self.status = format!("{}: {e}", dir.display());
+            return;
+        }
+        // A few small files (config layers, agent list): the same work the first frame waits for.
+        let l = Loaded::new(&dir);
+        self.todos = l.agent.cx.todos.clone();
+        self.agent = Arc::new(tokio::sync::Mutex::new(l.agent)); // the old one (and its MCP servers) goes
+        self.cfg = l.cfg;
+        self.agents = l.file_agents;
+        self.mode_before_plan = l.mode_before_plan;
+        self.cwd = dir;
+        self.queue.clear();
+        self.files.clear();
+        self.composer = composer::Composer::default(); // the old folder's history goes too
+        self.tokens = (0, 0);
+        self.reset_items(&[]);
+        self.status = if l.status.is_empty() {
+            format!("opened {}", self.cwd.display())
+        } else {
+            l.status
+        };
+        self.folder_opened(ctx);
     }
 
     /// Rebuild the client from the current provider/model/mode settings (only while idle).
@@ -587,6 +678,18 @@ impl App {
                     ctx.request_repaint();
                 });
             }
+            "open" => {
+                // The whole rest of the line: paths may have spaces.
+                let typed = input.trim_start()["/open".len()..].trim();
+                if typed.is_empty() {
+                    self.pick_folder(ctx);
+                } else {
+                    match folder::resolve(typed, &self.cwd) {
+                        Ok(dir) => self.open_folder(dir, ctx),
+                        Err(e) => self.status = format!("{e:#}"),
+                    }
+                }
+            }
             "resume" => {
                 let Ok(a) = self.agent.try_lock() else {
                     self.status = busy.into();
@@ -759,6 +862,12 @@ impl App {
                 UiMsg::Status(s) => self.status = s,
                 UiMsg::Files(f) => self.files = f,
                 UiMsg::History(h) => self.composer.load_history(h),
+                UiMsg::Recent(r) => self.recent = r,
+                UiMsg::Folder(Ok(Some(dir))) => self.open_folder(dir, ctx),
+                UiMsg::Folder(Ok(None)) => {}
+                UiMsg::Folder(Err(e)) => {
+                    self.status = format!("{e}; type /open <path> instead");
+                }
                 UiMsg::Sessions(generation, hits) => {
                     if let Some(p) = &mut self.resume {
                         p.set_results(generation, hits);
@@ -925,12 +1034,12 @@ impl App {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| self.cwd.display().to_string());
-                    ui.label(
-                        egui::RichText::new(folder)
-                            .font(theme::mono(theme::SMALL))
-                            .color(t.muted),
-                    )
-                    .on_hover_text(self.cwd.display().to_string());
+                    if let Some(dir) = self.folder_menu(ui, folder) {
+                        match dir {
+                            Some(dir) => self.open_folder(dir, ctx),
+                            None => self.pick_folder(ctx),
+                        }
+                    }
                     ui.add_space(12.0);
 
                     ui.add_enabled_ui(!self.running, |ui| {
@@ -1190,6 +1299,64 @@ impl App {
                     });
                 });
             });
+    }
+
+    /// The folder name in the top bar, as a menu: earlier folders and "Open folder…".
+    /// `Some(Some(dir))` = open `dir`, `Some(None)` = show the dialog.
+    fn folder_menu(&mut self, ui: &mut egui::Ui, name: String) -> Option<Option<PathBuf>> {
+        let t = *theme::tokens(ui);
+        let mut picked = None;
+        let button = egui::Button::new(
+            egui::RichText::new(format!("{name} ▾"))
+                .font(theme::mono(theme::SMALL))
+                .color(t.muted),
+        )
+        .frame(false);
+        let running = self.running;
+        let r = egui::containers::menu::MenuButton::from_button(button).ui(ui, |ui| {
+            ui.set_min_width(260.0);
+            if ui
+                .add_enabled(!running, egui::Button::new("Open folder…"))
+                .clicked()
+            {
+                picked = Some(None);
+            }
+            if !self.recent.is_empty() {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("Recent")
+                        .size(theme::SMALL)
+                        .color(t.muted),
+                );
+                for dir in &self.recent {
+                    let name = dir
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| dir.display().to_string());
+                    let parent = dir
+                        .parent()
+                        .map(|p| tilde(p).display().to_string())
+                        .unwrap_or_default();
+                    let label = egui::RichText::new(format!("{name}   {parent}"));
+                    if ui
+                        .add_enabled(!running, egui::Button::new(label))
+                        .on_hover_text(dir.display().to_string())
+                        .clicked()
+                    {
+                        picked = Some(Some(dir.clone()));
+                    }
+                }
+            }
+        });
+        r.0.on_hover_text(format!(
+            "{}\nclick to open another folder",
+            self.cwd.display()
+        ));
+        if running && picked.is_some() {
+            self.status = "busy — stop or wait for the current request first".into();
+            return None;
+        }
+        picked
     }
 
     fn tasks_on_side(&self, ctx: &egui::Context) -> bool {
@@ -1547,6 +1714,9 @@ fn empty_state(ui: &mut egui::Ui, cwd: &std::path::Path) -> Option<&'static str>
         });
     ui.add_space(18.0);
     ui.horizontal(|ui| {
+        if theme::secondary(ui, "Open folder…", None).clicked() {
+            cmd = Some("/open");
+        }
         if theme::secondary(ui, "Resume a session…", None).clicked() {
             cmd = Some("/resume");
         }
@@ -1572,6 +1742,17 @@ fn queued_label(text: &str, images: usize) -> String {
         0 => first.to_owned(),
         1 => format!("{first}  + 1 image"),
         n => format!("{first}  + {n} images"),
+    }
+}
+
+/// `/home/a/src` → `~/src`, for short labels.
+fn tilde(p: &std::path::Path) -> PathBuf {
+    match std::env::var_os("HOME").map(PathBuf::from) {
+        Some(home) => match p.strip_prefix(&home) {
+            Ok(rest) => PathBuf::from("~").join(rest),
+            Err(_) => p.to_path_buf(),
+        },
+        None => p.to_path_buf(),
     }
 }
 
@@ -1653,6 +1834,11 @@ const BUILTINS: &[(&str, &str, &str)] = &[
         "resume",
         "Pick a saved session of this folder (search every folder)",
         "[search]",
+    ),
+    (
+        "open",
+        "Work in another folder (no path: the folder dialog)",
+        "[path]",
     ),
 ];
 

@@ -32,7 +32,17 @@ fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.17.0" 
 fastframe-text = { git = "https://github.com/crmne/fastframe", tag = "v0.17.0" }
 fastframe-graphics = { git = "https://github.com/crmne/fastframe", tag = "v0.17.0" }
 fastframe-notifications = { git = "https://github.com/crmne/fastframe", tag = "v0.17.0" }
+futures-util.workspace = true
+
+# The folder dialog. Linux: the desktop portal over zbus (pure Rust, already in the tree through
+# fastframe; same version and features). Elsewhere: rfd, which uses the system API directly.
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5.19", default-features = false, features = ["tokio"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rfd = { version = "0.18", default-features = false }
 
 [dev-dependencies]
 # Headless UI tests (no renderer, no wgpu: default features only).
 egui_kittest = "0.36.2"
+tempfile = "3"
