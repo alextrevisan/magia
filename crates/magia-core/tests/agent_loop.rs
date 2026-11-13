@@ -1674,3 +1674,62 @@ async fn always_deny_refuses_the_folder_for_the_session_without_asking_again() {
     resumed.resume(&path).unwrap();
     assert_eq!(*resumed.denied_dirs.lock().unwrap(), vec![ext]);
 }
+
+#[tokio::test]
+async fn a_deny_is_for_one_call_and_reset_forgets_always_answers() {
+    use magia_core::FolderAnswer;
+    let project = tempfile::tempdir().unwrap();
+    let other = tempfile::tempdir().unwrap();
+    let ext = std::fs::canonicalize(other.path()).unwrap();
+    std::fs::write(ext.join("a.txt"), "outside-a").unwrap();
+    let read = format!(r#"{{"file_path":"{}"}}"#, ext.join("a.txt").display());
+    let (url, server) = serve(vec![
+        tool_reply(&[("r1", "read", &read)]), // deny once
+        text_reply("you denied it"),
+        tool_reply(&[("r2", "read", &read)]), // asked again: always deny
+        text_reply("blocked"),
+        tool_reply(&[("r3", "read", &read)]), // after reset: asked again, allowed
+        text_reply("done"),
+    ])
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Ask,
+        project.path().into(),
+    );
+    agent.store = Some(magia_store::SessionFile::create_for(root.path(), project.path()).unwrap());
+    let a = FolderApprover {
+        answers: std::sync::Mutex::new(vec![
+            FolderAnswer::Deny,
+            FolderAnswer::DenyAlways,
+            FolderAnswer::Once,
+        ]),
+        asked: Default::default(),
+    };
+    let out = tool_outputs(&run_with(&mut agent, "read it", &a).await);
+    assert!(
+        out[0].0.contains("asks for it again"),
+        "the model is told to ask again later: {out:?}"
+    );
+    run_with(&mut agent, "I clicked deny by mistake, read it again", &a).await;
+    assert_eq!(
+        a.asked.lock().unwrap().len(),
+        2,
+        "asked again after a plain deny"
+    );
+    assert_eq!(agent.folder_permissions().1, vec![ext.clone()]);
+
+    agent.reset_folder_permissions().unwrap();
+    assert_eq!(agent.folder_permissions(), (vec![], vec![]));
+    assert!(
+        agent.store.as_ref().unwrap().meta().denied_dirs.is_empty(),
+        "saved"
+    );
+    let out = tool_outputs(&run_with(&mut agent, "read it", &a).await);
+    assert!(!out[0].1 && out[0].0.contains("outside-a"), "{out:?}");
+    assert_eq!(a.asked.lock().unwrap().len(), 3);
+    let bodies = server.await.unwrap();
+    assert!(bodies[2].contains("asks for it again"));
+}

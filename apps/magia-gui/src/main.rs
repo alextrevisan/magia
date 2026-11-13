@@ -867,6 +867,35 @@ impl App {
                     ctx.request_repaint();
                 });
             }
+            "permissions" => {
+                let Ok(mut a) = self.agent.try_lock() else {
+                    self.status = busy.into();
+                    return true;
+                };
+                if arg == Some("reset") {
+                    self.status = match a.reset_folder_permissions() {
+                        Ok(()) => "folders outside the project will be asked about again".into(),
+                        Err(e) => format!("{e:#}"),
+                    };
+                } else {
+                    let (allowed, blocked) = a.folder_permissions();
+                    let list = |v: &[PathBuf]| {
+                        if v.is_empty() {
+                            "none".to_owned()
+                        } else {
+                            v.iter()
+                                .map(|d| tilde(d).display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    };
+                    self.status = format!(
+                        "this session — allowed: {} · blocked: {} · /permissions reset forgets them",
+                        list(&allowed),
+                        list(&blocked)
+                    );
+                }
+            }
             "btw" => {
                 let question = input.trim_start()["/btw".len()..].trim();
                 if question.is_empty() {
@@ -2133,6 +2162,11 @@ const BUILTINS: &[(&str, &str, &str)] = &[
         "open",
         "Work in another folder (no path: the folder dialog)",
         "[path]",
+    ),
+    (
+        "permissions",
+        "Folders outside the project this session allowed or blocked (`reset` forgets them)",
+        "[reset]",
     ),
     (
         "btw",

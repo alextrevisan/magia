@@ -61,6 +61,9 @@ pub enum AgentEvent {
     TurnDone,
 }
 
+/// Ends every one-time refusal sent to the model, so it does not treat one "deny" as forever.
+const AGAIN: &str = " This refusal was for this call only: do not work around it, but if the user later asks for it again, make the call again (they will be asked again).";
+
 /// `parent` of the reviewer's `SubTool` events.
 pub const REVIEW_PARENT: &str = "review";
 
@@ -958,7 +961,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
             .any(|d| refused.iter().any(|r| d.starts_with(r)))
         {
             return Err(format!(
-                "the user blocked {list} (outside the project) for this session. Do not try to reach it another way; work without it or tell the user what you needed."
+                "the user blocked {list} (outside the project) for this session. Do not try to reach it another way; work without it or tell the user what you needed (they can lift the block with /permissions reset)."
             ));
         }
         match self.outside_rule(&dirs) {
@@ -993,7 +996,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
             FolderAnswer::Deny => {
                 self.denied.store(true, Ordering::Relaxed);
                 Err(format!(
-                    "the user denied access to {list} (outside the project). Do not try to reach it another way."
+                    "the user denied access to {list} (outside the project). Do not try to reach it another way.{AGAIN}"
                 ))
             }
             FolderAnswer::DenyAlways => {
@@ -1009,7 +1012,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
                     let _ = s.set_denied_dirs(&all);
                 }
                 Err(format!(
-                    "the user blocked {list} (outside the project) for this session. Do not try to reach it another way."
+                    "the user blocked {list} (outside the project) for this session. Do not try to reach it another way. Only the user can lift it, with /permissions reset."
                 ))
             }
         }
@@ -1062,7 +1065,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
         } else {
             self.denied.store(true, Ordering::Relaxed);
             Err(format!(
-                "the user denied this tool call (auto mode flagged it: {reason})"
+                "the user denied this tool call (auto mode flagged it: {reason}).{AGAIN}"
             ))
         }
     }
@@ -1195,7 +1198,7 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
                 _ if approved => {}
                 Decision::Ask if !approver.approve(call).await => {
                     self.denied.store(true, Ordering::Relaxed);
-                    return ("the user denied this tool call".into(), true);
+                    return (format!("the user denied this tool call.{AGAIN}"), true);
                 }
                 Decision::Review => {
                     if let Err(msg) = self.auto_check(call, events, approver).await {
@@ -1402,6 +1405,29 @@ Do not call tools."
         if let Ok(mut t) = self.cx.todos.lock() {
             *t = todos_in(&self.history);
         }
+    }
+
+    /// Folders outside the project this session allowed and blocked ("always" answers).
+    pub fn folder_permissions(&self) -> (Vec<PathBuf>, Vec<PathBuf>) {
+        let get = |m: &Arc<std::sync::Mutex<Vec<PathBuf>>>| {
+            m.lock().map(|v| v.clone()).unwrap_or_default()
+        };
+        (get(&self.allowed_dirs), get(&self.denied_dirs))
+    }
+
+    /// Forget every "always" answer about folders outside the project (`/permissions reset`):
+    /// they will be asked about again.
+    pub fn reset_folder_permissions(&mut self) -> Result<()> {
+        for m in [&self.allowed_dirs, &self.denied_dirs] {
+            if let Ok(mut v) = m.lock() {
+                v.clear();
+            }
+        }
+        if let Some(s) = &self.store {
+            s.set_allowed_dirs(&[])?;
+            s.set_denied_dirs(&[])?;
+        }
+        Ok(())
     }
 
     /// Per-conversation state that must not leak into the next one: the task list and the
