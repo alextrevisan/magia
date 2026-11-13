@@ -234,7 +234,7 @@ async fn auto_compaction_summarizes_old_history_and_keeps_tail() {
         matches!(agent.history.last(), Some(Message::Assistant { text, .. }) if text == "done")
     );
     let bodies = server.await.unwrap();
-    assert!(bodies[0].contains("Summarize this session transcript"));
+    assert!(bodies[0].contains("<transcript>") && bodies[0].contains("Write the summary"));
     assert!(bodies[1].contains("SUMMARY-OF-OLD"));
 }
 
