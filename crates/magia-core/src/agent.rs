@@ -60,8 +60,17 @@ pub enum AgentEvent {
     /// A subagent (`task` call `parent`, or the reviewer: `parent` = `"review"`) used a tool.
     SubTool {
         parent: String,
+        /// The subagent's own call id, matched by `SubToolEnd`.
+        id: String,
         name: String,
         input: Value,
+    },
+    /// That subagent call finished.
+    SubToolEnd {
+        parent: String,
+        id: String,
+        output: String,
+        is_error: bool,
     },
     /// Turn finished (completed, cancelled or failed).
     TurnDone,
@@ -1687,12 +1696,27 @@ fn run_subagent(
             while let Some(ev) = rx.recv().await {
                 match ev {
                     AgentEvent::Error(e) => error = Some(e),
-                    AgentEvent::ToolStart { name, input, .. } => {
+                    AgentEvent::ToolStart { id, name, input } => {
                         if let Some((parent_tx, parent)) = &forward {
                             let _ = parent_tx.send(AgentEvent::SubTool {
                                 parent: parent.clone(),
+                                id,
                                 name,
                                 input,
+                            });
+                        }
+                    }
+                    AgentEvent::ToolEnd {
+                        id,
+                        output,
+                        is_error,
+                    } => {
+                        if let Some((parent_tx, parent)) = &forward {
+                            let _ = parent_tx.send(AgentEvent::SubToolEnd {
+                                parent: parent.clone(),
+                                id,
+                                output,
+                                is_error,
                             });
                         }
                     }

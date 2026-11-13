@@ -209,6 +209,9 @@ struct App {
     /// Cached rendered height per item (0 = not measured yet); drives the virtualized list.
     heights: Vec<f32>,
     last_width: f32,
+    /// Item to bring into view: `(index, exact)`. First the scroll jumps to its estimated
+    /// place (heights of unseen items are guesses), then, once it is drawn, exactly to it.
+    scroll_to: Option<(usize, bool)>,
     /// Created lazily (it starts a background runtime): only when the window is unfocused.
     notifier: Option<fastframe_notifications::Client>,
     todos: Arc<std::sync::Mutex<Vec<magia_tools::Todo>>>,
@@ -372,6 +375,7 @@ impl App {
             tokens: (0, 0),
             heights: vec![],
             last_width: 0.0,
+            scroll_to: None,
             notifier: None,
             todos,
             agents: file_agents,
@@ -1419,7 +1423,9 @@ impl App {
                             self.heights.clear();
                         }
                         AgentEvent::Error(e) => self.items.push(Item::Error(e)),
-                        AgentEvent::Magia(_) | AgentEvent::SubTool { .. } => {}
+                        AgentEvent::Magia(_)
+                        | AgentEvent::SubTool { .. }
+                        | AgentEvent::SubToolEnd { .. } => {}
                         AgentEvent::Round { n, reason } => {
                             self.items
                                 .push(Item::Round(format!("round {n} · {reason}")));
@@ -1891,7 +1897,7 @@ impl App {
                     .id_salt("tasks_side")
                     .auto_shrink(false)
                     .show(ui, |ui| {
-                        activity::show(ui, &self.activity);
+                        let mut jump = activity::show(ui, &self.activity);
                         if !todos.is_empty() {
                             ui.label(
                                 egui::RichText::new(tasks_title(&todos))
@@ -1899,10 +1905,25 @@ impl App {
                                     .color(t.fg),
                             );
                             ui.add_space(6.0);
-                            todo_list(ui, &todos);
+                            jump = jump.or(todo_list(ui, &todos));
+                        }
+                        if let Some(j) = jump {
+                            self.jump(j);
                         }
                     });
             });
+    }
+
+    /// Scroll the transcript to where a round or a task began.
+    fn jump(&mut self, j: activity::Jump) {
+        let found = match &j {
+            activity::Jump::Round(n) => round_start(&self.items, *n),
+            activity::Jump::Task(content) => task_start(&self.items, content),
+        };
+        match found {
+            Some(i) => self.scroll_to = Some((i, false)),
+            None => self.status = "that point is no longer in the conversation".into(),
+        }
     }
 
     fn transcript(&mut self, ui: &mut egui::Ui) {
@@ -1916,8 +1937,10 @@ impl App {
             .show(ui, |ui| {
                 if !self.tasks_on_side(ui.ctx()) {
                     let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
-                    if !todos.is_empty() || !self.activity.is_empty() {
-                        column(ui, |ui| todo_card(ui, &todos, &self.activity));
+                    if (!todos.is_empty() || !self.activity.is_empty())
+                        && let Some(j) = column(ui, |ui| todo_card(ui, &todos, &self.activity))
+                    {
+                        self.jump(j);
                     }
                 }
                 if self.items.is_empty() {
@@ -1929,47 +1952,69 @@ impl App {
                 }
                 // Virtualized: only items near the viewport are laid out; the rest are skipped
                 // using cached heights, so long sessions cost little CPU/RAM.
-                egui::ScrollArea::vertical()
+                let mut area = egui::ScrollArea::vertical()
                     .auto_shrink(false)
-                    .stick_to_bottom(true)
-                    .show_viewport(ui, |ui, viewport| {
-                        let width = ui.available_width();
-                        if (width - self.last_width).abs() > 1.0 {
-                            self.heights.iter_mut().for_each(|h| *h = 0.0);
-                            self.last_width = width;
-                        }
-                        self.heights.resize(self.items.len(), 0.0);
-                        let spacing = ui.spacing().item_spacing.y;
-                        let (top, bottom) = (viewport.min.y - 500.0, viewport.max.y + 500.0);
-                        let (mut y, mut skipped) = (0.0f32, 0.0f32);
-                        ui.add_space(12.0);
-                        for (n, it) in self.items.iter().enumerate() {
-                            let known = self.heights[n] > 0.0;
-                            let h = if known { self.heights[n] } else { 80.0 };
-                            let visible = if known {
-                                y + h >= top && y <= bottom
-                            } else {
-                                y <= bottom
-                            };
-                            if visible {
-                                if skipped > 0.0 {
-                                    ui.add_space(skipped);
-                                    skipped = 0.0;
-                                }
-                                let start = ui.cursor().min.y;
-                                let prev = n.checked_sub(1).map(|p| &self.items[p]);
-                                column(ui, |ui| render_item(ui, n, it, prev));
-                                self.heights[n] = (ui.cursor().min.y - start).max(1.0);
-                            } else {
-                                skipped += h + spacing;
+                    .stick_to_bottom(true);
+                if let Some((target, false)) = self.scroll_to {
+                    let spacing = ui.spacing().item_spacing.y;
+                    let y: f32 = 12.0
+                        + self
+                            .heights
+                            .iter()
+                            .take(target)
+                            .map(|h| if *h > 0.0 { *h } else { 80.0 } + spacing)
+                            .sum::<f32>()
+                        + (target.saturating_sub(self.heights.len())) as f32 * (80.0 + spacing);
+                    area = area.vertical_scroll_offset(y);
+                    self.scroll_to = Some((target, true));
+                    ui.ctx().request_repaint();
+                }
+                area.show_viewport(ui, |ui, viewport| {
+                    let width = ui.available_width();
+                    if (width - self.last_width).abs() > 1.0 {
+                        self.heights.iter_mut().for_each(|h| *h = 0.0);
+                        self.last_width = width;
+                    }
+                    self.heights.resize(self.items.len(), 0.0);
+                    let spacing = ui.spacing().item_spacing.y;
+                    let (top, bottom) = (viewport.min.y - 500.0, viewport.max.y + 500.0);
+                    let (mut y, mut skipped) = (0.0f32, 0.0f32);
+                    ui.add_space(12.0);
+                    for (n, it) in self.items.iter().enumerate() {
+                        let known = self.heights[n] > 0.0;
+                        let h = if known { self.heights[n] } else { 80.0 };
+                        let visible = if known {
+                            y + h >= top && y <= bottom
+                        } else {
+                            y <= bottom
+                        };
+                        if visible {
+                            if skipped > 0.0 {
+                                ui.add_space(skipped);
+                                skipped = 0.0;
                             }
-                            y += self.heights[n].max(if known { 0.0 } else { h }) + spacing;
+                            let start = ui.cursor().min.y;
+                            let prev = n.checked_sub(1).map(|p| &self.items[p]);
+                            column(ui, |ui| render_item(ui, n, it, prev));
+                            self.heights[n] = (ui.cursor().min.y - start).max(1.0);
+                            if self.scroll_to == Some((n, true)) {
+                                let r = egui::Rect::from_x_y_ranges(
+                                    ui.max_rect().x_range(),
+                                    start..=start + self.heights[n],
+                                );
+                                ui.scroll_to_rect(r, Some(egui::Align::TOP));
+                                self.scroll_to = None;
+                            }
+                        } else {
+                            skipped += h + spacing;
                         }
-                        if skipped > 0.0 {
-                            ui.add_space(skipped);
-                        }
-                        ui.add_space(12.0);
-                    });
+                        y += self.heights[n].max(if known { 0.0 } else { h }) + spacing;
+                    }
+                    if skipped > 0.0 {
+                        ui.add_space(skipped);
+                    }
+                    ui.add_space(12.0);
+                });
             });
     }
 
@@ -2346,8 +2391,10 @@ fn tasks_title(todos: &[magia_tools::Todo]) -> String {
     format!("Tasks  {done}/{}", todos.len())
 }
 
-fn todo_list(ui: &mut egui::Ui, todos: &[magia_tools::Todo]) {
+/// The task list; returns the task the user clicked (to see where it began).
+fn todo_list(ui: &mut egui::Ui, todos: &[magia_tools::Todo]) -> Option<activity::Jump> {
     let t = *theme::tokens(ui);
+    let mut jump = None;
     for todo in todos {
         let (mark, color, text_color) = match todo.status.as_str() {
             "completed" => ("✓", t.ok, t.muted),
@@ -2363,14 +2410,67 @@ fn todo_list(ui: &mut egui::Ui, todos: &[magia_tools::Todo]) {
             if matches!(todo.status.as_str(), "completed" | "cancelled") {
                 text = text.strikethrough();
             }
-            ui.add(egui::Label::new(text).wrap());
+            let r = ui
+                .add(egui::Label::new(text).wrap().sense(egui::Sense::click()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Show where this task began");
+            if r.clicked() {
+                jump = Some(activity::Jump::Task(todo.content.clone()));
+            }
         });
     }
+    jump
+}
+
+/// Where the latest request began (its user message; answers to questions don't count).
+fn request_start(items: &[Item]) -> Option<usize> {
+    items
+        .iter()
+        .rposition(|i| matches!(i, Item::User(t, _) if !t.starts_with("(answer) ")))
+}
+
+/// Round 1 is the request itself; later rounds are their divider after it.
+fn round_start(items: &[Item], n: u32) -> Option<usize> {
+    let from = request_start(items)?;
+    if n <= 1 {
+        return Some(from);
+    }
+    let prefix = format!("round {n} ");
+    (from..items.len()).find(|&i| matches!(&items[i], Item::Round(l) if l.starts_with(&prefix)))
+}
+
+/// The `todo` call that first set this task in progress, or else first listed it.
+fn task_start(items: &[Item], content: &str) -> Option<usize> {
+    let lists = items.iter().enumerate().filter_map(|(i, it)| match it {
+        Item::Tool { name, input, .. } if name == "todo" => {
+            let v: serde_json::Value = serde_json::from_str(input).ok()?;
+            let todos = v.get("todos")?.as_array()?.clone();
+            Some((i, todos))
+        }
+        _ => None,
+    });
+    let mut first = None;
+    for (i, todos) in lists {
+        for t in &todos {
+            if t.get("content").and_then(|c| c.as_str()) == Some(content) {
+                if t.get("status").and_then(|s| s.as_str()) == Some("in_progress") {
+                    return Some(i);
+                }
+                first.get_or_insert(i);
+            }
+        }
+    }
+    first
 }
 
 /// Narrow windows: a collapsible card with a few lines visible; the rest scrolls.
-fn todo_card(ui: &mut egui::Ui, todos: &[magia_tools::Todo], act: &activity::Activity) {
+fn todo_card(
+    ui: &mut egui::Ui,
+    todos: &[magia_tools::Todo],
+    act: &activity::Activity,
+) -> Option<activity::Jump> {
     let t = *theme::tokens(ui);
+    let mut jump = None;
     egui::Frame::new()
         .fill(t.surface)
         .stroke(egui::Stroke::new(1.0, t.line))
@@ -2394,11 +2494,12 @@ fn todo_card(ui: &mut egui::Ui, todos: &[magia_tools::Todo], act: &activity::Act
                     .id_salt("todos_scroll")
                     .max_height(160.0)
                     .show(ui, |ui| {
-                        activity::show(ui, act);
-                        todo_list(ui, todos);
+                        jump = activity::show(ui, act);
+                        jump = jump.take().or(todo_list(ui, todos));
                     });
             });
         });
+    jump
 }
 
 /// Built-in commands handled by `App::slash` (name, description, argument hint).
@@ -2869,6 +2970,32 @@ mod tests {
             Message::user(format!("{}\nkeep going", magia_mode::CONTINUE_PREFIX)),
         ];
         assert_eq!(sent_messages(&h), ["look at @a.txt", "next"]);
+    }
+
+    #[test]
+    fn rounds_and_tasks_lead_to_where_they_began() {
+        let todo = |id: &str, status: &str| Item::Tool {
+            id: id.into(),
+            name: "todo".into(),
+            summary: String::new(),
+            input: format!(r#"{{"todos":[{{"content":"write docs","status":"{status}"}}]}}"#),
+            output: None,
+        };
+        let items = vec![
+            Item::User("old request".into(), vec![]),
+            Item::Round("round 2 · continued".into()),
+            Item::User("new request".into(), vec![]), // 2
+            todo("a", "pending"),                     // 3
+            Item::User("(answer) yes".into(), vec![]),
+            Item::Round("round 2 · 1 task open".into()), // 5
+            todo("b", "in_progress"),                    // 6
+        ];
+        assert_eq!(round_start(&items, 1), Some(2));
+        assert_eq!(round_start(&items, 2), Some(5));
+        assert_eq!(round_start(&items, 3), None);
+        assert_eq!(task_start(&items, "write docs"), Some(6));
+        assert_eq!(task_start(&items[..5], "write docs"), Some(3));
+        assert_eq!(task_start(&items, "other"), None);
     }
 
     #[test]

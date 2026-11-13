@@ -335,6 +335,7 @@ async fn real_main() -> Result<()> {
                     parent,
                     name,
                     input,
+                    ..
                 } => {
                     let who = if parent == magia_core::REVIEW_PARENT {
                         "reviewer"
