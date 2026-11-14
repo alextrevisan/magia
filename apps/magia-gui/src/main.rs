@@ -2667,6 +2667,8 @@ fn render_item(ui: &mut egui::Ui, n: usize, it: &Item, prev: Option<&Item>) {
                 .color(t.accent);
             egui::CollapsingHeader::new(head)
                 .id_salt(("summary", n))
+                // Open: collapsed, the one-line header was easy to miss above the kept messages.
+                .default_open(true)
                 .show(ui, |ui| {
                     egui::Frame::new()
                         .stroke(egui::Stroke::new(1.0, t.line))
