@@ -362,14 +362,91 @@ async fn subagent_roles_bring_their_prompt_and_model() {
         matches!(&agent.history[2], Message::ToolResult { content, is_error: false, .. } if content.contains("null pointer"))
     );
     assert!(
-        matches!(&agent.history[3], Message::ToolResult { content, is_error: true, .. } if content.contains("explore, plan or oracle"))
+        matches!(&agent.history[3], Message::ToolResult { content, is_error: true, .. } if content.contains("explore, plan, oracle, worker"))
     );
     let bodies = server.await.unwrap();
-    assert!(bodies[0].contains(r#""enum":["explore","plan","oracle"]"#));
+    assert!(bodies[0].contains(r#""enum":["explore","plan","oracle","worker"]"#));
     assert!(
         bodies[1].contains(r#""model":"oracle-model""#) && bodies[1].contains("You are the oracle")
     );
     assert!(bodies[2].contains(r#""model":"main-model""#));
+}
+
+/// Approves everything and counts the questions.
+struct CountingApprover(std::sync::atomic::AtomicUsize);
+#[async_trait::async_trait]
+impl magia_core::Approver for CountingApprover {
+    async fn approve(&self, _: &magia_types::ToolCall) -> bool {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
+    }
+}
+
+#[tokio::test]
+async fn a_worker_edits_with_the_users_approval_and_rewind_undoes_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = serve(vec![
+        tool_reply(&[(
+            "t1",
+            "task",
+            r#"{"agent":"worker","prompt":"create a.txt with hi"}"#,
+        )]),
+        tool_reply(&[("w1", "write", r#"{"file_path":"a.txt","content":"hi"}"#)]),
+        text_reply("wrote a.txt"),
+        text_reply("done"),
+    ])
+    .await;
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Ask,
+        dir.path().into(),
+    );
+    let approver = CountingApprover(Default::default());
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_turn("make a.txt", tx, CancellationToken::new(), &approver)
+        .await;
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "hi"
+    );
+    assert_eq!(
+        approver.0.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the user approved the write"
+    );
+    let bodies = server.await.unwrap();
+    assert!(
+        bodies[1].contains(r#""name":"write""#),
+        "a worker is offered tools that change files"
+    );
+    assert!(bodies[1].contains("You are a worker subagent"));
+    // The worker's edit belongs to the parent's turn.
+    agent.rewind(1).unwrap();
+    assert!(!dir.path().join("a.txt").exists());
+}
+
+#[tokio::test]
+async fn plan_mode_offers_no_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = serve(vec![
+        tool_reply(&[("t1", "task", r#"{"agent":"worker","prompt":"edit"}"#)]),
+        text_reply("ok"),
+    ])
+    .await;
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Plan,
+        dir.path().into(),
+    );
+    run(&mut agent, "go").await;
+    assert!(
+        matches!(&agent.history[2], Message::ToolResult { is_error: true, content, .. } if content.contains("explore, plan, oracle"))
+    );
+    let bodies = server.await.unwrap();
+    assert!(bodies[0].contains(r#""enum":["explore","plan","oracle"]"#));
 }
 
 #[tokio::test]

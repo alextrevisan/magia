@@ -45,19 +45,28 @@ pub enum Role {
     Explore,
     Plan,
     Oracle,
+    /// Implements a well-defined part of the work; the only role that edits files.
+    Worker,
     Review,
 }
 
 impl Role {
-    pub const ALL: [Role; 4] = [Role::Explore, Role::Plan, Role::Oracle, Role::Review];
+    pub const ALL: [Role; 5] = [
+        Role::Explore,
+        Role::Plan,
+        Role::Oracle,
+        Role::Worker,
+        Role::Review,
+    ];
     /// The ones the model can pick in `task`.
-    pub const DELEGATED: [Role; 3] = [Role::Explore, Role::Plan, Role::Oracle];
+    pub const DELEGATED: [Role; 4] = [Role::Explore, Role::Plan, Role::Oracle, Role::Worker];
 
     pub fn name(self) -> &'static str {
         match self {
             Role::Explore => "explore",
             Role::Plan => "plan",
             Role::Oracle => "oracle",
+            Role::Worker => "worker",
             Role::Review => "review",
         }
     }
@@ -68,6 +77,7 @@ impl Role {
             "explore" | "explorer" => Some(Role::Explore),
             "plan" | "planner" => Some(Role::Plan),
             "oracle" => Some(Role::Oracle),
+            "worker" | "implementer" => Some(Role::Worker),
             "review" | "reviewer" => Some(Role::Review),
             _ => None,
         }
@@ -79,6 +89,7 @@ impl Role {
             Role::Explore => EXPLORE,
             Role::Plan => PLANNER,
             Role::Oracle => ORACLE,
+            Role::Worker => WORKER,
             Role::Review => REVIEWER,
         }
     }
@@ -109,6 +120,15 @@ Think it through carefully, check your assumptions against the code, and reply w
 diagnosis or recommendation, the reasoning in a few lines, the risks or cases the asker is \
 missing, and a better alternative if there is one. Be direct; say when the asker is wrong.";
 
+const WORKER: &str = "\
+You are a worker subagent: another agent split a larger job and gave you one well-defined part. \
+You can read, edit and run commands. Change only the files your instructions give you (other \
+workers may be editing other files at the same time); if the part cannot be done without touching \
+something else, stop and say so instead. Make the smallest complete change: no stubs, \
+placeholders or simplified versions. Verify it the way the instructions say (build, tests, \
+running it) and do not report success without that evidence. Reply with a short report: the files \
+you changed, what you did, how you verified it (commands and results), and anything left open.";
+
 /// Added to the system prompt while the Magia agent is selected. Adapted from the "ultrawork"
 /// mode of oh-my-opencode: understand, plan, implement, then prove it works.
 pub const INSTRUCTIONS: &str = "\
@@ -138,6 +158,11 @@ or multi-part one. Each one has a pass condition that can fail, observed on the 
 and verified, add what you discover. The last items are verification and cleanup.
 
 ## 3. Implement
+- When the plan has parts that are independent and touch different files, hand each one to \
+`task` with `agent: \"worker\"`, all in the same response (they run in parallel): name the files it \
+owns, the change and how to verify it. Never give two workers the same file. Do small or tightly \
+coupled changes yourself. Afterwards read what the workers changed and run the checks yourself: \
+their report is a claim, not evidence.
 - Read the tests that cover an area before changing it. A bug: reproduce it first.
 - Make the smallest change that fully does the request. No simplified version, stub, mock data, \
 placeholder or \"you can extend this later\": deliver all of it. Do not change the scope without \

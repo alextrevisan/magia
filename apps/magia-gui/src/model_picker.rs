@@ -29,8 +29,20 @@ impl ModelPicker {
         models: &[String],
         width: f32,
     ) -> Option<String> {
+        self.show_with(ui, current, models, width, "pick a model")
+    }
+
+    /// Like `show`, with `empty` on the button when no model is set.
+    pub fn show_with(
+        &mut self,
+        ui: &mut egui::Ui,
+        current: &str,
+        models: &[String],
+        width: f32,
+        empty: &str,
+    ) -> Option<String> {
         let label = if current.trim().is_empty() {
-            egui::RichText::new("pick a model")
+            egui::RichText::new(empty)
                 .font(theme::mono(theme::MONO))
                 .weak()
         } else {

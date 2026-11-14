@@ -20,6 +20,7 @@ mod model_picker;
 mod portal;
 mod resume;
 mod screenshot;
+mod settings;
 mod sidebar;
 mod theme;
 
@@ -33,6 +34,8 @@ use magia_types::{Image, Message, ToolCall};
 enum UiMsg {
     Agent(AgentEvent),
     Models(Result<Vec<String>, String>),
+    /// Another provider's model list, for the settings window.
+    ProviderModels(String, Vec<String>),
     /// A call to approve.
     Permission(Pending),
     Question(Question),
@@ -199,6 +202,9 @@ struct App {
     files: Vec<String>,
     models: Vec<String>,
     model_picker: model_picker::ModelPicker,
+    settings: settings::Settings,
+    /// Model lists by provider, for the settings window's role pickers.
+    provider_models: std::collections::HashMap<String, Vec<String>>,
     /// Messages sent while the agent works; they go out together when the turn ends.
     queue: Vec<(String, Vec<magia_core::Image>)>,
     /// The status line shows a "trying again" notice.
@@ -319,13 +325,6 @@ impl App {
         rendering.apply_to(&mut fonts);
         cc.egui_ctx.set_fonts(fonts);
         theme::install(&cc.egui_ctx);
-        // Follows the system appearance; MAGIA_THEME=light|dark overrides it.
-        cc.egui_ctx
-            .set_theme(match std::env::var("MAGIA_THEME").as_deref() {
-                Ok("light") => egui::ThemePreference::Light,
-                Ok("dark") => egui::ThemePreference::Dark,
-                _ => egui::ThemePreference::System,
-            });
         cc.egui_ctx
             .all_styles_mut(|s| rendering.apply_to_visuals(&mut s.visuals));
 
@@ -351,6 +350,10 @@ impl App {
             status,
             mode_before_plan,
         } = Loaded::new(&cwd);
+        // The theme picked in the settings (system by default); MAGIA_THEME=light|dark wins.
+        cc.egui_ctx.set_theme(settings::preference(
+            &std::env::var("MAGIA_THEME").unwrap_or_else(|_| cfg.theme.clone()),
+        ));
         let todos = agent.cx.todos.clone();
         let (tx, rx) = unbounded_channel();
         let mut app = Self {
@@ -373,6 +376,8 @@ impl App {
             files: vec![],
             models: vec![],
             model_picker: Default::default(),
+            settings: Default::default(),
+            provider_models: std::collections::HashMap::new(),
             queue: vec![],
             retrying: false,
             magic: Default::default(),
@@ -814,6 +819,63 @@ impl App {
         }
     }
 
+    /// Draw the settings window and carry out what it asks.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let mut providers: Vec<String> = PROVIDERS.iter().map(|p| p.to_string()).collect();
+        for p in self.cfg.providers.keys() {
+            if !providers.contains(p) {
+                providers.push(p.clone());
+            }
+        }
+        let actions = self
+            .settings
+            .ui(ctx, &self.cfg, &providers, &self.provider_models);
+        for a in actions {
+            match a {
+                settings::Action::Models(p) => self.fetch_provider_models(p, ctx),
+                settings::Action::Save(d) => {
+                    self.cfg.theme = d.theme.clone();
+                    self.cfg.magia_mode.max_rounds = d.max_rounds;
+                    self.cfg.magia_mode.review = d.review;
+                    self.cfg.role_models = d.role_models();
+                    self.cfg.magia_from_state = true;
+                    ctx.set_theme(settings::preference(&d.theme));
+                    if let Ok(mut a) = self.agent.try_lock() {
+                        a.set_roles(&self.cfg);
+                        a.magia = (self.cfg.agent == agents::MAGIA).then_some(self.cfg.magia_mode);
+                    } else {
+                        self.status = "settings saved; they apply from the next request".into();
+                    }
+                    let _ = self.cfg.save_state();
+                }
+            }
+        }
+    }
+
+    /// Fetch a provider's model list once (an empty list marks it as asked).
+    fn fetch_provider_models(&mut self, provider: String, ctx: &egui::Context) {
+        self.provider_models.insert(provider.clone(), Vec::new());
+        let Ok(client) = self.cfg.provider_config(&provider).and_then(Client::new) else {
+            return;
+        };
+        let declared = self.cfg.declared_models(&provider);
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        self.rt.spawn(async move {
+            let mut ids: Vec<String> = client
+                .list_models()
+                .await
+                .map(|m| m.into_iter().map(|m| m.id).collect())
+                .unwrap_or_default();
+            for d in declared {
+                if !ids.contains(&d) {
+                    ids.push(d);
+                }
+            }
+            let _ = tx.send(UiMsg::ProviderModels(provider, ids));
+            ctx.request_repaint();
+        });
+    }
+
     /// Switch the primary agent. `plan` also switches the mode; a file agent's text is read off
     /// the UI thread and handed to the agent.
     fn select_agent(&mut self, name: String, ctx: &egui::Context) {
@@ -1038,6 +1100,7 @@ impl App {
                     .collect();
                 self.status = format!("{} — type / to browse", names.join(" "));
             }
+            "settings" => self.settings.open(&self.cfg),
             "compact" => {
                 let (agent, tx, ctx) = (self.agent.clone(), self.tx.clone(), ctx.clone());
                 self.running = true;
@@ -1311,7 +1374,14 @@ impl App {
                 self.status.clear();
             }
             match msg {
-                UiMsg::Models(Ok(m)) => self.models = m,
+                UiMsg::Models(Ok(m)) => {
+                    self.provider_models
+                        .insert(self.cfg.provider.clone(), m.clone());
+                    self.models = m;
+                }
+                UiMsg::ProviderModels(p, m) => {
+                    self.provider_models.insert(p, m);
+                }
                 UiMsg::Models(Err(e)) => self.status = format!("models: {e}"),
                 UiMsg::Catalog(c) => self.catalog = c,
                 UiMsg::Agents(a) => self.agents = a,
@@ -1492,6 +1562,7 @@ impl eframe::App for App {
 
         // Before the panels: the picker takes ↑↓/Enter/Esc ahead of the composer.
         self.resume_picker(&ctx);
+        self.settings_window(&ctx);
         self.btw_window(&ctx);
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::B)) {
             self.toggle_nav();
@@ -1538,6 +1609,16 @@ impl App {
                         .clicked()
                     {
                         self.toggle_nav();
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(egui::RichText::new("⚙").size(16.0).color(t.muted))
+                                .frame(false),
+                        )
+                        .on_hover_text("Settings: theme and Magia mode (/settings)")
+                        .clicked()
+                    {
+                        self.settings.open(&self.cfg);
                     }
                     ui.label(
                         egui::RichText::new(APP_NAME)
@@ -2513,6 +2594,7 @@ const BUILTINS: &[(&str, &str, &str)] = &[
     ("help", "List the available commands", ""),
     ("clear", "Start a new session", ""),
     ("compact", "Summarize older history to free context", ""),
+    ("settings", "Theme and Magia mode settings", ""),
     (
         "rewind",
         "Undo the last turn(s): messages and file edits",

@@ -57,6 +57,11 @@ pub struct Config {
     /// Model of each subagent role (`"magia_mode": {"models": {"explore": "provider/model"}}`);
     /// a role left out uses the session's model. See `Config::role_model`.
     pub role_models: Vec<(crate::magia_mode::Role, String)>,
+    /// `magia_mode` and `role_models` were set in the GUI's settings: they live in the state
+    /// file and win over the config file.
+    pub magia_from_state: bool,
+    /// GUI appearance: `system`, `light` or `dark` (state file).
+    pub theme: String,
     pub hooks: Vec<HookConfig>,
     pub mcp: Vec<McpServerConfig>,
     pub rules: RuleSet,
@@ -84,6 +89,8 @@ impl Default for Config {
             auto_model: None,
             magia_mode: Default::default(),
             role_models: vec![],
+            magia_from_state: false,
+            theme: "system".into(),
             hooks: vec![],
             mcp: vec![],
             rules: RuleSet::default(),
@@ -465,6 +472,27 @@ impl Config {
         if let Some(b) = v.get("sidebar").and_then(Value::as_bool) {
             self.sidebar = b;
         }
+        if let Some(t) = v.get("theme").and_then(Value::as_str) {
+            self.theme = t.to_owned();
+        }
+        if let Some(m) = v
+            .get("magia_mode")
+            .and_then(|m| serde_json::from_value(m.clone()).ok())
+        {
+            self.magia_mode = m;
+            self.magia_from_state = true;
+            self.role_models = v
+                .get("role_models")
+                .and_then(Value::as_object)
+                .into_iter()
+                .flatten()
+                .filter_map(|(k, spec)| {
+                    let role = crate::magia_mode::Role::parse(k)?;
+                    let spec = spec.as_str()?.trim();
+                    (!spec.is_empty()).then(|| (role, spec.to_owned()))
+                })
+                .collect();
+        }
     }
 
     pub fn save_state(&self) -> Result<()> {
@@ -472,13 +500,26 @@ impl Config {
         if let Some(p) = path.parent() {
             std::fs::create_dir_all(p)?;
         }
-        let v = serde_json::json!({
+        let mut v = serde_json::json!({
             "provider": self.provider,
             "model": self.model,
             "permission_mode": self.permission_mode,
             "agent": self.agent,
             "sidebar": self.sidebar,
+            "theme": self.theme,
         });
+        if self.magia_from_state {
+            v["magia_mode"] = serde_json::json!({
+                "max_rounds": self.magia_mode.max_rounds,
+                "review": self.magia_mode.review,
+            });
+            v["role_models"] = self
+                .role_models
+                .iter()
+                .map(|(r, s)| (r.name().to_owned(), Value::from(s.as_str())))
+                .collect::<serde_json::Map<_, _>>()
+                .into();
+        }
         std::fs::write(path, serde_json::to_string_pretty(&v)?)?;
         Ok(())
     }

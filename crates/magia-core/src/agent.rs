@@ -277,6 +277,14 @@ pub struct Agent {
     denied: AtomicBool,
     last_input_tokens: u64,
     is_child: bool,
+    /// A `worker` subagent: it may change files, under the parent's permission mode, rules
+    /// and checkpoints, asking the user through the parent's approver.
+    worker: bool,
+    /// A worker's `auto` mode reviewer judges against these (the person's own requests), never
+    /// the prompt the parent model wrote for it.
+    user_requests: Option<Vec<String>>,
+    /// Workers ask the user one at a time, even when several run at once.
+    approve_lock: Arc<tokio::sync::Mutex<()>>,
     /// Used as the session id when there is no session file (tests, subagents).
     fallback_session: String,
 }
@@ -322,6 +330,9 @@ impl Agent {
             denied: AtomicBool::new(false),
             last_input_tokens: 0,
             is_child: false,
+            worker: false,
+            user_requests: None,
+            approve_lock: Default::default(),
             fallback_session: new_session_id(),
         }
     }
@@ -333,6 +344,13 @@ impl Agent {
         self.cx.sandbox = cfg.sandbox;
         self.rules = cfg.rules.clone();
         self.auto_model = cfg.auto_model.clone();
+        self.set_roles(cfg);
+        self.reference_dirs = crate::projects::references(&self.cx.cwd);
+        self.add_instructions(&cfg.instructions);
+    }
+
+    /// The model of each subagent role, from `Config::role_models`.
+    pub fn set_roles(&mut self, cfg: &crate::Config) {
         self.roles.clear();
         for (role, spec) in &cfg.role_models {
             // Bad specs were reported as config warnings; those roles use the session model.
@@ -346,8 +364,6 @@ impl Agent {
             };
             self.roles.insert(*role, (client, model));
         }
-        self.reference_dirs = crate::projects::references(&self.cx.cwd);
-        self.add_instructions(&cfg.instructions);
     }
 
     /// Append extra instruction files (`instructions` in the config; paths or globs relative to
@@ -437,7 +453,7 @@ impl Agent {
         if self.rules.fully_denied(name) {
             return false;
         }
-        if self.is_child {
+        if self.is_child && !self.worker {
             // The subagent's approver always says no, so only auto-allowed tools are usable.
             return decide(self.mode, tool) == Decision::Allow || self.rules.may_allow(name);
         }
@@ -521,11 +537,13 @@ or a decision is genuinely theirs; do not use it for things you can find out you
                 description: format!("Delegate to a read-only subagent with its own fresh context. It can read/search \
 the project but not modify it, and returns a report. Pick `agent`: `explore` (default) finds code, files and \
 conventions fast; `plan` turns a request plus the context you gathered into an ordered plan with verification steps; \
-`oracle` is a senior consultant for hard problems (architecture, a stubborn bug, a second opinion on your plan). \
+`oracle` is a senior consultant for hard problems (architecture, a stubborn bug, a second opinion on your plan); \
+`worker` (not in plan mode) implements a well-defined change and CAN edit files: tell it exactly which files it owns, \
+what to change and how to verify, never give two workers the same file, and check their work afterwards. \
 Several `task` calls in one response run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent \
 questions across them."),
                 schema: json!({"type":"object","properties":{
-                    "agent":{"type":"string","enum":Role::DELEGATED.map(Role::name),"description":"which subagent (default explore)"},
+                    "agent":{"type":"string","enum":self.delegated().iter().map(|r| r.name()).collect::<Vec<_>>(),"description":"which subagent (default explore)"},
                     "description":{"type":"string","description":"3-5 word label"},
                     "prompt":{"type":"string","description":"everything the subagent needs to know"}},
                     "required":["prompt"]}),
@@ -569,7 +587,10 @@ questions across them."),
         if !hook.output.trim().is_empty() {
             prompt.push_str(&format!("\n\n[hook output]\n{}", hook.output.trim()));
         }
-        self.cx.checkpoints.begin_turn();
+        // A worker shares the parent's checkpoints: its edits belong to the parent's turn.
+        if !self.is_child {
+            self.cx.checkpoints.begin_turn();
+        }
         self.push(Message::User {
             text: prompt,
             images,
@@ -702,7 +723,7 @@ questions across them."),
     }
 
     fn max_steps(&self) -> usize {
-        if self.is_child {
+        if self.is_child && !self.worker {
             CHILD_MAX_STEPS
         } else {
             MAX_STEPS
@@ -742,6 +763,7 @@ questions across them."),
             Role::Review.prompt(),
             cancel.clone(),
             Some((events.clone(), REVIEW_PARENT.into())),
+            None,
         )
         .await;
         magia_mode::parse_review(&report)
@@ -933,6 +955,14 @@ questions across them."),
     }
 
     /// What a subagent in `role` gets: the role's own model when the config names one.
+    /// The roles `task` may start: no `worker` in plan mode, where nothing may change.
+    fn delegated(&self) -> Vec<Role> {
+        Role::DELEGATED
+            .into_iter()
+            .filter(|r| *r != Role::Worker || self.mode != PermissionMode::Plan)
+            .collect()
+    }
+
     fn child_base(&self, role: Role) -> ChildBase {
         let (client, model) = match self.roles.get(&role) {
             Some((client, model)) => (
@@ -944,6 +974,18 @@ questions across them."),
         ChildBase {
             client,
             model,
+            mode: self.mode,
+            rules: self.rules.clone(),
+            hooks: self.hooks.clone(),
+            auto_model: self.auto_model.clone(),
+            sandbox: self.cx.sandbox,
+            checkpoints: self.cx.checkpoints.clone(),
+            read_files: self.cx.read_files.clone(),
+            user_requests: self
+                .user_requests
+                .clone()
+                .unwrap_or_else(|| crate::review::user_requests(&self.history)),
+            approve_lock: self.approve_lock.clone(),
             cwd: self.cx.cwd.clone(),
             allowed_dirs: self.allowed_dirs.clone(),
             denied_dirs: self.denied_dirs.clone(),
@@ -1131,7 +1173,10 @@ questions across them."),
                 let r = crate::review::review(
                     &self.client,
                     model,
-                    &crate::review::user_requests(&self.history),
+                    &self
+                        .user_requests
+                        .clone()
+                        .unwrap_or_else(|| crate::review::user_requests(&self.history)),
                     call,
                     &self.cx.cwd,
                     self.session_id(),
@@ -1249,7 +1294,7 @@ questions across them."),
                 .to_owned();
             let role = match call.arguments.get("agent").and_then(Value::as_str) {
                 None => Some(Role::Explore),
-                Some(a) => Role::parse(a).filter(|r| Role::DELEGATED.contains(r)),
+                Some(a) => Role::parse(a).filter(|r| self.delegated().contains(r)),
             };
             if prompt.is_empty() {
                 Err(anyhow::anyhow!("missing `prompt`"))
@@ -1262,11 +1307,16 @@ questions across them."),
                     role.prompt(),
                     self.cx.cancel.clone(),
                     Some((events.clone(), call.id.clone())),
+                    (role == Role::Worker).then_some(approver),
                 )
                 .await
                 .into())
             } else {
-                Err(anyhow::anyhow!("`agent` must be explore, plan or oracle"))
+                let names: Vec<_> = self.delegated().iter().map(|r| r.name()).collect();
+                Err(anyhow::anyhow!(
+                    "`agent` must be one of: {}",
+                    names.join(", ")
+                ))
             }
         } else {
             let Some(tool) = self.tools.get(&call.name) else {
@@ -1751,16 +1801,50 @@ struct ChildBase {
     allowed_dirs: Arc<std::sync::Mutex<Vec<PathBuf>>>,
     denied_dirs: Arc<std::sync::Mutex<Vec<PathBuf>>>,
     reference_dirs: Vec<PathBuf>,
+    // Used by a worker only: it runs under the parent's rules and shares its checkpoints.
+    mode: PermissionMode,
+    rules: RuleSet,
+    hooks: Hooks,
+    auto_model: Option<String>,
+    sandbox: bool,
+    checkpoints: Arc<magia_tools::Checkpoints>,
+    read_files: Arc<std::sync::Mutex<std::collections::HashSet<PathBuf>>>,
+    user_requests: Vec<String>,
+    approve_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
-fn run_subagent(
+/// The parent's approver, one question at a time.
+struct SerialApprover<'a> {
+    inner: &'a dyn Approver,
+    lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+#[async_trait]
+impl Approver for SerialApprover<'_> {
+    async fn approve(&self, call: &ToolCall) -> bool {
+        let _turn = self.lock.lock().await;
+        self.inner.approve(call).await
+    }
+    async fn approve_folder(&self, call: &ToolCall, dirs: &[PathBuf]) -> FolderAnswer {
+        let _turn = self.lock.lock().await;
+        self.inner.approve_folder(call, dirs).await
+    }
+    async fn approve_because(&self, call: &ToolCall, reason: &str) -> bool {
+        let _turn = self.lock.lock().await;
+        self.inner.approve_because(call, reason).await
+    }
+}
+
+fn run_subagent<'a>(
     base: ChildBase,
     prompt: String,
     role: &'static str,
     cancel: CancellationToken,
     // Where to report the child's tool calls live, under which parent id.
     forward: Option<(UnboundedSender<AgentEvent>, String)>,
-) -> BoxFuture<'static, String> {
+    // A worker: it may change files, asking the user through this approver.
+    worker: Option<&'a dyn Approver>,
+) -> BoxFuture<'a, String> {
     let ChildBase {
         client,
         model,
@@ -1768,10 +1852,38 @@ fn run_subagent(
         allowed_dirs,
         denied_dirs,
         reference_dirs,
+        mode,
+        rules,
+        hooks,
+        auto_model,
+        sandbox,
+        checkpoints,
+        read_files,
+        user_requests,
+        approve_lock,
     } = base;
     async move {
-        let mut child = Agent::new(client, model, PermissionMode::Plan, cwd);
+        let mut child = Agent::new(
+            client,
+            model,
+            if worker.is_some() {
+                mode
+            } else {
+                PermissionMode::Plan
+            },
+            cwd,
+        );
         child.is_child = true;
+        if worker.is_some() {
+            child.worker = true;
+            child.rules = rules;
+            child.hooks = hooks;
+            child.auto_model = auto_model;
+            child.cx.sandbox = sandbox;
+            child.cx.checkpoints = checkpoints;
+            child.cx.read_files = read_files;
+            child.user_requests = Some(user_requests);
+        }
         child.allowed_dirs = allowed_dirs;
         child.denied_dirs = denied_dirs;
         child.reference_dirs = reference_dirs;
@@ -1813,10 +1925,19 @@ fn run_subagent(
                 }
             }
         };
-        tokio::join!(
-            child.run_turn(prompt, tx, cancel, &AutoApprove(false)),
-            watch
-        );
+        let deny = AutoApprove(false);
+        let serial;
+        let approver: &dyn Approver = match worker {
+            Some(inner) => {
+                serial = SerialApprover {
+                    inner,
+                    lock: approve_lock,
+                };
+                &serial
+            }
+            None => &deny,
+        };
+        tokio::join!(child.run_turn(prompt, tx, cancel, approver), watch);
         let report = child
             .history
             .iter()
