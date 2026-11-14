@@ -1,6 +1,6 @@
 use crate::ext::{SkillTool, discover_skills, expand_mentions};
 use crate::hooks::Hooks;
-use crate::magia_mode::{self, Continue, MagiaMode};
+use crate::magia_mode::{self, Continue, MagiaMode, Role};
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -263,6 +263,9 @@ pub struct Agent {
     /// The Magia agent is selected (`crate::magia_mode`): the request runs in rounds until the
     /// task list is closed. Ignored in plan mode and in subagents.
     pub magia: Option<MagiaMode>,
+    /// Subagent roles with their own model (`Config::role_models`): the client when the role
+    /// names its provider, else the session's client with this model id.
+    pub roles: std::collections::HashMap<Role, (Option<Client>, String)>,
     /// Pause before repeating a failed request (5 s; the provider's `retry-after` can raise it).
     pub retry_delay: std::time::Duration,
     /// The root file already added as project instructions (`AGENTS.md`/`CLAUDE.md`), so picking
@@ -307,6 +310,7 @@ impl Agent {
             auto_model: None,
             persona: None,
             magia: None,
+            roles: Default::default(),
             subagents: tokio::sync::Semaphore::new(MAX_PARALLEL_SUBAGENTS),
             side: Default::default(),
             allowed_dirs: Default::default(),
@@ -329,6 +333,19 @@ impl Agent {
         self.cx.sandbox = cfg.sandbox;
         self.rules = cfg.rules.clone();
         self.auto_model = cfg.auto_model.clone();
+        self.roles.clear();
+        for (role, spec) in &cfg.role_models {
+            // Bad specs were reported as config warnings; those roles use the session model.
+            let Ok((provider, model)) = cfg.role_model(spec) else {
+                continue;
+            };
+            let client = match provider.map(Client::new) {
+                Some(Ok(c)) => Some(c),
+                Some(Err(_)) => continue,
+                None => None,
+            };
+            self.roles.insert(*role, (client, model));
+        }
         self.reference_dirs = crate::projects::references(&self.cx.cwd);
         self.add_instructions(&cfg.instructions);
     }
@@ -501,10 +518,14 @@ or a decision is genuinely theirs; do not use it for things you can find out you
         if !self.is_child && !self.rules.fully_denied("task") {
             v.push(ToolSpec {
                 name: "task".into(),
-                description: format!("Delegate a self-contained research question to a read-only subagent with its own context. \
-It can read/search the project but not modify it; it returns a concise report. Several `task` calls in one response \
-run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent questions across them."),
+                description: format!("Delegate to a read-only subagent with its own fresh context. It can read/search \
+the project but not modify it, and returns a report. Pick `agent`: `explore` (default) finds code, files and \
+conventions fast; `plan` turns a request plus the context you gathered into an ordered plan with verification steps; \
+`oracle` is a senior consultant for hard problems (architecture, a stubborn bug, a second opinion on your plan). \
+Several `task` calls in one response run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent \
+questions across them."),
                 schema: json!({"type":"object","properties":{
+                    "agent":{"type":"string","enum":Role::DELEGATED.map(Role::name),"description":"which subagent (default explore)"},
                     "description":{"type":"string","description":"3-5 word label"},
                     "prompt":{"type":"string","description":"everything the subagent needs to know"}},
                     "required":["prompt"]}),
@@ -716,9 +737,9 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
             })
             .unwrap_or("");
         let report = run_subagent(
-            self.child_base(),
+            self.child_base(Role::Review),
             magia_mode::review_prompt(request, todos, &files, claim),
-            magia_mode::REVIEWER,
+            Role::Review.prompt(),
             cancel.clone(),
             Some((events.clone(), REVIEW_PARENT.into())),
         )
@@ -911,10 +932,18 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
         }
     }
 
-    fn child_base(&self) -> ChildBase {
+    /// What a subagent in `role` gets: the role's own model when the config names one.
+    fn child_base(&self, role: Role) -> ChildBase {
+        let (client, model) = match self.roles.get(&role) {
+            Some((client, model)) => (
+                client.clone().unwrap_or_else(|| self.client.clone()),
+                model.clone(),
+            ),
+            None => (self.client.clone(), self.model.clone()),
+        };
         ChildBase {
-            client: self.client.clone(),
-            model: self.model.clone(),
+            client,
+            model,
             cwd: self.cx.cwd.clone(),
             allowed_dirs: self.allowed_dirs.clone(),
             denied_dirs: self.denied_dirs.clone(),
@@ -1218,20 +1247,26 @@ run in parallel (up to {MAX_PARALLEL_SUBAGENTS} at a time): split independent qu
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned();
+            let role = match call.arguments.get("agent").and_then(Value::as_str) {
+                None => Some(Role::Explore),
+                Some(a) => Role::parse(a).filter(|r| Role::DELEGATED.contains(r)),
+            };
             if prompt.is_empty() {
                 Err(anyhow::anyhow!("missing `prompt`"))
-            } else {
+            } else if let Some(role) = role {
                 // Waits here when MAX_PARALLEL_SUBAGENTS are already running.
                 let _slot = self.subagents.acquire().await;
                 Ok(run_subagent(
-                    self.child_base(),
+                    self.child_base(role),
                     prompt,
-                    RESEARCHER,
+                    role.prompt(),
                     self.cx.cancel.clone(),
                     Some((events.clone(), call.id.clone())),
                 )
                 .await
                 .into())
+            } else {
+                Err(anyhow::anyhow!("`agent` must be explore, plan or oracle"))
             }
         } else {
             let Some(tool) = self.tools.get(&call.name) else {
@@ -1705,8 +1740,6 @@ fn render_transcript(h: &[Message]) -> String {
     }
     out
 }
-
-const RESEARCHER: &str = "You are a read-only research subagent. Investigate, then reply with a concise report (no preamble).";
 
 /// A read-only child agent with a fresh context; returns its final report.
 /// What a subagent takes from its parent.

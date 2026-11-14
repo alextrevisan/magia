@@ -64,7 +64,12 @@
     "sandbox": false,                  // bash inside bubblewrap
     // Magia agent: rounds per request (each with the usual step limit), and an independent
     // read-only review of the changed files before it finishes
-    "magia_mode": { "max_rounds": 30, "review": true },
+    "magia_mode": {
+      "max_rounds": 30, "review": true,
+      // Model of each subagent role ("provider/model", or a bare id on the session's provider).
+      // A role left out uses the session's model.
+      "models": { "explore": "go/fast-model", "plan": "zen/big-model", "oracle": "zen/big-model", "review": "zen/big-model" }
+    },
     "wire_overrides": { "zen/some-model": "messages" },   // chat_completions | responses | messages
     "hooks": [
       { "event": "pre_tool", "matcher": "bash", "command": "jq -e '.input.command | test(\"rm -rf /\") | not' >/dev/null || { echo 'refusing' >&2; exit 2; }" }

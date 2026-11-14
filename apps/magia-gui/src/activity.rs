@@ -149,7 +149,11 @@ impl Activity {
                     .filter(|d| !d.is_empty())
                     .or(get("prompt"))
                     .unwrap_or("subagent");
-                self.subs.push(new_sub(id, clip(label, 80)));
+                let label = match get("agent").filter(|a| !a.is_empty()) {
+                    Some(role) => format!("{role} · {label}"),
+                    None => label.to_owned(),
+                };
+                self.subs.push(new_sub(id, clip(&label, 80)));
             }
             AgentEvent::ToolEnd {
                 id,

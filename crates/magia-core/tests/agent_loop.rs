@@ -332,6 +332,47 @@ async fn subagent_runs_read_only_with_fresh_context() {
 }
 
 #[tokio::test]
+async fn subagent_roles_bring_their_prompt_and_model() {
+    use magia_core::magia_mode::Role;
+    let dir = tempfile::tempdir().unwrap();
+    let (url, server) = serve(vec![
+        tool_reply(&[
+            (
+                "t1",
+                "task",
+                r#"{"agent":"oracle","prompt":"why does it crash"}"#,
+            ),
+            ("t2", "task", r#"{"agent":"wizard","prompt":"x"}"#),
+        ]),
+        text_reply("diagnosis: null pointer"),
+        text_reply("done"),
+    ])
+    .await;
+    let mut agent = Agent::new(
+        client(url),
+        "main-model".into(),
+        PermissionMode::Ask,
+        dir.path().into(),
+    );
+    agent
+        .roles
+        .insert(Role::Oracle, (None, "oracle-model".into()));
+    run(&mut agent, "investigate").await;
+    assert!(
+        matches!(&agent.history[2], Message::ToolResult { content, is_error: false, .. } if content.contains("null pointer"))
+    );
+    assert!(
+        matches!(&agent.history[3], Message::ToolResult { content, is_error: true, .. } if content.contains("explore, plan or oracle"))
+    );
+    let bodies = server.await.unwrap();
+    assert!(bodies[0].contains(r#""enum":["explore","plan","oracle"]"#));
+    assert!(
+        bodies[1].contains(r#""model":"oracle-model""#) && bodies[1].contains("You are the oracle")
+    );
+    assert!(bodies[2].contains(r#""model":"main-model""#));
+}
+
+#[tokio::test]
 async fn pre_tool_hook_blocks_execution() {
     let dir = tempfile::tempdir().unwrap();
     let (url, _s) = serve(vec![

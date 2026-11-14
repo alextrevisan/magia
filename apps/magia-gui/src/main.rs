@@ -2770,7 +2770,12 @@ fn tool_summary(name: &str, args: &serde_json::Value) -> String {
         }),
         "webfetch" => get("url"),
         "websearch" => get("query"),
-        "task" => get("description").or_else(|| get("prompt")),
+        "task" => get("description")
+            .or_else(|| get("prompt"))
+            .map(|d| match get("agent") {
+                Some(role) => format!("{role} · {d}"),
+                None => d,
+            }),
         "todo" => Some("update the task list".into()),
         _ => None,
     };

@@ -54,6 +54,9 @@ pub struct Config {
     pub auto_model: Option<String>,
     /// Limits of the Magia agent (`"magia": {"magia_mode": {...}}`).
     pub magia_mode: crate::magia_mode::MagiaMode,
+    /// Model of each subagent role (`"magia_mode": {"models": {"explore": "provider/model"}}`);
+    /// a role left out uses the session's model. See `Config::role_model`.
+    pub role_models: Vec<(crate::magia_mode::Role, String)>,
     pub hooks: Vec<HookConfig>,
     pub mcp: Vec<McpServerConfig>,
     pub rules: RuleSet,
@@ -80,6 +83,7 @@ impl Default for Config {
             sandbox: false,
             auto_model: None,
             magia_mode: Default::default(),
+            role_models: vec![],
             hooks: vec![],
             mcp: vec![],
             rules: RuleSet::default(),
@@ -373,6 +377,22 @@ impl Config {
         {
             cfg.magia_mode = m;
         }
+        let models = u.get("magia_mode").and_then(|m| m.get("models"));
+        for (k, spec) in obj(models.unwrap_or(&Value::Null)) {
+            let spec = spec.as_str().map(str::trim).unwrap_or_default();
+            match crate::magia_mode::Role::parse(&k) {
+                Some(role) if !spec.is_empty() => match cfg.role_model(spec) {
+                    Ok(_) => cfg.role_models.push((role, spec.to_owned())),
+                    Err(e) => cfg.warnings.push(format!(
+                        "magia_mode.models.{k}: {e:#}; using the session's model"
+                    )),
+                },
+                Some(_) => {}
+                None => cfg.warnings.push(format!(
+                    "magia_mode.models: unknown role `{k}` (explore, plan, oracle, review)"
+                )),
+            }
+        }
         if let Some(h) = u
             .get("hooks")
             .and_then(|h| serde_json::from_value(h.clone()).ok())
@@ -473,6 +493,16 @@ impl Config {
 
     /// Resolve a provider by name: preset (zen/go/openrouter) + user overrides + key from env.
     /// Any other name needs a base URL and is treated as an OpenAI-compatible endpoint.
+    /// A role's model: `provider/model` (its own provider) or a bare `model` (the session's
+    /// provider), as in `model`. A `#variant` suffix is dropped.
+    pub fn role_model(&self, spec: &str) -> Result<(Option<ProviderConfig>, String)> {
+        let spec = spec.split('#').next().unwrap_or(spec).trim();
+        match spec.split_once('/') {
+            Some((p, m)) => Ok((Some(self.provider_config(p)?), m.to_owned())),
+            None => Ok((None, spec.to_owned())),
+        }
+    }
+
     pub fn provider_config(&self, name: &str) -> Result<ProviderConfig> {
         let ov = self.providers.get(name).cloned().unwrap_or_default();
         let mut cfg = match preset(name) {
@@ -553,7 +583,7 @@ mod tests {
             "instructions": ["CONTRIBUTING.md"],
             "command": {"review": {"template": "Review $ARGUMENTS"}},
             "magia": {"permission_mode": "accept_edits", "compact_at_tokens": 5, "sandbox": true,
-                     "magia_mode": {"max_rounds": 7},
+                     "magia_mode": {"max_rounds": 7, "models": {"explorer": "local/m1", "oracle": "big-model", "bogus": "x"}},
                      "wire_overrides": {"zen/foo": "messages"}}
         });
         let c = Config::from_value(&v);
@@ -602,6 +632,28 @@ mod tests {
             }
         );
         assert!(Config::default().provider_config("nope").is_err());
+        // Subagent roles: `provider/model` brings its provider, a bare id uses the session's.
+        use crate::magia_mode::Role;
+        let roles: Vec<_> = c
+            .role_models
+            .iter()
+            .map(|(r, s)| {
+                let (p, m) = c.role_model(s).unwrap();
+                (*r, p.map(|p| p.base_url), m)
+            })
+            .collect();
+        assert_eq!(
+            roles,
+            [
+                (
+                    Role::Explore,
+                    Some("http://localhost:8080/v1".into()),
+                    "m1".into()
+                ),
+                (Role::Oracle, None, "big-model".into()),
+            ]
+        );
+        assert!(c.warnings.iter().any(|w| w.contains("`bogus`")));
     }
 
     #[test]
