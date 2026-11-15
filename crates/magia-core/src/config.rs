@@ -33,6 +33,9 @@ pub struct ProviderOverride {
     pub default_wire: Option<Wire>,
     /// Model ids declared in the config (added to the model picker).
     pub models: Vec<String>,
+    /// Token limits declared with them (`"models": {"id": {"limit": {"context": 200000}}}`).
+    /// They win over what the provider's model list says.
+    pub limits: HashMap<String, magia_types::ModelLimit>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,8 +49,9 @@ pub struct Config {
     /// GUI: the left bar (projects and chats) is open. Last choice, from the state file.
     pub sidebar: bool,
     pub providers: HashMap<String, ProviderOverride>,
-    /// Compact the conversation when it nears this many tokens (0 = never). Default 100k.
-    pub compact_at_tokens: u64,
+    /// Compact the conversation when it nears this many tokens (0 = never). None (the default):
+    /// at `compact_percent` of the model's context window, or 100k when it is unknown.
+    pub compact_at_tokens: Option<u64>,
     /// Run `bash` inside bubblewrap (read-only FS except the project dir) when installed.
     pub sandbox: bool,
     /// `auto` mode: model id that reviews unclear tool calls (default: the session's model).
@@ -62,6 +66,9 @@ pub struct Config {
     pub magia_from_state: bool,
     /// GUI appearance: `system`, `light` or `dark` (state file).
     pub theme: String,
+    /// Compact at this share of the model's context window, in % (settings window, state
+    /// file; default 95). An explicit `compact_at_tokens` wins.
+    pub compact_percent: u8,
     pub hooks: Vec<HookConfig>,
     pub mcp: Vec<McpServerConfig>,
     pub rules: RuleSet,
@@ -84,13 +91,14 @@ impl Default for Config {
             agent: crate::agents::BUILD.into(),
             sidebar: true,
             providers: HashMap::new(),
-            compact_at_tokens: 100_000,
+            compact_at_tokens: None,
             sandbox: false,
             auto_model: None,
             magia_mode: Default::default(),
             role_models: vec![],
             magia_from_state: false,
             theme: "system".into(),
+            compact_percent: 95,
             hooks: vec![],
             mcp: vec![],
             rules: RuleSet::default(),
@@ -232,8 +240,12 @@ impl Config {
                     Some("@ai-sdk/openai-compatible") => Some(Wire::ChatCompletions),
                     _ => ov.default_wire,
                 };
-                ov.models
-                    .extend(obj(p.get("models").unwrap_or(&Value::Null)).keys().cloned());
+                for (id, m) in obj(p.get("models").unwrap_or(&Value::Null)) {
+                    ov.models.push(id.clone());
+                    if let Some(l) = magia_types::ModelLimit::from_json(&m) {
+                        ov.limits.insert(id.clone(), l);
+                    }
+                }
             }
         }
 
@@ -368,7 +380,7 @@ impl Config {
             cfg.permission_mode = m;
         }
         if let Some(n) = u.get("compact_at_tokens").and_then(Value::as_u64) {
-            cfg.compact_at_tokens = n;
+            cfg.compact_at_tokens = Some(n);
         }
         cfg.sandbox = u.get("sandbox").and_then(Value::as_bool).unwrap_or(false);
         if let Some(m) = u
@@ -475,6 +487,9 @@ impl Config {
         if let Some(t) = v.get("theme").and_then(Value::as_str) {
             self.theme = t.to_owned();
         }
+        if let Some(p) = v.get("compact_percent").and_then(Value::as_u64) {
+            self.compact_percent = p.clamp(10, 100) as u8;
+        }
         if let Some(m) = v
             .get("magia_mode")
             .and_then(|m| serde_json::from_value(m.clone()).ok())
@@ -507,6 +522,7 @@ impl Config {
             "agent": self.agent,
             "sidebar": self.sidebar,
             "theme": self.theme,
+            "compact_percent": self.compact_percent,
         });
         if self.magia_from_state {
             v["magia_mode"] = serde_json::json!({
@@ -532,15 +548,18 @@ impl Config {
             .unwrap_or_default()
     }
 
-    /// Resolve a provider by name: preset (zen/go/openrouter) + user overrides + key from env.
-    /// Any other name needs a base URL and is treated as an OpenAI-compatible endpoint.
-    /// A role's model: `provider/model` (its own provider) or a bare `model` (the session's
-    /// provider), as in `model`. A `#variant` suffix is dropped.
+    /// The context window declared in the config for this provider's model.
+    pub fn declared_limit(&self, provider: &str, model: &str) -> Option<magia_types::ModelLimit> {
+        self.providers.get(provider)?.limits.get(model).copied()
+    }
+
     /// A built-in provider or one defined under `"provider"`.
     pub fn is_provider(&self, name: &str) -> bool {
         preset(name).is_some() || self.providers.contains_key(name)
     }
 
+    /// A role's model: `provider/model` (its own provider) or a bare `model` (the session's
+    /// provider), as in `model`. A `#variant` suffix is dropped.
     pub fn role_model(&self, spec: &str) -> Result<(Option<ProviderConfig>, String)> {
         let spec = spec.split('#').next().unwrap_or(spec).trim();
         // Only a provider magia knows counts as the prefix: many ids carry a vendor of their
@@ -554,6 +573,8 @@ impl Config {
         }
     }
 
+    /// Resolve a provider by name: preset (zen/go/openrouter) + user overrides + key from env.
+    /// Any other name needs a base URL and is treated as an OpenAI-compatible endpoint.
     pub fn provider_config(&self, name: &str) -> Result<ProviderConfig> {
         let ov = self.providers.get(name).cloned().unwrap_or_default();
         let mut cfg = match preset(name) {
@@ -622,7 +643,7 @@ mod tests {
             "model": "openrouter/anthropic/claude-sonnet-4#high",
             "provider": {
                 "local": {"npm": "@ai-sdk/openai-compatible", "options": {"baseURL": "http://localhost:8080/v1", "apiKey": "sk-local", "headers": {"X-A": "1"}},
-                          "models": {"m1": {}, "m2": {}}},
+                          "models": {"m1": {"limit": {"context": 32768, "output": 4096}}, "m2": {}}},
                 "zen": {"options": {"baseURL": "http://proxy/v1"}},
                 "anthro": {"npm": "@ai-sdk/anthropic", "options": {"baseURL": "https://x/v1"}}
             },
@@ -648,6 +669,11 @@ mod tests {
         assert_eq!(l.extra_headers, vec![("X-A".to_owned(), "1".to_owned())]);
         assert_eq!(c.declared_models("local"), vec!["m1", "m2"]);
         assert_eq!(
+            c.declared_limit("local", "m1").map(|l| l.context),
+            Some(32_768)
+        );
+        assert_eq!(c.declared_limit("local", "m2"), None);
+        assert_eq!(
             c.provider_config("zen").unwrap().base_url,
             "http://proxy/v1"
         );
@@ -672,7 +698,7 @@ mod tests {
         assert_eq!(c.commands["review"], "Review $ARGUMENTS");
         assert_eq!(
             (c.permission_mode, c.compact_at_tokens, c.sandbox),
-            (PermissionMode::AcceptEdits, 5, true)
+            (PermissionMode::AcceptEdits, Some(5), true)
         );
         // Keys left out keep their defaults.
         assert_eq!(

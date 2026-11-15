@@ -219,6 +219,9 @@ struct App {
     last_rate: Option<f64>,
     /// Size of the context at the last response (its input + output); 0 = not known yet.
     context: u64,
+    /// The model's context window (None = not reported) and the size at which the agent
+    /// compacts, as of the last request.
+    context_limit: (Option<u64>, u64),
     /// The conversation waiting for "Delete?" to be confirmed: (session file, title).
     delete_confirm: Option<(PathBuf, String)>,
     /// Cached rendered height per item (0 = not measured yet); drives the virtualized list.
@@ -392,6 +395,7 @@ impl App {
             tokens: (0, 0),
             last_rate: None,
             context: 0,
+            context_limit: (None, 0),
             delete_confirm: None,
             heights: vec![],
             last_width: 0.0,
@@ -939,13 +943,19 @@ impl App {
                     self.cfg.magia_mode.max_rounds = d.max_rounds;
                     self.cfg.magia_mode.review = d.review;
                     self.cfg.role_models = d.role_models(&self.cfg);
+                    self.cfg.compact_percent = d.compact_percent;
                     self.cfg.magia_from_state = true;
                     ctx.set_theme(settings::preference(&d.theme));
-                    if let Ok(mut a) = self.agent.try_lock() {
-                        a.set_roles(&self.cfg);
-                        a.magia = (self.cfg.agent == agents::MAGIA).then_some(self.cfg.magia_mode);
-                    } else {
-                        self.status = "settings saved; they apply from the next request".into();
+                    // A running request holds the agent: the settings go in when it ends.
+                    let (agent, cfg) = (self.agent.clone(), self.cfg.clone());
+                    self.rt.spawn(async move {
+                        let mut a = agent.lock().await;
+                        a.set_roles(&cfg);
+                        a.magia = (cfg.agent == agents::MAGIA).then_some(cfg.magia_mode);
+                        a.compact_percent = cfg.compact_percent;
+                    });
+                    if self.running {
+                        self.status = "settings saved; they apply when this request ends".into();
                     }
                     let _ = self.cfg.save_state();
                 }
@@ -1022,12 +1032,14 @@ impl App {
         let Ok(a) = self.agent.try_lock() else { return };
         let client = a.client.clone();
         drop(a);
-        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        let (tx, ctx, agent) = (self.tx.clone(), ctx.clone(), self.agent.clone());
         let declared = self.cfg.declared_models(&self.cfg.provider);
         self.rt.spawn(async move {
             // Models declared in the JSON config are always offered, even if `/models` fails.
+            let mut listed = Vec::new();
             let r = match client.list_models().await {
                 Ok(m) => {
+                    listed = m.clone();
                     let mut ids: Vec<String> = m.into_iter().map(|m| m.id).collect();
                     for d in declared {
                         if !ids.contains(&d) {
@@ -1041,6 +1053,10 @@ impl App {
             };
             let _ = tx.send(UiMsg::Models(r));
             ctx.request_repaint();
+            // The agent learns the windows from this list (waits for a running turn to end).
+            if !listed.is_empty() {
+                agent.lock().await.add_limits(&client.config.name, &listed);
+            }
         });
     }
 
@@ -1601,6 +1617,14 @@ impl App {
                                 self.last_rate = Some(r);
                             }
                         }
+                        AgentEvent::Context {
+                            tokens,
+                            window,
+                            compact_at,
+                        } => {
+                            self.context = tokens;
+                            self.context_limit = (window, compact_at);
+                        }
                         AgentEvent::Notice(n) => self.status = n,
                         AgentEvent::Compacted { before, history } => {
                             // Show what the model sees now: the summary, then what was kept.
@@ -2000,13 +2024,20 @@ impl App {
                             ui.add_space(6.0);
                         }
                         if self.context > 0 {
-                            let ctx = theme::count(self.context);
+                            let (window, at) = self.context_limit;
+                            let (text, hover) = context_label(self.context, window, at);
+                            // Warn from 80% of the compaction point on.
+                            let color = if at > 0 && self.context * 5 >= at * 4 {
+                                t.warn
+                            } else {
+                                t.muted
+                            };
                             ui.label(
-                                egui::RichText::new(format!("context {ctx}"))
+                                egui::RichText::new(text)
                                     .font(theme::mono(theme::SMALL))
-                                    .color(t.muted),
+                                    .color(color),
                             )
-                            .on_hover_text("Tokens in the current context (input + output)");
+                            .on_hover_text(hover);
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if self.running {
@@ -2241,17 +2272,29 @@ impl App {
         let mut answer: Option<Option<String>> = None;
         egui::Modal::new(egui::Id::new("question")).show(ctx, |ui| {
             let t = *theme::tokens(ui);
-            ui.set_width(460.0);
+            ui.set_width(560.0_f32.min(ctx.content_rect().width() - 48.0));
             theme::role(ui, "THE AGENT ASKS", t.accent);
             ui.add_space(2.0);
-            ui.add(egui::Label::new(egui::RichText::new(&q.text).size(theme::BODY + 1.0)).wrap());
+            // A long question (or long options) scrolls; the answer field and buttons stay put.
+            let max = (ctx.content_rect().height() * 0.6).max(160.0);
+            egui::ScrollArea::vertical()
+                // Per question, so the next step starts at its top, not where this one was.
+                .id_salt(("question-text", &q.text))
+                .max_height(max)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    markdown::show(ui, &q.text, 0x9e57);
+                    ui.add_space(6.0);
+                    for o in &q.options {
+                        let b = egui::Button::new(egui::RichText::new(o))
+                            .wrap()
+                            .min_size(egui::vec2(ui.available_width(), 30.0));
+                        if ui.add(b).clicked() {
+                            answer = Some(Some(o.clone()));
+                        }
+                    }
+                });
             ui.add_space(6.0);
-            for o in &q.options {
-                let b = egui::Button::new(o).min_size(egui::vec2(ui.available_width(), 30.0));
-                if ui.add(b).clicked() {
-                    answer = Some(Some(o.clone()));
-                }
-            }
             let r = ui.add(
                 egui::TextEdit::singleline(typed)
                     .hint_text("Or type your own answer")
@@ -2969,6 +3012,29 @@ fn relative(s: &str, cwd: &std::path::Path) -> String {
 }
 
 /// The argument that says what a tool call does: the command, the path, the query…
+/// The context counter under the composer: `context 45k / 200k` (or `context 45k` when the
+/// window is unknown) and its hover text with the compaction point.
+fn context_label(used: u64, window: Option<u64>, compact_at: u64) -> (String, String) {
+    let c = theme::count;
+    let text = match window {
+        Some(w) => format!("context {} / {}", c(used), c(w)),
+        None => format!("context {}", c(used)),
+    };
+    let mut hover = format!("Tokens in the current context (input + output): {used}");
+    match window {
+        Some(w) => hover.push_str(&format!("\nModel's context window: {w}")),
+        None => hover.push_str("\nThe provider does not report this model's context window"),
+    }
+    if compact_at > 0 {
+        hover.push_str(&format!(
+            "\nCompacts at about {} ({}% used)",
+            c(compact_at),
+            (used * 100 / compact_at).min(999)
+        ));
+    }
+    (text, hover)
+}
+
 fn tool_summary(name: &str, args: &serde_json::Value) -> String {
     let get = |k: &str| args.get(k).and_then(|v| v.as_str()).map(str::to_owned);
     let s = match name {

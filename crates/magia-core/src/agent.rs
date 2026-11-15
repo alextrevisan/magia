@@ -38,6 +38,13 @@ pub enum AgentEvent {
         output: u64,
         tokens_per_sec: Option<f64>,
     },
+    /// Before each request: the context's size (estimated until the answer reports it), the
+    /// model's window when known, and the size at which the conversation is compacted.
+    Context {
+        tokens: u64,
+        window: Option<u64>,
+        compact_at: u64,
+    },
     /// Informational (e.g. "auto: allowed").
     Notice(String),
     /// The older history was replaced by a summary: `history` is what is left (the summary
@@ -258,8 +265,19 @@ pub struct Agent {
     pub hooks: Hooks,
     /// OpenCode-style permission rules (last match wins); they refine `mode`.
     pub rules: RuleSet,
-    /// Compact when the context nears this many tokens (0 = never).
-    pub compact_at_tokens: u64,
+    /// Compact when the context nears this many tokens (0 = never). None: from the model's
+    /// context window (`compact_percent` of it), or `DEFAULT_COMPACT_AT` while it is unknown.
+    pub compact_at_tokens: Option<u64>,
+    /// Share of the context window, in %, at which to compact.
+    pub compact_percent: u8,
+    /// Context windows by (provider, model), from the provider's model list (`add_limits`,
+    /// or a lookup when the context first grows) or from a refusal that named the window.
+    limits: std::collections::HashMap<(String, String), magia_types::ModelLimit>,
+    /// When a lookup found no window for a model; asked again after `LOOKUP_AGAIN` (a local
+    /// server may load the model, and so give it a window, only on the first request).
+    limit_misses: std::collections::HashMap<(String, String), std::time::Instant>,
+    /// Windows declared in the config (`"models": {"id": {"limit": …}}`); they win.
+    declared_limits: std::collections::HashMap<(String, String), magia_types::ModelLimit>,
     /// `auto` mode reviewer model (None = the session's model).
     pub auto_model: Option<String>,
     /// Instructions of the selected file agent (`crate::agents`): (file name, text). They are
@@ -294,15 +312,45 @@ pub struct Agent {
     fallback_session: String,
 }
 
+/// The questions of a `question` call: the `questions` list, else the single `question`
+/// (with `options`). Empty texts are dropped.
+fn questions_of(args: &Value) -> Vec<(String, Vec<String>)> {
+    let one = |v: &Value| -> Option<(String, Vec<String>)> {
+        let q = v.get("question")?.as_str()?.trim();
+        let options = v
+            .get("options")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|o| o.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        (!q.is_empty()).then(|| (q.to_owned(), options))
+    };
+    match args.get("questions").and_then(Value::as_array) {
+        Some(list) if !list.is_empty() => list.iter().filter_map(one).collect(),
+        _ => one(args).into_iter().collect(),
+    }
+}
+
+/// Compaction point while the model's window is unknown.
+const DEFAULT_COMPACT_AT: u64 = 100_000;
+/// History size from which the model's window is looked up (a chat this short costs no
+/// extra request).
+const LOOKUP_AT: u64 = 1_000;
+/// How long a model without a reported window waits before its list is asked again.
+const LOOKUP_AGAIN: std::time::Duration = std::time::Duration::from_secs(60);
+
 impl Agent {
     pub fn new(client: Client, model: String, mode: PermissionMode, cwd: PathBuf) -> Self {
         let skills = discover_skills(&cwd);
         let mut system = build_system_prompt(&cwd);
         let project_instructions = project_instructions_file(&cwd);
         let mut tools = Registry::builtin();
-        if !skills.is_empty() {
+        if skills.iter().any(|s| s.for_model) {
             system.push_str("\n\n# Skills (load one with the `skill` tool when relevant)\n");
-            for s in &skills {
+            for s in skills.iter().filter(|s| s.for_model) {
                 system.push_str(&format!("- {}: {}\n", s.name, s.description));
             }
             tools.add(Box::new(SkillTool(skills)));
@@ -319,7 +367,13 @@ impl Agent {
             system,
             hooks: Hooks::default(),
             rules: RuleSet::default(),
-            compact_at_tokens: 100_000,
+            // Fixed until `configure` applies the config (whose default is the model's window),
+            // so an agent built without a config never asks the provider for its model list.
+            compact_at_tokens: Some(DEFAULT_COMPACT_AT),
+            compact_percent: 95,
+            limits: Default::default(),
+            limit_misses: Default::default(),
+            declared_limits: Default::default(),
             auto_model: None,
             persona: None,
             magia: None,
@@ -346,6 +400,16 @@ impl Agent {
     pub fn configure(&mut self, cfg: &crate::Config) {
         self.hooks = Hooks(cfg.hooks.clone());
         self.compact_at_tokens = cfg.compact_at_tokens;
+        self.compact_percent = cfg.compact_percent;
+        self.declared_limits = cfg
+            .providers
+            .iter()
+            .flat_map(|(p, ov)| {
+                ov.limits
+                    .iter()
+                    .map(move |(m, l)| ((p.clone(), m.clone()), *l))
+            })
+            .collect();
         self.cx.sandbox = cfg.sandbox;
         self.rules = cfg.rules.clone();
         self.auto_model = cfg.auto_model.clone();
@@ -527,13 +591,19 @@ impl Agent {
         if interactive && !self.is_child && !self.rules.fully_denied("question") {
             v.push(ToolSpec {
                 name: "question".into(),
-                description: "Ask the user a question and wait for the answer. Use it when the request is ambiguous \
-or a decision is genuinely theirs; do not use it for things you can find out yourself."
+                description: "Ask the user and wait for the answer. Use it when the request is ambiguous \
+or a decision is genuinely theirs; do not use it for things you can find out yourself. One question: `question` \
+(+ `options`). Several: `questions`, one item each, never several questions packed into one text; the user \
+answers them one at a time and you get all the answers together."
                     .into(),
                 schema: json!({"type":"object","properties":{
                     "question":{"type":"string"},
-                    "options":{"type":"array","items":{"type":"string"},"description":"suggested answers (the user may also type their own)"}},
-                    "required":["question"]}),
+                    "options":{"type":"array","items":{"type":"string"},"description":"suggested answers (the user may also type their own)"},
+                    "questions":{"type":"array","description":"several questions, asked one after another","items":{
+                        "type":"object","properties":{
+                            "question":{"type":"string"},
+                            "options":{"type":"array","items":{"type":"string"}}},
+                        "required":["question"]}}}}),
             });
         }
         if !self.is_child && !self.rules.fully_denied("task") {
@@ -781,8 +851,10 @@ questions across them."),
         approver: &dyn Approver,
     ) -> Result<RoundEnd> {
         let (mut calls_made, mut edits) = (0usize, 0usize);
+        // Times this turn a too-big request was shrunk and sent again.
+        let mut overflow_fixes = 0;
         let done = |end: End, calls: usize, edits: usize| Ok(RoundEnd { end, calls, edits });
-        for _ in 0..self.max_steps() {
+        'steps: for _ in 0..self.max_steps() {
             self.maybe_compact(events).await;
             // Also published for `/btw` questions asked during the turn (same Arc, no copy).
             let side = Arc::new(crate::btw::SideContext {
@@ -808,6 +880,21 @@ questions across them."),
                         text,
                         emitted,
                     } => {
+                        // Too big for the model: shrink the context and build the request
+                        // again, instead of failing (or repeating what cannot fit).
+                        if let Some(window) = magia_providers::context_overflow(&error)
+                            && overflow_fixes < 2
+                            && !emitted
+                            && !cancel.is_cancelled()
+                        {
+                            overflow_fixes += 1;
+                            if self.recover_overflow(window, events).await {
+                                let _ = events.send(AgentEvent::Notice(
+                                    "the request did not fit the model's context; shrunk it and sent it again".into(),
+                                ));
+                                continue 'steps;
+                            }
+                        }
                         let Some(min) = magia_providers::retry_after(&error)
                             .filter(|_| attempt < MAX_RETRIES && !cancel.is_cancelled())
                         else {
@@ -883,9 +970,10 @@ questions across them."),
                 if !is_error && self.tools.get(&call.name).is_some_and(|t| t.is_edit()) {
                     edits += 1;
                 }
+                let content = self.fit_output(output);
                 self.push(Message::ToolResult {
                     call_id: call.id,
-                    content: output,
+                    content,
                     is_error,
                     images,
                 });
@@ -1271,37 +1359,54 @@ questions across them."),
         }
 
         let result = if call.name == "question" && !self.is_child {
-            let question = call
-                .arguments
-                .get("question")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .to_owned();
-            let options: Vec<String> = call
-                .arguments
-                .get("options")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|o| o.as_str().map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if question.is_empty() {
+            let asks = questions_of(&call.arguments);
+            if asks.is_empty() {
                 Err(anyhow::anyhow!("missing `question`"))
-            } else if self.rules.check("question", &question) == Some(Effect::Deny) {
+            } else if asks
+                .iter()
+                .any(|(q, _)| self.rules.check("question", q) == Some(Effect::Deny))
+            {
                 Err(anyhow::anyhow!(
                     "asking the user is disabled by the permission rules"
                 ))
             } else {
-                match approver.ask(&question, &options).await {
-                    Some(a) if !a.trim().is_empty() => {
-                        Ok(format!("The user answered: {}", a.trim()).into())
-                    }
-                    _ => Err(anyhow::anyhow!(
+                // One at a time, each with its own options; a step shows where it is.
+                let n = asks.len();
+                let mut answers = Vec::with_capacity(n);
+                for (i, (q, options)) in asks.iter().enumerate() {
+                    let shown = if n > 1 {
+                        format!("**Question {} of {n}**\n\n{q}", i + 1)
+                    } else {
+                        q.clone()
+                    };
+                    let a = approver
+                        .ask(&shown, options)
+                        .await
+                        .map(|a| a.trim().to_owned())
+                        .filter(|a| !a.is_empty());
+                    answers.push(a);
+                }
+                match (n, answers.iter().all(Option::is_none)) {
+                    (_, true) => Err(anyhow::anyhow!(
                         "the user did not answer; continue with your best judgment and say what you assumed"
                     )),
+                    (1, false) => Ok(format!(
+                        "The user answered: {}",
+                        answers[0].as_deref().unwrap_or_default()
+                    )
+                    .into()),
+                    _ => {
+                        let mut out = String::from("The user answered:");
+                        for ((q, _), a) in asks.iter().zip(&answers) {
+                            out.push_str(&format!(
+                                "\n- {q}\n  → {}",
+                                a.as_deref().unwrap_or(
+                                    "(skipped: use your best judgment and say what you assumed)"
+                                )
+                            ));
+                        }
+                        Ok(out.into())
+                    }
                 }
             }
         } else if call.name == "task" && !self.is_child {
@@ -1410,16 +1515,154 @@ questions across them."),
 
     // ───────────── context compaction ─────────────
 
+    /// Note the context windows of a provider's models (from a model list the caller already
+    /// fetched), so no lookup of its own is needed.
+    pub fn add_limits(&mut self, provider: &str, models: &[magia_types::ModelInfo]) {
+        for m in models {
+            let key = (provider.to_owned(), m.id.clone());
+            match m.limit {
+                Some(l) => {
+                    self.limit_misses.remove(&key);
+                    self.limits.insert(key, l);
+                }
+                // Not loaded yet (LM Studio): a window it had before no longer holds.
+                None => {
+                    self.limits.remove(&key);
+                }
+            }
+        }
+    }
+
+    /// (provider, model) of the session, without a `#variant`.
+    fn limit_key(&self) -> (String, String) {
+        let model = self.model.split('#').next().unwrap_or(&self.model);
+        (self.client.config.name.clone(), model.to_owned())
+    }
+
+    /// The session model's limits as known now: the config's, then what the provider said.
+    fn known_limit(&self) -> Option<magia_types::ModelLimit> {
+        let key = self.limit_key();
+        self.declared_limits
+            .get(&key)
+            .or_else(|| self.limits.get(&key))
+            .copied()
+    }
+
+    /// `known_limit`, asking the provider's model list first when nothing is known (`lookup`),
+    /// at most once a minute per model.
+    async fn model_limit(&mut self, lookup: bool) -> Option<magia_types::ModelLimit> {
+        let key = self.limit_key();
+        let missed = |t: &std::time::Instant| t.elapsed() < LOOKUP_AGAIN;
+        if lookup
+            && self.known_limit().is_none()
+            && !self.limit_misses.get(&key).is_some_and(missed)
+        {
+            let list = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.client.list_models(),
+            )
+            .await;
+            if let Ok(Ok(models)) = list {
+                self.add_limits(&key.0, &models);
+            }
+            if !self.limits.contains_key(&key) {
+                self.limit_misses.insert(key, std::time::Instant::now());
+            }
+        }
+        self.known_limit()
+    }
+
+    /// Cut a tool result to a quarter of the model's window (≈ 4 bytes a token), so one big
+    /// read or command output cannot fill a small local model's context by itself.
+    fn fit_output(&self, out: String) -> String {
+        match self.known_limit() {
+            Some(l) => magia_tools::truncate_output(out, l.context as usize),
+            None => out,
+        }
+    }
+
+    /// The provider refused the request as too big: note the window it named, cut the tool
+    /// results already in the history to fit it, and compact. False when nothing shrank.
+    async fn recover_overflow(
+        &mut self,
+        window: Option<u64>,
+        events: &UnboundedSender<AgentEvent>,
+    ) -> bool {
+        let key = self.limit_key();
+        if let Some(n) = window
+            && !self.declared_limits.contains_key(&key)
+        {
+            let l = magia_types::ModelLimit {
+                context: n,
+                input: None,
+                output: None,
+            };
+            self.limits.insert(key, l);
+        }
+        let mut cut = false;
+        if let Some(l) = self.known_limit() {
+            for m in &mut self.history {
+                if let Message::ToolResult { content, .. } = m
+                    && content.len() > l.context as usize
+                {
+                    *content =
+                        magia_tools::truncate_output(std::mem::take(content), l.context as usize);
+                    cut = true;
+                }
+            }
+        }
+        let compacted = match self.compact().await {
+            Ok(Some((before, _))) => {
+                let _ = events.send(AgentEvent::Compacted {
+                    before,
+                    history: self.history.clone(),
+                });
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                let _ = events.send(AgentEvent::Notice(format!("compaction failed: {e:#}")));
+                false
+            }
+        };
+        if cut
+            && !compacted
+            && let Some(st) = &self.store
+        {
+            let _ = st.rewrite(&self.history);
+        }
+        cut || compacted
+    }
+
     async fn maybe_compact(&mut self, events: &UnboundedSender<AgentEvent>) {
-        if self.compact_at_tokens == 0 {
+        if self.compact_at_tokens == Some(0) {
             return;
         }
         // The API's reported input size is the truth; the byte estimate covers the first request.
-        // Only the history can be compacted, so the fixed prompt (which a big file agent can
-        // push past the threshold on its own) is taken out of the reported size.
         let fixed = (self.system_prompt().len() / 4) as u64;
-        let size = estimate_tokens(&self.history).max(self.last_input_tokens.saturating_sub(fixed));
-        if size <= self.compact_at_tokens {
+        let history =
+            estimate_tokens(&self.history).max(self.last_input_tokens.saturating_sub(fixed));
+        // The window is looked up only once the context is big enough for it to matter.
+        let lookup = self.compact_at_tokens.is_none() && history >= LOOKUP_AT;
+        let limit = self.model_limit(lookup).await;
+        let at = self
+            .compact_at_tokens
+            .or(limit.map(|l| l.compact_at(self.compact_percent)))
+            .unwrap_or(DEFAULT_COMPACT_AT);
+        let _ = events.send(AgentEvent::Context {
+            tokens: fixed + history,
+            window: limit.map(|l| l.context),
+            compact_at: at,
+        });
+        // Only the history can be compacted, so the fixed prompt (which a big file agent can
+        // push near the point on its own) is taken out; a quarter of the point always remains
+        // for the history, or compaction would run every round.
+        let budget = if self.compact_at_tokens.is_some() {
+            at // an explicit setting counts the history alone, as it always has
+        } else {
+            at.saturating_sub(fixed).max(at / 4)
+        };
+        if history <= budget {
             return;
         }
         match self.compact().await {
@@ -1906,7 +2149,7 @@ fn run_subagent<'a>(
         child.allowed_dirs = allowed_dirs;
         child.denied_dirs = denied_dirs;
         child.reference_dirs = reference_dirs;
-        child.compact_at_tokens = 0;
+        child.compact_at_tokens = Some(0);
         child.system.push_str("\n\n");
         child.system.push_str(role);
         let (tx, mut rx) = unbounded_channel();

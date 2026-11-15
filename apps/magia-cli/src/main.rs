@@ -203,7 +203,16 @@ async fn real_main() -> Result<()> {
         Cmd::Models => {
             let client = Client::new(cfg.provider_config(&cfg.provider)?)?;
             for m in client.list_models().await? {
-                println!("{}", m.id);
+                let limit = cfg.declared_limit(&cfg.provider, &m.id).or(m.limit);
+                match limit {
+                    Some(l) => println!(
+                        "{:<48} context {:>8}  compacts at {}",
+                        m.id,
+                        l.context,
+                        l.compact_at(cfg.compact_percent)
+                    ),
+                    None => println!("{}", m.id),
+                }
             }
             return Ok(());
         }
@@ -336,7 +345,7 @@ async fn real_main() -> Result<()> {
                     let rate = tokens_per_sec
                         .map(|r| format!(" @ {:.0} tok/s", r))
                         .unwrap_or_default();
-                    eprintln!("\n[tokens in {} / out {}{rate}]", input, output)
+                    eprintln!("\n[tokens in {input} / out {output}{rate}]")
                 }
                 AgentEvent::SubTool {
                     parent,

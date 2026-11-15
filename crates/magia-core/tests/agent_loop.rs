@@ -207,7 +207,7 @@ async fn auto_compaction_summarizes_old_history_and_keeps_tail() {
         PermissionMode::Ask,
         dir.path().into(),
     );
-    agent.compact_at_tokens = 10;
+    agent.compact_at_tokens = Some(10);
     for i in 0..5 {
         agent.history.push(Message::user(format!(
             "question number {i} with some padding text"
@@ -678,7 +678,11 @@ async fn subagent_is_not_offered_tools_it_cannot_use() {
     );
     run(&mut agent, "delegate").await;
     let bodies = server.await.unwrap();
-    let child = offered(&bodies[1]);
+    // `skill` is there only when the machine has skills installed (`~/.claude/skills`…).
+    let child: Vec<_> = offered(&bodies[1])
+        .into_iter()
+        .filter(|t| t != "skill")
+        .collect();
     assert_eq!(
         child,
         ["glob", "grep", "ls", "read", "todo"],
@@ -717,6 +721,63 @@ async fn question_tool_reaches_the_user_and_returns_the_answer() {
         matches!(&agent.history[2], Message::ToolResult { content, is_error: false, .. } if content == "The user answered: yes")
     );
     assert!(offered(&server.await.unwrap()[0]).contains(&"question".to_owned()));
+}
+
+/// Answers each question from a list, recording what it was shown.
+struct Script(std::sync::Mutex<Vec<String>>, Vec<Option<&'static str>>);
+#[async_trait::async_trait]
+impl magia_core::Approver for Script {
+    async fn approve(&self, _: &magia_types::ToolCall) -> bool {
+        false
+    }
+    async fn ask(&self, q: &str, _options: &[String]) -> Option<String> {
+        let mut seen = self.0.lock().unwrap();
+        let a = self.1[seen.len()];
+        seen.push(q.to_owned());
+        a.map(str::to_owned)
+    }
+    fn interactive(&self) -> bool {
+        true
+    }
+}
+
+#[tokio::test]
+async fn several_questions_are_asked_one_at_a_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let qs = r#"{"questions":[{"question":"Genre?","options":["racing","puzzle"]},{"question":"Art style?"},{"question":"Length?"}]}"#;
+    let (url, _server) = serve(vec![
+        tool_reply(&[("q1", "question", qs)]),
+        text_reply("ok"),
+    ])
+    .await;
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Ask,
+        dir.path().into(),
+    );
+    let script = Script(
+        Default::default(),
+        vec![Some("racing"), None, Some("short")],
+    );
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    agent
+        .run_turn("make a game", tx, CancellationToken::new(), &script)
+        .await;
+    let seen = script.0.lock().unwrap().clone();
+    assert_eq!(seen.len(), 3, "one step per question");
+    assert!(seen[0].starts_with("**Question 1 of 3**") && seen[0].ends_with("Genre?"));
+    assert!(seen[2].starts_with("**Question 3 of 3**"));
+    let Message::ToolResult {
+        content, is_error, ..
+    } = &agent.history[2]
+    else {
+        panic!("{:?}", agent.history[2]);
+    };
+    assert!(!is_error);
+    assert!(content.contains("- Genre?\n  → racing"), "{content}");
+    assert!(content.contains("- Art style?\n  → (skipped"), "{content}");
+    assert!(content.contains("- Length?\n  → short"), "{content}");
 }
 
 /// Like `serve`, but returns the raw request heads (request line + headers).
@@ -1018,7 +1079,7 @@ async fn a_big_agent_prompt_alone_does_not_trigger_compaction() {
         PermissionMode::Ask,
         dir.path().into(),
     );
-    agent.compact_at_tokens = 1_000;
+    agent.compact_at_tokens = Some(1_000);
     // ≈ 7.5k tokens of instructions: nearly all of the reported input (the fake server
     // reads at most 64 KB per request, so this stays small).
     agent.persona = Some(("BIG.md".into(), "x".repeat(30_000)));
@@ -1040,6 +1101,166 @@ async fn a_big_agent_prompt_alone_does_not_trigger_compaction() {
     }
     let bodies = server.await.unwrap();
     assert!(bodies.iter().all(|b| !b.contains("Summarize this session")));
+}
+
+/// A long chat: 5 questions of ~5k tokens each (bytes / 4), 25k in all.
+fn long_history(agent: &mut Agent) {
+    for i in 0..5 {
+        agent.history.push(Message::user(format!(
+            "question {i} {}",
+            "q".repeat(20_000)
+        )));
+        agent.history.push(Message::Assistant {
+            text: format!("answer {i}"),
+            tool_calls: vec![],
+        });
+    }
+}
+
+#[tokio::test]
+async fn the_models_window_decides_when_to_compact() {
+    let dir = tempfile::tempdir().unwrap();
+    // The provider's model list says `m` has a 20k window: compaction comes at 19k, well
+    // before the 100k used while the window is unknown.
+    let list = r#"{"data":[{"id":"m","limit":{"context":20000,"output":4000}},{"id":"other"}]}"#;
+    let models = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{list}",
+        list.len()
+    );
+    let (url, server) = serve(vec![
+        models,
+        text_reply("SUMMARY-OF-OLD"),
+        text_reply("done"),
+    ])
+    .await;
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Ask,
+        dir.path().into(),
+    );
+    agent.compact_at_tokens = None; // from the window, as `configure` sets it by default
+    long_history(&mut agent);
+    let ev = run(&mut agent, "go on").await;
+    assert!(
+        ev.iter().any(|e| matches!(e, AgentEvent::Compacted { .. })),
+        "{ev:?}"
+    );
+    let bodies = server.await.unwrap();
+    assert!(bodies[0].is_empty(), "the first request is the model list");
+    assert!(
+        bodies[1].contains("You compress the history"),
+        "the second is the summary"
+    );
+    // The next turn asks no list again: the window is remembered.
+    let (url, server) = serve(vec![text_reply("ok")]).await;
+    agent.client = client(url);
+    run(&mut agent, "more").await;
+    assert_eq!(server.await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_window_from_the_callers_list_needs_no_lookup_and_is_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let usage = r#"{"choices":[],"usage":{"prompt_tokens":900,"completion_tokens":5}}"#;
+    let reply = sse(&[
+        r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+        usage,
+        "[DONE]",
+    ]);
+    let (url, server) = serve(vec![reply]).await;
+    let mut agent = Agent::new(
+        client(url),
+        "m#high".into(),
+        PermissionMode::Ask,
+        dir.path().into(),
+    );
+    agent.compact_at_tokens = None; // from the window, as `configure` sets it by default
+    agent.add_limits(
+        "fake",
+        &[magia_types::ModelInfo {
+            id: "m".into(),
+            limit: Some(magia_types::ModelLimit {
+                context: 200_000,
+                input: None,
+                output: None,
+            }),
+        }],
+    );
+    let ev = run(&mut agent, "hello").await;
+    let got = ev.iter().find_map(|e| match e {
+        AgentEvent::Context {
+            window, compact_at, ..
+        } => Some((*window, *compact_at)),
+        _ => None,
+    });
+    assert_eq!(got, Some((Some(200_000), 190_000)));
+    assert_eq!(server.await.unwrap().len(), 1, "no /models request");
+}
+
+#[tokio::test]
+async fn a_request_too_big_for_the_model_is_shrunk_and_sent_again() {
+    let dir = tempfile::tempdir().unwrap();
+    // As LM Studio answers when a request passes the loaded window (inside the stream).
+    let refusal = sse(&[
+        r#"{"error":{"code":400,"message":"request (11671 tokens) exceeds the available context size (8192 tokens), try increasing it"}}"#,
+    ]);
+    let (url, server) = serve(vec![
+        refusal,
+        text_reply("SUMMARY-OF-OLD"),
+        text_reply("fits now"),
+    ])
+    .await;
+    let mut agent = Agent::new(
+        client(url),
+        "m".into(),
+        PermissionMode::Ask,
+        dir.path().into(),
+    );
+    // A big tool result from an earlier round, then a few exchanges.
+    agent.history.push(Message::user("read it"));
+    agent.history.push(Message::Assistant {
+        text: String::new(),
+        tool_calls: vec![magia_types::ToolCall {
+            id: "c1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"file_path": "big.rs"}),
+        }],
+    });
+    agent.history.push(Message::ToolResult {
+        call_id: "c1".into(),
+        content: "x".repeat(30_000),
+        is_error: false,
+        images: vec![],
+    });
+    for i in 0..4 {
+        agent.history.push(Message::Assistant {
+            text: format!("answer {i}"),
+            tool_calls: vec![],
+        });
+        agent.history.push(Message::user(format!("question {i}")));
+    }
+    let ev = run(&mut agent, "go on").await;
+    assert!(
+        !ev.iter().any(|e| matches!(e, AgentEvent::Retry { .. })),
+        "not repeated as is: {ev:?}"
+    );
+    assert!(ev.iter().any(|e| matches!(e, AgentEvent::Compacted { .. })));
+    assert_eq!(
+        agent.history.last(),
+        Some(&Message::Assistant {
+            text: "fits now".into(),
+            tool_calls: vec![]
+        })
+    );
+    // The window it named is used from now on.
+    let window = ev.iter().rev().find_map(|e| match e {
+        AgentEvent::Context { window, .. } => *window,
+        _ => None,
+    });
+    assert_eq!(window, Some(8192));
+    let bodies = server.await.unwrap();
+    assert!(bodies[2].len() < 30_000, "the big result was cut");
 }
 
 // ───────────── Magia mode ─────────────

@@ -130,6 +130,57 @@ pub enum StreamEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
+    /// Token limits, when the provider's model list reports them.
+    pub limit: Option<ModelLimit>,
+}
+
+/// How many tokens a model takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ModelLimit {
+    /// The whole context window (prompt + answer).
+    pub context: u64,
+    /// Most tokens of prompt, when lower than the window allows.
+    pub input: Option<u64>,
+    /// Most tokens of one answer.
+    pub output: Option<u64>,
+}
+
+impl ModelLimit {
+    /// Read the limits of one model entry, in the shapes providers use: models.dev / OpenCode
+    /// (`limit: {context, input, output}`, also in the config file), OpenRouter
+    /// (`context_length`, `top_provider.max_completion_tokens`), LM Studio's `/api/v0/models`
+    /// (`loaded_context_length`: what the model was loaded with, often far below its
+    /// `max_context_length`) and others (`context_window`). None when no window is given.
+    pub fn from_json(m: &Value) -> Option<Self> {
+        let n = |p: &str| m.pointer(p).and_then(Value::as_u64).filter(|&n| n > 0);
+        // LM Studio: a model not loaded yet gets whatever window it is loaded with later.
+        if m.get("state").and_then(Value::as_str) == Some("not-loaded") {
+            return None;
+        }
+        let context = n("/limit/context")
+            .or_else(|| n("/loaded_context_length"))
+            .or_else(|| n("/context_length"))
+            .or_else(|| n("/top_provider/context_length"))
+            .or_else(|| n("/context_window"))
+            .or_else(|| n("/max_context_length"))?;
+        Some(Self {
+            context,
+            input: n("/limit/input"),
+            output: n("/limit/output")
+                .or_else(|| n("/top_provider/max_completion_tokens"))
+                .or_else(|| n("/max_completion_tokens"))
+                .or_else(|| n("/max_output_tokens")),
+        })
+    }
+
+    /// When to compact: at `percent` of the window (or of the prompt cap, when the provider
+    /// gives one). The answer gets the rest; the provider shortens it if the prompt grew past
+    /// the estimate within a round.
+    pub fn compact_at(&self, percent: u8) -> u64 {
+        let p = u64::from(percent.min(100));
+        let prompt = self.input.unwrap_or(self.context).min(self.context);
+        prompt / 100 * p + prompt % 100 * p / 100
+    }
 }
 
 /// Parse tool-call arguments streamed as a string; empty means `{}`.
@@ -138,4 +189,58 @@ pub fn parse_arguments(raw: &str) -> Value {
         return Value::Object(Default::default());
     }
     serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_owned()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn limits_are_read_from_each_provider_shape() {
+        let zen =
+            json!({"id": "a", "limit": {"context": 200000, "input": 160000, "output": 32000}});
+        let or = json!({"id": "b", "context_length": 1048576,
+                        "top_provider": {"context_length": 1048576, "max_completion_tokens": 262144}});
+        let groq = json!({"id": "c", "context_window": 131072});
+        assert_eq!(
+            ModelLimit::from_json(&zen),
+            Some(ModelLimit {
+                context: 200_000,
+                input: Some(160_000),
+                output: Some(32_000)
+            })
+        );
+        assert_eq!(ModelLimit::from_json(&or).unwrap().output, Some(262_144));
+        assert_eq!(ModelLimit::from_json(&groq).unwrap().context, 131_072);
+        assert_eq!(ModelLimit::from_json(&json!({"id": "d"})), None);
+        // LM Studio: the loaded window, not the most the model could take.
+        let lms = json!({"id": "q", "state": "loaded", "max_context_length": 262144,
+                         "loaded_context_length": 65536});
+        assert_eq!(ModelLimit::from_json(&lms).unwrap().context, 65_536);
+        let idle = json!({"id": "e", "state": "not-loaded", "max_context_length": 2048});
+        assert_eq!(ModelLimit::from_json(&idle), None);
+        assert_eq!(
+            ModelLimit::from_json(&json!({"limit": {"context": 0}})),
+            None
+        );
+    }
+
+    #[test]
+    fn compaction_comes_at_95_percent() {
+        let l = |context, input, output| ModelLimit {
+            context,
+            input,
+            output,
+        };
+        assert_eq!(l(200_000, None, Some(32_000)).compact_at(95), 190_000);
+        // The prompt cap is what fills up.
+        assert_eq!(
+            l(200_000, Some(160_000), Some(32_000)).compact_at(95),
+            152_000
+        );
+        assert_eq!(l(1_000_000, None, Some(128_000)).compact_at(95), 950_000);
+        assert_eq!(l(65_536, None, None).compact_at(95), 62_259);
+        assert_eq!(l(65_536, None, None).compact_at(80), 52_428);
+    }
 }

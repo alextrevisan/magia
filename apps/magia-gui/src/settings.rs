@@ -19,6 +19,8 @@ pub struct Draft {
     pub theme: String,
     pub max_rounds: u32,
     pub review: bool,
+    /// Compact at this share of the model's context window, in %.
+    pub compact_percent: u8,
     /// Per role (in `Role::ALL` order): provider ("" = the chat's) and model ("" = the chat's).
     pub roles: [(String, String); 5],
 }
@@ -35,6 +37,7 @@ impl Draft {
             theme: cfg.theme.clone(),
             max_rounds: cfg.magia_mode.max_rounds,
             review: cfg.magia_mode.review,
+            compact_percent: cfg.compact_percent,
             roles,
         }
     }
@@ -136,6 +139,24 @@ impl Settings {
                     ui.radio_value(&mut draft.theme, key.to_owned(), label);
                 }
             });
+            ui.add_space(14.0);
+
+            section(ui, &t, "Context");
+            ui.horizontal(|ui| {
+                ui.label("Compact at");
+                ui.add(
+                    egui::DragValue::new(&mut draft.compact_percent)
+                        .range(50..=99)
+                        .suffix("%"),
+                );
+                ui.label("of the model's context window");
+            })
+            .response
+            .on_hover_text(
+                "The older messages are summarized when the conversation reaches this share of \
+                 the window. Higher keeps more history but leaves less room for the answer. \
+                 Unknown window: 100k tokens. A compact_at_tokens in the JSON config wins.",
+            );
             ui.add_space(14.0);
 
             section(ui, &t, "Magia mode");

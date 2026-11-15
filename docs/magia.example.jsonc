@@ -24,7 +24,9 @@
         "apiKey": "{file:~/.secrets/local-key}",
         "headers": { "X-Team": "me" }
       },
-      "models": { "my-model": {} }          // shown in the model picker
+      // Shown in the model picker. "limit" gives the context window when the server does
+      // not report it (Zen, OpenRouter and LM Studio do).
+      "models": { "my-model": { "limit": { "context": 32768, "output": 4096 } } }
     }
   },
 
@@ -60,7 +62,10 @@
   "magia": {
     "permission_mode": "ask",          // ask | accept_edits | auto | plan | yolo
     // "auto_model": "claude-haiku-5-5", // auto mode: model that reviews unclear actions (default: the session model)
-    "compact_at_tokens": 100000,       // 0 = never
+    // Left out: compact at 95% of the model's context window (the share is set in the
+    // GUI's ⚙),
+    // or at 100000 when the window is unknown. A number fixes it; 0 = never.
+    // "compact_at_tokens": 100000,
     "sandbox": false,                  // bash inside bubblewrap
     // Magia agent: rounds per request (each with the usual step limit), and an independent
     // read-only review of the changed files before it finishes

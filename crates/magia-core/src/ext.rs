@@ -35,38 +35,203 @@ pub fn frontmatter(text: &str) -> (HashMap<String, String>, &str) {
 
 #[derive(Debug, Clone)]
 pub struct Skill {
+    /// The id, from the path (`release/SKILL.md` or `release.md` → `release`), as OpenCode.
     pub name: String,
     pub description: String,
+    /// Shown after the name in the `/` list (`argument-hint`).
+    pub args: String,
+    /// The folder the skill's files sit in.
     pub dir: PathBuf,
+    /// Its instructions: `SKILL.md`, or a flat `<id>.md` at a source's root.
+    pub file: PathBuf,
+    /// Offered to the model in the system prompt: it has a description and does not set
+    /// `disable-model-invocation: true` (it can still be run as `/name`).
+    pub for_model: bool,
 }
 
-/// `.magia/skills/<name>/SKILL.md` in the project, then `~/.config/magia/skills/…`.
+/// `cwd` and its parents up to the project root (the nearest folder with `.git`), nearest
+/// first. Without a repository, only `cwd`.
+fn project_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let up: Vec<PathBuf> = cwd.ancestors().map(Path::to_path_buf).collect();
+    match up.iter().position(|d| d.join(".git").exists()) {
+        Some(root) => up[..=root].to_vec(),
+        None => vec![cwd.to_path_buf()],
+    }
+}
+
+fn home_dir() -> Option<PathBuf> {
+    // Unit tests must not pick up the skills installed on the machine running them.
+    if cfg!(test) {
+        return None;
+    }
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// Where definitions live, highest priority first: magia's own folders, then OpenCode's
+/// order (project `.opencode`, global OpenCode, then the compatibility folders `extra`, each
+/// project nearest-first before the global one). `kind` is `skills` or `commands`; OpenCode
+/// still reads the singular `skill`/`command` too.
+fn sources(cwd: &Path, kind: &str, compat: &[&str]) -> Vec<PathBuf> {
+    let single = kind.trim_end_matches('s');
+    let dirs = project_dirs(cwd);
+    let home = home_dir();
+    let mut out: Vec<PathBuf> = dirs.iter().map(|d| d.join(".magia").join(kind)).collect();
+    out.push(user_config_dir().join(kind));
+    for d in &dirs {
+        out.push(d.join(".opencode").join(kind));
+        out.push(d.join(".opencode").join(single));
+    }
+    if let Some(h) = &home {
+        out.push(h.join(".config/opencode").join(kind));
+        out.push(h.join(".config/opencode").join(single));
+    }
+    for c in compat {
+        out.extend(dirs.iter().map(|d| d.join(c).join(kind)));
+        if let Some(h) = &home {
+            out.push(h.join(c).join(kind));
+        }
+    }
+    out.dedup();
+    out
+}
+
+/// Hidden entries and `node_modules` are not searched.
+fn skipped(name: &std::ffi::OsStr) -> bool {
+    let n = name.to_string_lossy();
+    n.starts_with('.') || n == "node_modules"
+}
+
+/// The skills of one source: flat `.md` files at its root, and folders holding `SKILL.md`
+/// at any depth up to six (a skill folder is not searched further).
+fn skills_in(root: &Path, out: &mut Vec<(String, PathBuf, PathBuf)>) {
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<(String, PathBuf, PathBuf)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = rd.flatten().filter(|e| !skipped(&e.file_name())).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            if p.is_dir() {
+                let skill = p.join("SKILL.md");
+                if skill.is_file() {
+                    out.push((e.file_name().to_string_lossy().into_owned(), p, skill));
+                } else if depth < 6 {
+                    walk(&p, depth + 1, out);
+                }
+            } else if depth == 0
+                && p.extension().is_some_and(|x| x == "md")
+                && let Some(stem) = p.file_stem()
+            {
+                out.push((stem.to_string_lossy().into_owned(), dir.to_path_buf(), p));
+            }
+        }
+    }
+    walk(root, 0, out);
+}
+
+/// Skills from magia's folders, OpenCode's (`.opencode/skills`, `~/.config/opencode/skills`)
+/// and the compatibility folders OpenCode also reads (`.agents/skills`, `.claude/skills`, in
+/// the project and its parents up to the repository root, and in the home folder). On the
+/// same id the higher source wins, in that order.
 pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
     let mut out: Vec<Skill> = Vec::new();
-    for root in [cwd.join(".magia/skills"), user_config_dir().join("skills")] {
-        let Ok(rd) = std::fs::read_dir(&root) else {
-            continue;
-        };
-        for e in rd.flatten() {
-            let Ok(text) = std::fs::read_to_string(e.path().join("SKILL.md")) else {
+    for root in sources(cwd, "skills", &[".agents", ".claude"]) {
+        let mut found = Vec::new();
+        skills_in(&root, &mut found);
+        for (name, dir, file) in found {
+            if out.iter().any(|s| s.name == name) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&file) else {
                 continue;
             };
             let (f, _) = frontmatter(&text);
-            let name = f
-                .get("name")
-                .cloned()
-                .unwrap_or_else(|| e.file_name().to_string_lossy().into_owned());
-            if out.iter().any(|s| s.name == name) {
-                continue; // project skills win over user skills
-            }
+            let description = f.get("description").cloned().unwrap_or_default();
+            let for_model = !description.is_empty()
+                && f.get("disable-model-invocation").map(String::as_str) != Some("true");
             out.push(Skill {
                 name,
-                description: f.get("description").cloned().unwrap_or_default(),
-                dir: e.path(),
+                description,
+                args: f.get("argument-hint").cloned().unwrap_or_default(),
+                dir,
+                file,
+                for_model,
             });
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// Command files (`<name>.md`, a subfolder adds to the name: `team/review.md` →
+/// `team/review`), from magia's, OpenCode's and Claude Code's `commands` folders. On the same
+/// name the higher source wins.
+fn command_files(cwd: &Path) -> Vec<(String, PathBuf)> {
+    fn walk(root: &Path, dir: &Path, depth: usize, out: &mut Vec<(String, PathBuf)>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        let mut entries: Vec<_> = rd.flatten().filter(|e| !skipped(&e.file_name())).collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            if p.is_dir() {
+                if depth < 6 {
+                    walk(root, &p, depth + 1, out);
+                }
+            } else if p.extension().is_some_and(|x| x == "md")
+                && let Ok(rel) = p.with_extension("").strip_prefix(root)
+            {
+                let name = rel
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if !out.iter().any(|(n, _)| *n == name) {
+                    out.push((name, p));
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for root in sources(cwd, "commands", &[".claude"]) {
+        walk(&root, &root, 0, &mut out);
+    }
+    out
+}
+
+/// A skill's instructions as the model should see them. Skills written for Claude Code use
+/// `${CLAUDE_SKILL_DIR}` and `$CLAUDE_PROJECT_DIR`, filled in here, and lines `` !`cmd` `` whose
+/// output Claude Code pastes in before the model reads it; magia asks the model to run them
+/// first instead (through `bash`, so the usual permissions apply).
+fn skill_text(skill: &Skill, body: &str, cwd: &Path) -> String {
+    let dir = skill.dir.display().to_string();
+    let project = cwd.display().to_string();
+    let mut out = String::new();
+    for line in body
+        .replace("${CLAUDE_SKILL_DIR}", &dir)
+        .replace("$CLAUDE_SKILL_DIR", &dir)
+        .replace("${CLAUDE_PROJECT_DIR}", &project)
+        .replace("$CLAUDE_PROJECT_DIR", &project)
+        .lines()
+    {
+        match line
+            .trim()
+            .strip_prefix("!`")
+            .and_then(|l| l.strip_suffix('`'))
+        {
+            Some(cmd) => out.push_str(&format!(
+                "[Run first with bash and use its output here: `{cmd}`]\n"
+            )),
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
     out
 }
 
@@ -87,7 +252,7 @@ impl Tool for SkillTool {
     fn read_only(&self) -> bool {
         true
     }
-    async fn call(&self, input: Value, _cx: &ToolCx) -> Result<String> {
+    async fn call(&self, input: Value, cx: &ToolCx) -> Result<String> {
         let name = input.get("name").and_then(Value::as_str).unwrap_or("");
         let Some(s) = self.0.iter().find(|s| s.name == name) else {
             bail!(
@@ -99,13 +264,17 @@ impl Tool for SkillTool {
                     .join(", ")
             );
         };
-        let text = tokio::fs::read_to_string(s.dir.join("SKILL.md")).await?;
+        let text = tokio::fs::read_to_string(&s.file).await?;
         let (_, body) = frontmatter(&text);
-        Ok(format!("Skill directory: {}\n\n{body}", s.dir.display()))
+        Ok(format!(
+            "Skill directory: {}\n\n{}",
+            s.dir.display(),
+            skill_text(s, body, &cx.cwd)
+        ))
     }
 }
 
-/// Expand `/name args` using `.magia/commands/name.md` (or the user dir). `$ARGUMENTS` is replaced
+/// Expand `/name args` using a command file (`command_files`). `$ARGUMENTS` is replaced
 /// by the args; without the placeholder the args are appended.
 pub fn expand_command(
     cwd: &Path,
@@ -114,7 +283,7 @@ pub fn expand_command(
 ) -> Option<String> {
     let rest = input.trim().strip_prefix('/')?;
     let (name, args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
-    if name.is_empty() || name.contains(['/', '.']) {
+    if name.is_empty() || name.contains('.') || name.starts_with('/') {
         return None;
     }
     let args = args.trim();
@@ -128,25 +297,40 @@ pub fn expand_command(
         }
     };
     // Files win over commands defined in the JSON config (project-level customization).
-    for root in [
-        cwd.join(".magia/commands"),
-        user_config_dir().join("commands"),
-    ] {
-        if let Ok(text) = std::fs::read_to_string(root.join(format!("{name}.md"))) {
-            return Some(fill(frontmatter(&text).1));
-        }
+    if let Some((_, file)) = command_files(cwd).into_iter().find(|(n, _)| n == name)
+        && let Ok(text) = std::fs::read_to_string(file)
+    {
+        return Some(fill(frontmatter(&text).1));
     }
     if let Some(t) = configured.get(name) {
         return Some(fill(t));
     }
     // A skill invoked directly by the user: inline its instructions (no tool round-trip).
     let skill = discover_skills(cwd).into_iter().find(|s| s.name == name)?;
-    let text = std::fs::read_to_string(skill.dir.join("SKILL.md")).ok()?;
-    let body = frontmatter(&text).1;
-    let request = if args.is_empty() {
-        "Apply this skill to the current task."
-    } else {
-        args
+    let text = std::fs::read_to_string(&skill.file).ok()?;
+    let (fields, body) = frontmatter(&text);
+    let body = skill_text(&skill, body, cwd);
+    let filled = body.contains("$ARGUMENTS");
+    let body = body.replace("$ARGUMENTS", args);
+    // The text after `/name` is the skill's input, not a task of its own: a small model given
+    // a long skill and then a bare request tends to drop the skill and just do the request.
+    let request = match (args.is_empty(), filled) {
+        (true, _) => "Follow this skill now, step by step.".to_owned(),
+        (false, true) => {
+            "Follow this skill now, step by step (its arguments are filled in above).".to_owned()
+        }
+        (false, false) => {
+            let hint = fields
+                .get("argument-hint")
+                .map(|h| format!(" (it expects: {h})"))
+                .unwrap_or_default();
+            format!(
+                "Follow this skill now, step by step. The user's arguments for it{hint}:\n\n\
+                 {args}\n\nThey are the skill's input, not a separate task: do what the skill \
+                 says with them. If they do not fit what it expects, or what it needs is \
+                 missing, say so as the skill instructs instead of doing something else."
+            )
+        }
     };
     Some(format!(
         "Use the skill `{name}` (directory: {}).\n\n<skill>\n{body}\n</skill>\n\n{request}",
@@ -210,42 +394,25 @@ pub fn slash_catalog(
             out.push(e);
         }
     };
-    for root in [
-        cwd.join(".magia/commands"),
-        user_config_dir().join("commands"),
-    ] {
-        let Ok(rd) = std::fs::read_dir(&root) else {
+    for (name, f) in command_files(cwd) {
+        let Ok(text) = std::fs::read_to_string(&f) else {
             continue;
         };
-        let mut files: Vec<PathBuf> = rd
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "md"))
-            .collect();
-        files.sort();
-        for f in files {
-            let (Some(stem), Ok(text)) = (
-                f.file_stem().map(|s| s.to_string_lossy().into_owned()),
-                std::fs::read_to_string(&f),
-            ) else {
-                continue;
-            };
-            let (fields, body) = frontmatter(&text);
-            let description = fields
-                .get("description")
-                .cloned()
-                .unwrap_or_else(|| first_line(body));
-            let args = fields.get("argument-hint").cloned().unwrap_or_default();
-            push(
-                &mut out,
-                SlashEntry {
-                    name: stem,
-                    description,
-                    kind: SlashKind::Command,
-                    args,
-                },
-            );
-        }
+        let (fields, body) = frontmatter(&text);
+        let description = fields
+            .get("description")
+            .cloned()
+            .unwrap_or_else(|| first_line(body));
+        let args = fields.get("argument-hint").cloned().unwrap_or_default();
+        push(
+            &mut out,
+            SlashEntry {
+                name,
+                description,
+                kind: SlashKind::Command,
+                args,
+            },
+        );
     }
     let mut cfg_cmds: Vec<(&String, &String)> = cfg.commands.iter().collect();
     cfg_cmds.sort();
@@ -272,7 +439,7 @@ pub fn slash_catalog(
                 name: s.name,
                 description: s.description,
                 kind: SlashKind::Skill,
-                args: String::new(),
+                args: s.args,
             },
         );
     }
@@ -562,9 +729,104 @@ mod tests {
         // A skill typed as a command inlines its instructions.
         let out = expand_command(d.path(), "/deploy staging", &cfg.commands).unwrap();
         assert!(
-            out.contains("Run make deploy") && out.ends_with("staging"),
+            out.contains("Run make deploy")
+                && out.contains("arguments for it")
+                && out.contains("\n\nstaging\n\n")
+                && out.contains("not a separate task"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn skills_and_commands_follow_opencode_folders() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let w = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let sub = root.join("game/level");
+        std::fs::create_dir_all(&sub).unwrap();
+        // At the repository root, found from a subfolder.
+        w(
+            ".claude/skills/adopt/SKILL.md",
+            "---\ndescription: audit\nargument-hint: [focus]\n---\nx",
+        );
+        // Grouping folders; the id comes from the folder, not `name`.
+        w(
+            ".agents/skills/team/release/SKILL.md",
+            "---\nname: Release It\ndescription: ship\n---\nx",
+        );
+        // A flat file at a source's root, OpenCode's singular folder.
+        w(
+            ".opencode/skill/notes.md",
+            "---\ndescription: notes\n---\nx",
+        );
+        // No description, or hidden: runnable as /name, not offered to the model.
+        w(".opencode/skills/quiet/SKILL.md", "x");
+        w(
+            ".opencode/skills/manual/SKILL.md",
+            "---\ndescription: m\ndisable-model-invocation: true\n---\nx",
+        );
+        // The nearer folder wins over the repository root's.
+        w(
+            "game/level/.claude/skills/adopt/SKILL.md",
+            "---\ndescription: near\n---\nx",
+        );
+        // Skipped: hidden folders inside a source.
+        w(
+            ".claude/skills/.cache/old/SKILL.md",
+            "---\ndescription: no\n---\nx",
+        );
+        let s = discover_skills(&sub);
+        let get = |n: &str| s.iter().find(|s| s.name == n);
+        assert_eq!(get("adopt").unwrap().description, "near");
+        assert_eq!(get("release").unwrap().description, "ship");
+        assert_eq!(get("notes").unwrap().description, "notes");
+        assert!(get("old").is_none());
+        assert!(!get("quiet").unwrap().for_model && !get("manual").unwrap().for_model);
+        assert!(get("release").unwrap().for_model);
+
+        // Commands: Claude Code's and OpenCode's folders, subfolders in the name.
+        w(
+            ".claude/commands/fix.md",
+            "---\ndescription: fix it\n---\nFix $ARGUMENTS",
+        );
+        w(".opencode/commands/team/review.md", "Review $ARGUMENTS");
+        w(".opencode/command/old.md", "Old one");
+        let cfg = crate::Config::default();
+        let names: Vec<String> = slash_catalog(&sub, &[], &cfg)
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        for n in ["fix", "team/review", "old", "adopt", "release"] {
+            assert!(names.contains(&n.to_owned()), "{n} in {names:?}");
+        }
+        let empty = HashMap::new();
+        assert_eq!(
+            expand_command(&sub, "/fix the bug", &empty).unwrap(),
+            "Fix the bug"
+        );
+        assert_eq!(
+            expand_command(&sub, "/team/review src", &empty).unwrap(),
+            "Review src"
+        );
+        assert!(expand_command(&sub, "/../x", &empty).is_none());
+
+        // A skill written for Claude Code: its folder and the commands to run first.
+        w(
+            ".claude/skills/epics/SKILL.md",
+            "---\ndescription: e\n---\n!`bash \"${CLAUDE_SKILL_DIR}/../../hooks/y.sh\" --keys a`\nLayer: $ARGUMENTS",
+        );
+        let out = expand_command(&sub, "/epics feature", &empty).unwrap();
+        let dir = root.join(".claude/skills/epics").display().to_string();
+        assert!(
+            out.contains(&format!("[Run first with bash and use its output here: `bash \"{dir}/../../hooks/y.sh\" --keys a`]")),
+            "{out}"
+        );
+        assert!(out.contains("Layer: feature"), "{out}");
     }
 
     #[test]
@@ -577,8 +839,34 @@ mod tests {
         )
         .unwrap();
         let s = discover_skills(d.path());
-        assert_eq!(s.len(), 1);
-        assert_eq!(s[0].description, "ship it");
+        assert!(
+            s.iter()
+                .any(|s| s.name == "deploy" && s.description == "ship it")
+        );
+        // Installed for Claude Code: found too; magia's own copy of a name wins.
+        for (dir, text) in [
+            (
+                ".claude/skills/adopt",
+                "---\nname: adopt\ndescription: \"audit it\"\n---\nx",
+            ),
+            (
+                ".claude/skills/deploy",
+                "---\nname: deploy\ndescription: other\n---\nx",
+            ),
+        ] {
+            std::fs::create_dir_all(d.path().join(dir)).unwrap();
+            std::fs::write(d.path().join(dir).join("SKILL.md"), text).unwrap();
+        }
+        let s = discover_skills(d.path());
+        assert!(
+            s.iter()
+                .any(|s| s.name == "adopt" && s.description == "audit it")
+        );
+        let deploy: Vec<_> = s.iter().filter(|s| s.name == "deploy").collect();
+        assert_eq!(
+            (deploy.len(), deploy[0].description.as_str()),
+            (1, "ship it")
+        );
 
         std::fs::write(d.path().join("a.txt"), "content-a").unwrap();
         let cx = ToolCx::new(d.path().to_path_buf());

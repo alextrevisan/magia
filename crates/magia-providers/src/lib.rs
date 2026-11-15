@@ -8,7 +8,7 @@ pub use wire::Wire;
 
 use anyhow::{Context, Result, bail};
 use futures_util::{Stream, StreamExt, stream::BoxStream};
-use magia_types::{ChatRequest, ModelInfo, StreamEvent};
+use magia_types::{ChatRequest, ModelInfo, ModelLimit, StreamEvent};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -139,9 +139,31 @@ impl Client {
     }
 
     pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
-        let url = format!("{}/models", self.config.base_url.trim_end_matches('/'));
+        let base = self.config.base_url.trim_end_matches('/');
+        let mut models = parse_models(&self.get_json(&format!("{base}/models")).await?);
+        // LM Studio's OpenAI-style list has no windows; its own API on the same server has
+        // them. Only asked when the first list said nothing about any model.
+        if !models.is_empty()
+            && models.iter().all(|m| m.limit.is_none())
+            && let Some(root) = base.strip_suffix("/v1")
+        {
+            let limits = match self.get_json(&format!("{root}/api/v1/models")).await {
+                Ok(v) => lmstudio_windows(&v),
+                Err(_) => match self.get_json(&format!("{root}/api/v0/models")).await {
+                    Ok(v) => parse_models(&v),
+                    Err(_) => vec![],
+                },
+            };
+            for m in &mut models {
+                m.limit = limits.iter().find(|l| l.id == m.id).and_then(|l| l.limit);
+            }
+        }
+        Ok(models)
+    }
+
+    async fn get_json(&self, url: &str) -> Result<serde_json::Value> {
         let resp = self
-            .request(reqwest::Method::GET, &url, Auth::Bearer)
+            .request(reqwest::Method::GET, url, Auth::Bearer)
             .send()
             .await?;
         let status = resp.status();
@@ -149,18 +171,7 @@ impl Client {
         if !status.is_success() {
             bail!("GET {url} → {status}: {}", truncate(&text, 500));
         }
-        let v: serde_json::Value = serde_json::from_str(&text).context("invalid /models JSON")?;
-        let mut ids: Vec<ModelInfo> = v["data"]
-            .as_array()
-            .map(|a| {
-                a.iter()
-                    .filter_map(|m| m["id"].as_str())
-                    .map(|id| ModelInfo { id: id.to_owned() })
-                    .collect()
-            })
-            .unwrap_or_default();
-        ids.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(ids)
+        serde_json::from_str(&text).context("invalid /models JSON")
     }
 
     /// Start a streaming completion (one attempt; the caller decides whether to retry, see
@@ -203,6 +214,52 @@ impl Client {
         }
         Ok(decode_stream(resp.bytes_stream(), wire))
     }
+}
+
+/// LM Studio's `/api/v1/models`: the context each loaded model was loaded with (its KV cache
+/// is shared by the parallel slots, so one request can use all of it). Models not loaded have
+/// none yet.
+fn lmstudio_windows(v: &serde_json::Value) -> Vec<ModelInfo> {
+    let mut out = Vec::new();
+    for inst in v["models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|m| m["loaded_instances"].as_array().into_iter().flatten())
+    {
+        let c = &inst["config"];
+        let (Some(id), Some(ctx)) = (inst["id"].as_str(), c["context_length"].as_u64()) else {
+            continue;
+        };
+        out.push(ModelInfo {
+            id: id.to_owned(),
+            limit: Some(ModelLimit {
+                context: ctx,
+                input: None,
+                output: None,
+            }),
+        });
+    }
+    out
+}
+
+/// A `/models` answer (`{"data": [{"id": …}, …]}`) → models sorted by id, with their limits.
+fn parse_models(v: &serde_json::Value) -> Vec<ModelInfo> {
+    let mut ids: Vec<ModelInfo> = v["data"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|m| {
+                    Some(ModelInfo {
+                        id: m["id"].as_str()?.to_owned(),
+                        limit: ModelLimit::from_json(m),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort_by(|a, b| a.id.cmp(&b.id));
+    ids
 }
 
 /// The provider answered with a non-2xx status.
@@ -256,15 +313,42 @@ pub fn retry_after(e: &anyhow::Error) -> Option<Duration> {
 /// The request itself is too big; repeating it gives the same answer.
 fn too_long(body: &str) -> bool {
     let b = body.to_ascii_lowercase();
-    [
-        "context length",
-        "context_length",
-        "too long",
-        "maximum context",
-        "too many tokens",
-    ]
-    .iter()
-    .any(|k| b.contains(k))
+    TOO_LONG.iter().any(|k| b.contains(k))
+}
+
+const TOO_LONG: [&str; 7] = [
+    "context length",
+    "context_length",
+    "context size",
+    "context window",
+    "too long",
+    "maximum context",
+    "too many tokens",
+];
+
+/// The provider refused the request as bigger than the model's context. `Some(Some(n))`
+/// when the message names the window: the number after the phrase that matched (llama.cpp /
+/// LM Studio: "exceeds the available context size (8192 tokens)"; OpenAI: "maximum context
+/// length is 128000 tokens").
+pub fn context_overflow(e: &anyhow::Error) -> Option<Option<u64>> {
+    let msg = match (
+        e.downcast_ref::<HttpError>(),
+        e.downcast_ref::<StreamError>(),
+    ) {
+        (Some(h), _) => h.body.clone(),
+        (_, Some(StreamError(m))) => m.clone(),
+        _ => return None,
+    };
+    let lower = msg.to_ascii_lowercase();
+    let at = TOO_LONG
+        .iter()
+        .find_map(|k| lower.find(k).map(|i| i + k.len()))?;
+    let digits: String = lower[at..]
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(char::is_ascii_digit)
+        .collect();
+    Some(digits.parse().ok().filter(|&n| n >= 512))
 }
 
 fn decode_stream<S>(bytes: S, wire: Wire) -> BoxStream<'static, Result<StreamEvent>>
@@ -354,6 +438,52 @@ fn truncate(s: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lmstudio_window_is_the_loaded_context() {
+        let v = serde_json::json!({"models": [
+            {"key": "a", "loaded_instances": [{"id": "a", "config": {"context_length": 65536, "parallel": 4}}]},
+            {"key": "b", "loaded_instances": []},
+            {"key": "c", "loaded_instances": [{"id": "c", "config": {"context_length": 8192}}]}
+        ]});
+        let w: Vec<_> = lmstudio_windows(&v)
+            .into_iter()
+            .map(|m| (m.id, m.limit.unwrap().context))
+            .collect();
+        // `parallel` does not split it: a 41k conversation runs on 131072 with 4 slots.
+        assert_eq!(w, [("a".to_owned(), 65_536), ("c".to_owned(), 8_192)]);
+    }
+
+    #[test]
+    fn a_context_overflow_is_not_retried_and_names_the_window() {
+        let http = |body: &str| -> anyhow::Error {
+            HttpError {
+                url: "u".into(),
+                status: reqwest::StatusCode::BAD_REQUEST,
+                body: body.into(),
+                retry_after: None,
+                quota: false,
+            }
+            .into()
+        };
+        let lms = http(
+            r#"{"error":{"code":400,"message":"request (11671 tokens) exceeds the available context size (8192 tokens), try increasing it"}}"#,
+        );
+        assert_eq!(context_overflow(&lms), Some(Some(8192)));
+        let oai = http(
+            "This model's maximum context length is 128000 tokens. However, you requested 130000",
+        );
+        assert_eq!(context_overflow(&oai), Some(Some(128_000)));
+        assert_eq!(context_overflow(&http("prompt is too long")), Some(None));
+        assert_eq!(context_overflow(&http("bad key")), None);
+        // LM Studio sends it inside the stream; it used to be retried 10 times.
+        let in_stream: anyhow::Error = StreamError(
+            "provider error: Engine protocol predict request returned 400: request (11671 tokens) exceeds the available context size (8192 tokens)".into(),
+        )
+        .into();
+        assert_eq!(retry_after(&in_stream), None);
+        assert_eq!(context_overflow(&in_stream), Some(Some(8192)));
+    }
 
     #[test]
     fn quota_errors_are_not_retried() {

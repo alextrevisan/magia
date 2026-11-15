@@ -261,7 +261,7 @@ A short one:
   },
   "magia": {                                // settings only magia understands
     "permission_mode": "auto",
-    "compact_at_tokens": 100000,            // 0 = never compact
+    // "compact_at_tokens": 100000,         // default: 95% of the model's context window; 0 = never
     "sandbox": false
   }
 }
@@ -305,7 +305,7 @@ included as project instructions, so picking it as the agent adds nothing twice.
 - **Commands**: add them under `command` in the config, or as `.magia/commands/<name>.md` files
   with `description` and `argument-hint` frontmatter. `$ARGUMENTS` in the template is replaced by
   what you type after the command.
-- **Skills**: `.magia/skills/<name>/SKILL.md` in the project or `~/.config/magia/skills/`. Their
+- **Skills**: OpenCode's folders: `.opencode/skills/`, `.agents/skills/`, `.claude/skills/` in the project and its parents up to the repository root, `~/.config/opencode/skills/`, `~/.agents/skills/`, `~/.claude/skills/`, plus magia's `.magia/skills/` and `~/.config/magia/skills/` (highest priority). A skill is a folder with `SKILL.md` (grouping folders allowed) or a flat `.md`; its id is the folder or file name. Commands: `commands/*.md` in `.magia`, `.opencode` and `.claude`. Their
   names and descriptions are listed for the model, and it loads the full text with the `skill`
   tool when relevant.
 - **Hooks**: `magia.hooks` entries have an `event` (`user_prompt`, `pre_tool`, `post_tool` or
