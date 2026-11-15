@@ -536,11 +536,21 @@ impl Config {
     /// Any other name needs a base URL and is treated as an OpenAI-compatible endpoint.
     /// A role's model: `provider/model` (its own provider) or a bare `model` (the session's
     /// provider), as in `model`. A `#variant` suffix is dropped.
+    /// A built-in provider or one defined under `"provider"`.
+    pub fn is_provider(&self, name: &str) -> bool {
+        preset(name).is_some() || self.providers.contains_key(name)
+    }
+
     pub fn role_model(&self, spec: &str) -> Result<(Option<ProviderConfig>, String)> {
         let spec = spec.split('#').next().unwrap_or(spec).trim();
+        // Only a provider magia knows counts as the prefix: many ids carry a vendor of their
+        // own (`moonshotai/kimi-k2` on OpenRouter), and those are bare ids of the chat's
+        // provider. To route such an id to another provider, name it: `openrouter/moonshotai/…`.
         match spec.split_once('/') {
-            Some((p, m)) => Ok((Some(self.provider_config(p)?), m.to_owned())),
-            None => Ok((None, spec.to_owned())),
+            Some((p, m)) if self.is_provider(p) => {
+                Ok((Some(self.provider_config(p)?), m.to_owned()))
+            }
+            _ => Ok((None, spec.to_owned())),
         }
     }
 
@@ -695,6 +705,17 @@ mod tests {
             ]
         );
         assert!(c.warnings.iter().any(|w| w.contains("`bogus`")));
+        // An id with a vendor of its own is a bare id; naming the provider routes it.
+        assert_eq!(
+            c.role_model("moonshotai/kimi-k2").unwrap().1,
+            "moonshotai/kimi-k2"
+        );
+        assert!(c.role_model("moonshotai/kimi-k2").unwrap().0.is_none());
+        let (p, m) = c.role_model("openrouter/anthropic/claude-x#high").unwrap();
+        assert_eq!(
+            (p.unwrap().name.as_str(), m.as_str()),
+            ("openrouter", "anthropic/claude-x")
+        );
     }
 
     #[test]

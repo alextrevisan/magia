@@ -32,7 +32,12 @@ pub enum AgentEvent {
         output: String,
         is_error: bool,
     },
-    Usage(Usage),
+    /// Tokens of one streamed response, and how fast the provider produced it.
+    Usage {
+        input: u64,
+        output: u64,
+        tokens_per_sec: Option<f64>,
+    },
     /// Informational (e.g. "auto: allowed").
     Notice(String),
     /// The older history was replaced by a summary: `history` is what is left (the summary
@@ -902,6 +907,8 @@ questions across them."),
         let mut text = String::new();
         let mut calls: Vec<ToolCall> = Vec::new();
         let mut emitted = false;
+        // When the first token arrived: the speed leaves out the wait for the prompt.
+        let mut first: Option<std::time::Instant> = None;
         let mut stream = tokio::select! {
             s = self.client.stream(req) => match s {
                 Ok(s) => s,
@@ -924,11 +931,13 @@ questions across them."),
                     };
                 }
                 Some(Ok(StreamEvent::TextDelta(t))) => {
+                    first.get_or_insert_with(std::time::Instant::now);
                     text.push_str(&t);
                     emitted = true;
                     let _ = events.send(AgentEvent::TextDelta(t));
                 }
                 Some(Ok(StreamEvent::ReasoningDelta(t))) => {
+                    first.get_or_insert_with(std::time::Instant::now);
                     emitted = true;
                     let _ = events.send(AgentEvent::ReasoningDelta(t));
                 }
@@ -936,7 +945,17 @@ questions across them."),
                 Some(Ok(StreamEvent::Usage(u))) => {
                     self.usage.add(u);
                     self.last_input_tokens = u.input_tokens;
-                    let _ = events.send(AgentEvent::Usage(u));
+                    // Tokens over the time since the first one. None when too short to
+                    // measure (a response that is only tool calls arrives in one piece).
+                    let rate = first
+                        .map(|f| f.elapsed().as_secs_f64())
+                        .filter(|&secs| secs >= 0.25)
+                        .map(|secs| u.output_tokens as f64 / secs);
+                    let _ = events.send(AgentEvent::Usage {
+                        input: u.input_tokens,
+                        output: u.output_tokens,
+                        tokens_per_sec: rate,
+                    });
                 }
             }
         }

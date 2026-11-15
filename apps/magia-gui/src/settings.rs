@@ -28,7 +28,7 @@ impl Draft {
         let mut roles: [(String, String); 5] = Default::default();
         for (role, spec) in &cfg.role_models {
             if let Some(i) = Role::ALL.iter().position(|r| r == role) {
-                roles[i] = split_spec(spec);
+                roles[i] = split_spec(cfg, spec);
             }
         }
         Self {
@@ -39,18 +39,21 @@ impl Draft {
         }
     }
 
-    /// The roles that name a model, as config specs (`provider/model` or a bare id).
-    pub fn role_models(&self) -> Vec<(Role, String)> {
+    /// The roles that name a model, as config specs (`provider/model` or a bare id). A bare id
+    /// that starts like `provider/` (`anthropic/claude-…` on OpenRouter) would be read as that
+    /// provider, so it is saved with the chat's provider named.
+    pub fn role_models(&self, cfg: &Config) -> Vec<(Role, String)> {
         Role::ALL
             .iter()
             .zip(&self.roles)
             .filter(|(_, (_, m))| !m.trim().is_empty())
             .map(|(r, (p, m))| {
                 let m = m.trim();
-                let spec = if p.is_empty() {
-                    m.to_owned()
-                } else {
-                    format!("{p}/{m}")
+                let misread = m.split_once('/').is_some_and(|(v, _)| cfg.is_provider(v));
+                let spec = match (p.is_empty(), misread) {
+                    (true, false) => m.to_owned(),
+                    (true, true) => format!("{}/{m}", cfg.provider),
+                    (false, _) => format!("{p}/{m}"),
                 };
                 (*r, spec)
             })
@@ -58,11 +61,12 @@ impl Draft {
     }
 }
 
-/// `provider/model` → (provider, model); a bare id → ("", id). Same rule as `model`.
-fn split_spec(spec: &str) -> (String, String) {
+/// `provider/model` → (provider, model); anything else → ("", id). Same rule as
+/// `Config::role_model`.
+fn split_spec(cfg: &Config, spec: &str) -> (String, String) {
     match spec.split_once('/') {
-        Some((p, m)) => (p.to_owned(), m.to_owned()),
-        None => (String::new(), spec.to_owned()),
+        Some((p, m)) if cfg.is_provider(p) => (p.to_owned(), m.to_owned()),
+        _ => (String::new(), spec.to_owned()),
     }
 }
 
@@ -222,7 +226,7 @@ impl Settings {
                         .zip(&draft.roles)
                         .find(|(_, (p, m))| !p.is_empty() && m.trim().is_empty());
                     let bad = draft
-                        .role_models()
+                        .role_models(cfg)
                         .into_iter()
                         .find_map(|(r, s)| cfg.role_model(&s).err().map(|e| (r, e)));
                     if let Some((r, _)) = missing {
@@ -278,18 +282,27 @@ mod tests {
     #[test]
     fn roles_round_trip_through_the_draft() {
         let cfg = Config {
+            provider: "openrouter".into(),
             role_models: vec![
-                (Role::Explore, "go/fast".into()),
+                (Role::Explore, "zen/fast".into()),
                 (Role::Oracle, "big".into()),
+                (Role::Worker, "moonshotai/kimi-k2".into()),
             ],
             ..Default::default()
         };
         let mut d = Draft::of(&cfg);
-        assert_eq!(d.roles[0], ("go".into(), "fast".into()));
+        assert_eq!(d.roles[0], ("zen".into(), "fast".into()));
         assert_eq!(d.roles[2], (String::new(), "big".into()));
+        assert_eq!(d.roles[3], (String::new(), "moonshotai/kimi-k2".into()));
         // A provider without a model is not a role model.
         d.roles[1] = ("zen".into(), String::new());
-        assert_eq!(d.role_models(), cfg.role_models);
+        assert_eq!(d.role_models(&cfg), cfg.role_models);
+        // The chat's model `zen/…` (an OpenRouter id) must not turn into the zen provider.
+        d.roles[4] = (String::new(), "zen/x".into());
+        assert_eq!(
+            d.role_models(&cfg)[3],
+            (Role::Review, "openrouter/zen/x".into())
+        );
     }
 
     #[test]

@@ -19,6 +19,8 @@ pub enum Action {
     NewIn(PathBuf),
     /// Open this session (switching to its folder).
     Open { path: PathBuf },
+    /// Delete a saved conversation (after the user confirms).
+    Delete { path: PathBuf, title: String },
     /// Pick a folder to work in.
     AddProject,
     /// Search every conversation (`/resume` over all folders).
@@ -268,10 +270,16 @@ const INDENT: f32 = 18.0;
 fn session_row(ui: &mut egui::Ui, s: &SessionInfo, current: Option<&Path>) -> Option<Action> {
     let t = *theme::tokens(ui);
     let selected = current == Some(s.path.as_path());
-    let (r, _) = row(ui, title_of(s), INDENT, selected, t.fg, None);
+    let (r, deleted) = row(ui, title_of(s), INDENT, selected, t.fg, Some("×"));
+    if deleted {
+        return Some(Action::Delete {
+            path: s.path.clone(),
+            title: title_of(s).to_owned(),
+        });
+    }
     let clicked = r
         .on_hover_text(format!(
-            "{} · {}",
+            "{} · {}\n× deletes this conversation",
             s.meta.title,
             magia_store::age(s.meta.updated)
         ))

@@ -230,6 +230,20 @@ impl SessionFile {
         self.save_meta()
     }
 
+    /// Delete the session file and its sidecars (metadata and archive).
+    pub fn delete(&self) -> Result<()> {
+        for p in [
+            self.path.clone(),
+            meta_path(&self.path),
+            archive_path(&self.path),
+        ] {
+            if p.exists() {
+                fs::remove_file(p)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Load all messages, skipping unparsable lines (e.g. a torn final write).
     pub fn load(&self) -> Result<Vec<Message>> {
         if !self.path.exists() {
@@ -558,6 +572,33 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, ["one", "two", "three"]);
+    }
+
+    #[test]
+    fn delete_removes_the_session_and_its_sidecars() {
+        let d = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let s = SessionFile::create_for(d.path(), cwd.path()).unwrap();
+        s.append(&Message::user("hi")).unwrap();
+        s.save_meta().unwrap();
+        std::fs::write(archive_path(s.path()), "old\n").unwrap();
+        let other = SessionFile::create_for(d.path(), cwd.path()).unwrap();
+        other.append(&Message::user("keep")).unwrap();
+        other.save_meta().unwrap();
+        assert_eq!(list(d.path(), Scope::All).len(), 2);
+        s.delete().unwrap();
+        for p in [
+            s.path().to_path_buf(),
+            meta_path(s.path()),
+            archive_path(s.path()),
+        ] {
+            assert!(!p.exists(), "{} left behind", p.display());
+        }
+        let left = list(d.path(), Scope::All);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].path, other.path());
+        // Deleting again (already gone) is not an error.
+        s.delete().unwrap();
     }
 
     #[test]

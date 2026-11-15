@@ -328,8 +328,15 @@ async fn real_main() -> Result<()> {
                         "\n[request failed ({error}); trying again in {wait_secs}s ({attempt}/{max})]"
                     );
                 }
-                AgentEvent::Usage(u) => {
-                    eprintln!("\n[tokens in {} / out {}]", u.input_tokens, u.output_tokens)
+                AgentEvent::Usage {
+                    input,
+                    output,
+                    tokens_per_sec,
+                } => {
+                    let rate = tokens_per_sec
+                        .map(|r| format!(" @ {:.0} tok/s", r))
+                        .unwrap_or_default();
+                    eprintln!("\n[tokens in {} / out {}{rate}]", input, output)
                 }
                 AgentEvent::SubTool {
                     parent,

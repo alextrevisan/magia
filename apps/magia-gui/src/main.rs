@@ -215,6 +215,12 @@ struct App {
     activity: activity::Activity,
     status: String,
     tokens: (u64, u64),
+    /// Output speed of the last streamed response.
+    last_rate: Option<f64>,
+    /// Size of the context at the last response (its input + output); 0 = not known yet.
+    context: u64,
+    /// The conversation waiting for "Delete?" to be confirmed: (session file, title).
+    delete_confirm: Option<(PathBuf, String)>,
     /// Cached rendered height per item (0 = not measured yet); drives the virtualized list.
     heights: Vec<f32>,
     last_width: f32,
@@ -384,6 +390,9 @@ impl App {
             activity: Default::default(),
             status,
             tokens: (0, 0),
+            last_rate: None,
+            context: 0,
+            delete_confirm: None,
             heights: vec![],
             last_width: 0.0,
             scroll_to: None,
@@ -533,6 +542,7 @@ impl App {
             sidebar::Action::Open { path } => {
                 self.resume_path(&path, ctx);
             }
+            sidebar::Action::Delete { path, title } => self.delete_confirm = Some((path, title)),
             sidebar::Action::AddProject => self.pick_folder(ctx),
             sidebar::Action::AddReference(project) => {
                 let (tx, ctx, start) = (self.tx.clone(), ctx.clone(), project.clone());
@@ -778,6 +788,7 @@ impl App {
         self.files.clear();
         self.composer = composer::Composer::default(); // the old folder's history goes too
         self.tokens = (0, 0);
+        self.last_rate = None;
         self.reset_items(&[]);
         self.status = if l.status.is_empty() {
             format!("opened {}", self.cwd.display())
@@ -819,14 +830,104 @@ impl App {
         }
     }
 
-    /// Draw the settings window and carry out what it asks.
-    fn settings_window(&mut self, ctx: &egui::Context) {
-        let mut providers: Vec<String> = PROVIDERS.iter().map(|p| p.to_string()).collect();
+    /// The built-in providers plus any defined under `"provider"` in the config JSON.
+    fn provider_list(&self) -> Vec<String> {
+        let mut list: Vec<String> = PROVIDERS.iter().map(|p| p.to_string()).collect();
         for p in self.cfg.providers.keys() {
-            if !providers.contains(p) {
-                providers.push(p.clone());
+            if !list.contains(p) {
+                list.push(p.clone());
             }
         }
+        list
+    }
+
+    /// Open the settings window. A provider whose model list came back empty (offline, bad
+    /// key) is asked again.
+    fn open_settings(&mut self) {
+        self.provider_models.retain(|_, m| !m.is_empty());
+        self.settings.open(&self.cfg);
+    }
+
+    /// "Delete this conversation?"; on yes the files go off the UI thread. The open
+    /// conversation is first replaced by a new one, so nothing writes to the deleted file.
+    fn delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some((path, title)) = &self.delete_confirm else {
+            return;
+        };
+        let mut yes = false;
+        let mut close = false;
+        let modal = egui::Modal::new(egui::Id::new("delete-session")).show(ctx, |ui| {
+            let t = *theme::tokens(ui);
+            ui.set_width(420.0);
+            ui.label(egui::RichText::new("Delete this conversation?").size(theme::HEADING));
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new(title).color(t.fg));
+            ui.label(
+                egui::RichText::new("It cannot be undone.")
+                    .size(theme::SMALL)
+                    .color(t.muted),
+            );
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                yes = theme::secondary(ui, "Delete", Some(t.danger)).clicked();
+                close = theme::secondary(ui, "Cancel", None).clicked();
+            });
+        });
+        if !yes {
+            if close || modal.should_close() {
+                self.delete_confirm = None;
+            }
+            return;
+        }
+        let path = path.clone();
+        if self.running {
+            self.status = "busy — stop or wait for the current request first".into();
+            return;
+        }
+        if self.current_session.as_deref() == Some(path.as_path()) {
+            let Ok(mut a) = self.agent.try_lock() else {
+                self.status = "busy — try again in a moment".into();
+                return;
+            };
+            let started = a.new_session();
+            let history = a.history.clone();
+            self.current_session = a.store.as_ref().map(|s| s.path().to_path_buf());
+            drop(a);
+            if let Err(e) = started {
+                self.status = format!("{e:#}");
+                return;
+            }
+            self.reset_items(&history);
+        }
+        self.delete_confirm = None;
+        let keep = self.cwd.clone();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        self.rt.spawn_blocking(move || {
+            let sf = SessionFile::open(&path);
+            let dir = sf.meta().cwd;
+            let status = match sf.delete() {
+                Ok(()) => {
+                    // A standalone chat's scratch folder goes too, when nothing was left in it.
+                    if let Some(d) = dir.filter(|d| {
+                        d.starts_with(folder::chats_root())
+                            && magia_store::canonical(d) != magia_store::canonical(&keep)
+                    }) {
+                        let _ = std::fs::remove_dir(d); // fails (and stays) when not empty
+                    }
+                    "conversation deleted".to_owned()
+                }
+                Err(e) => format!("could not delete {}: {e:#}", path.display()),
+            };
+            let _ = tx.send(UiMsg::Status(status));
+            let list = magia_store::list(&sessions_dir(), magia_store::Scope::All);
+            let _ = tx.send(UiMsg::SessionList(list));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Draw the settings window and carry out what it asks.
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        let providers = self.provider_list();
         let actions = self
             .settings
             .ui(ctx, &self.cfg, &providers, &self.provider_models);
@@ -837,7 +938,7 @@ impl App {
                     self.cfg.theme = d.theme.clone();
                     self.cfg.magia_mode.max_rounds = d.max_rounds;
                     self.cfg.magia_mode.review = d.review;
-                    self.cfg.role_models = d.role_models();
+                    self.cfg.role_models = d.role_models(&self.cfg);
                     self.cfg.magia_from_state = true;
                     ctx.set_theme(settings::preference(&d.theme));
                     if let Ok(mut a) = self.agent.try_lock() {
@@ -1074,6 +1175,8 @@ impl App {
         // Resume, rewind and /clear all change which session (or how much of it) is open.
         self.activity.clear();
         self.nav_dirty = true;
+        self.context = 0;
+        self.last_rate = None;
         self.session_title = sent_messages(history)
             .first()
             .map(|t| magia_store::title_of(t))
@@ -1100,7 +1203,7 @@ impl App {
                     .collect();
                 self.status = format!("{} — type / to browse", names.join(" "));
             }
-            "settings" => self.settings.open(&self.cfg),
+            "settings" => self.open_settings(),
             "compact" => {
                 let (agent, tx, ctx) = (self.agent.clone(), self.tx.clone(), ctx.clone());
                 self.running = true;
@@ -1486,9 +1589,17 @@ impl App {
                                 }
                             }
                         }
-                        AgentEvent::Usage(u) => {
-                            self.tokens.0 += u.input_tokens;
-                            self.tokens.1 += u.output_tokens;
+                        AgentEvent::Usage {
+                            input,
+                            output,
+                            tokens_per_sec,
+                        } => {
+                            self.tokens.0 += input;
+                            self.tokens.1 += output;
+                            self.context = input + output;
+                            if let Some(r) = tokens_per_sec {
+                                self.last_rate = Some(r);
+                            }
                         }
                         AgentEvent::Notice(n) => self.status = n,
                         AgentEvent::Compacted { before, history } => {
@@ -1497,6 +1608,8 @@ impl App {
                                 format!("context compacted: {before} → {} messages", history.len());
                             self.items = items_from_history(&history, &self.cwd);
                             self.heights.clear();
+                            // The context shrank; the next response reports its new size.
+                            self.context = 0;
                         }
                         AgentEvent::Error(e) => self.items.push(Item::Error(e)),
                         AgentEvent::Magia(_)
@@ -1563,6 +1676,7 @@ impl eframe::App for App {
         // Before the panels: the picker takes ↑↓/Enter/Esc ahead of the composer.
         self.resume_picker(&ctx);
         self.settings_window(&ctx);
+        self.delete_dialog(&ctx);
         self.btw_window(&ctx);
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::B)) {
             self.toggle_nav();
@@ -1618,7 +1732,7 @@ impl App {
                         .on_hover_text("Settings: theme and Magia mode (/settings)")
                         .clicked()
                     {
-                        self.settings.open(&self.cfg);
+                        self.open_settings();
                     }
                     ui.label(
                         egui::RichText::new(APP_NAME)
@@ -1640,18 +1754,22 @@ impl App {
 
                     ui.add_enabled_ui(!self.running, |ui| {
                         let mut changed = false;
+                        let providers = self.provider_list();
                         egui::ComboBox::from_id_salt("provider")
                             .selected_text(self.cfg.provider.clone())
                             .width(110.0)
                             .show_ui(ui, |ui| {
-                                for p in PROVIDERS {
-                                    changed |= ui
-                                        .selectable_value(&mut self.cfg.provider, p.to_owned(), p)
-                                        .changed();
+                                for p in &providers {
+                                    changed |= ui.selectable_value(
+                                        &mut self.cfg.provider,
+                                        p.to_owned(),
+                                        p.as_str(),
+                                    )
+                                    .changed();
                                 }
                             })
                             .response
-                            .on_hover_text("Provider");
+                            .on_hover_text("Provider: the built-ins plus any defined under \"provider\" in the config");
                         if let Some(m) =
                             self.model_picker
                                 .show(ui, &self.cfg.model, &self.models, 230.0)
@@ -1761,16 +1879,18 @@ impl App {
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if self.tokens != (0, 0) {
+                            let rate = self.last_rate.map(|r| format!(" · {:.0} tok/s", r));
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "{} in · {} out",
+                                    "{} in · {} out{}",
                                     theme::count(self.tokens.0),
-                                    theme::count(self.tokens.1)
+                                    theme::count(self.tokens.1),
+                                    rate.unwrap_or_default()
                                 ))
                                 .font(theme::mono(theme::SMALL))
                                 .color(t.muted),
                             )
-                            .on_hover_text("Tokens used in this window");
+                            .on_hover_text("Tokens used in this window · speed of the last response");
                         }
                     });
                 });
@@ -1878,6 +1998,15 @@ impl App {
                             );
                             ui.label(egui::RichText::new(what).size(theme::SMALL).color(t.muted));
                             ui.add_space(6.0);
+                        }
+                        if self.context > 0 {
+                            let ctx = theme::count(self.context);
+                            ui.label(
+                                egui::RichText::new(format!("context {ctx}"))
+                                    .font(theme::mono(theme::SMALL))
+                                    .color(t.muted),
+                            )
+                            .on_hover_text("Tokens in the current context (input + output)");
                         }
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if self.running {
