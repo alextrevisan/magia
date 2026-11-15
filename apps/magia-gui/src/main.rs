@@ -1627,11 +1627,17 @@ impl App {
                         }
                         AgentEvent::Notice(n) => self.status = n,
                         AgentEvent::Compacted { before, history } => {
-                            // Show what the model sees now: the summary, then what was kept.
+                            // Show what the model sees now: what was kept, then the summary.
                             self.status =
                                 format!("context compacted: {before} → {} messages", history.len());
                             self.items = items_from_history(&history, &self.cwd);
                             self.heights.clear();
+                            // The summary goes at the end, where the view is, so it is seen
+                            // without scrolling (a resumed session keeps it first, in order).
+                            if matches!(self.items.first(), Some(Item::Summary(_))) {
+                                let summary = self.items.remove(0);
+                                self.items.push(summary);
+                            }
                             // The context shrank; the next response reports its new size.
                             self.context = 0;
                         }
