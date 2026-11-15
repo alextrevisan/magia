@@ -1,5 +1,5 @@
 //! Just enough Markdown for model replies: fenced code blocks, headings, bullet and numbered
-//! lists, block quotes, and inline `code` / **bold**. Parsed per frame for visible items only
+//! lists, block quotes, tables, and inline `code` / **bold**. Parsed per frame for visible items only
 //! (the transcript is virtualized), so there is no cache and no extra memory.
 
 use crate::theme::{self, BODY, MONO, SMALL};
@@ -13,8 +13,57 @@ pub enum Block<'a> {
     Bullet(&'a str),
     Numbered(&'a str, &'a str),
     Quote(String),
-    Code { lang: &'a str, body: String },
+    Code {
+        lang: &'a str,
+        body: String,
+    },
     Rule,
+    /// Header cells, column alignments, body rows.
+    Table {
+        head: Vec<String>,
+        align: Vec<egui::Align>,
+        rows: Vec<Vec<String>>,
+    },
+}
+
+/// The cells of a `| a | b |` row (outer pipes optional, `\|` is a literal pipe).
+fn cells(line: &str) -> Vec<String> {
+    let l = line.trim();
+    let l = l.strip_prefix('|').unwrap_or(l);
+    let l = l.strip_suffix('|').unwrap_or(l);
+    let mut out = vec![String::new()];
+    let mut chars = l.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'|') => {
+                out.last_mut().unwrap().push('|');
+                chars.next();
+            }
+            '|' => out.push(String::new()),
+            c => out.last_mut().unwrap().push(c),
+        }
+    }
+    out.into_iter().map(|c| c.trim().to_owned()).collect()
+}
+
+/// `|---|:--:|--:|` → the alignment of each column; None when it is not a separator row.
+fn separator(line: &str) -> Option<Vec<egui::Align>> {
+    if !line.contains('-') || !line.trim_start().starts_with(['|', '-', ':']) {
+        return None;
+    }
+    cells(line)
+        .iter()
+        .map(|c| {
+            let dashes = c.trim_matches(':');
+            (!dashes.is_empty() && dashes.bytes().all(|b| b == b'-')).then(|| {
+                match (c.starts_with(':'), c.ends_with(':')) {
+                    (true, true) => egui::Align::Center,
+                    (false, true) => egui::Align::RIGHT,
+                    _ => egui::Align::LEFT,
+                }
+            })
+        })
+        .collect()
 }
 
 /// Split into blocks. An unterminated fence (a reply still streaming) is a code block so far.
@@ -43,6 +92,26 @@ pub fn parse(text: &str) -> Vec<Block<'_>> {
                 lang: lang.trim(),
                 body: body.join("\n"),
             });
+        } else if trimmed.contains('|')
+            && let Some(align) = lines.peek().and_then(|l| separator(l))
+        {
+            // A table: this line is the header, the next the separator, then the rows.
+            flush(&mut para, &mut out);
+            lines.next();
+            let head = cells(trimmed);
+            let mut rows = Vec::new();
+            while let Some(row) = lines
+                .peek()
+                .filter(|l| l.contains('|') && !l.trim().is_empty())
+            {
+                let mut r = cells(row);
+                r.resize(head.len(), String::new());
+                rows.push(r);
+                lines.next();
+            }
+            let mut align = align;
+            align.resize(head.len(), egui::Align::LEFT);
+            out.push(Block::Table { head, align, rows });
         } else if trimmed.is_empty() {
             flush(&mut para, &mut out);
         } else if let Some((level, rest)) = heading(trimmed) {
@@ -199,6 +268,7 @@ pub fn show(ui: &mut egui::Ui, text: &str, salt: usize) {
                 ui.separator();
             }
             Block::Code { lang, body } => code_block(ui, lang, &body, (salt, i)),
+            Block::Table { head, align, rows } => table(ui, &head, &align, &rows, (salt, i)),
         }
     }
 }
@@ -212,6 +282,127 @@ fn list_item(ui: &mut egui::Ui, marker: &str, text: &str) {
         );
         ui.add(egui::Label::new(text_job(ui, text, FontId::proportional(BODY), t.fg)).wrap());
     });
+}
+
+/// A table in a light frame: a bold header row, a line under it, striped body rows. Each
+/// column gets its natural width when the table fits; otherwise narrow columns keep theirs and
+/// the rest share what is left, wrapping. Every row is as tall as its tallest cell.
+fn table(
+    ui: &mut egui::Ui,
+    head: &[String],
+    align: &[egui::Align],
+    rows: &[Vec<String>],
+    salt: impl std::hash::Hash + std::fmt::Debug,
+) {
+    let t = theme::tokens(ui);
+    let n = head.len().max(1);
+    let gap = 16.0;
+    let pad = 10.0;
+    let head_font = theme::semibold(BODY);
+    let body_font = FontId::proportional(BODY);
+    // Natural (one-line) width of each column.
+    let natural = |text: &str, font: &FontId| -> f32 {
+        let job = text_job(ui, text, font.clone(), t.fg);
+        ui.fonts_mut(|f| f.layout_job(job)).size().x
+    };
+    let mut want = vec![0.0f32; n];
+    for (c, h) in head.iter().enumerate() {
+        want[c] = want[c].max(natural(h, &head_font));
+    }
+    for r in rows {
+        for (c, v) in r.iter().enumerate().take(n) {
+            want[c] = want[c].max(natural(v, &body_font));
+        }
+    }
+    let room = (ui.available_width() - 2.0 * pad - gap * (n as f32 - 1.0)).max(60.0 * n as f32);
+    let widths = fit_columns(&want, room, 60.0);
+    egui::Frame::new()
+        .stroke(Stroke::new(1.0, t.line))
+        .corner_radius(CornerRadius::same(6))
+        .inner_margin(Margin::symmetric(pad as i8, 6))
+        .show(ui, |ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt(("table", &salt))
+                .auto_shrink([true, true])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(gap, 0.0);
+                    let row = |ui: &mut egui::Ui, cells: &[String], font: &FontId, stripe: bool| {
+                        let bg = ui.painter().add(egui::Shape::Noop);
+                        let r = ui.horizontal_top(|ui| {
+                            for (c, w) in widths.iter().enumerate() {
+                                let text = cells.get(c).map(String::as_str).unwrap_or("");
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(*w, 0.0),
+                                    egui::Layout::top_down(align[c]),
+                                    |ui| {
+                                        ui.set_width(*w);
+                                        ui.add_space(5.0);
+                                        ui.add(
+                                            egui::Label::new(text_job(
+                                                ui,
+                                                text,
+                                                font.clone(),
+                                                t.fg,
+                                            ))
+                                            .wrap(),
+                                        );
+                                        ui.add_space(5.0);
+                                    },
+                                );
+                            }
+                        });
+                        if stripe {
+                            let rect = r.response.rect.expand2(egui::vec2(pad, 0.0));
+                            ui.painter()
+                                .set(bg, egui::Shape::rect_filled(rect, 0.0, t.raised));
+                        }
+                        r.response.rect
+                    };
+                    let h = row(ui, head, &head_font, false);
+                    ui.painter().hline(
+                        (h.left() - pad)..=(h.right() + pad),
+                        h.bottom(),
+                        Stroke::new(1.0, t.line),
+                    );
+                    for (i, r) in rows.iter().enumerate() {
+                        row(ui, r, &body_font, i % 2 == 1);
+                    }
+                });
+        });
+}
+
+/// Column widths for `room`: all natural widths when they fit; otherwise columns narrower than
+/// an even share keep theirs and the others split the rest evenly (never below `min`).
+fn fit_columns(want: &[f32], room: f32, min: f32) -> Vec<f32> {
+    if want.iter().sum::<f32>() <= room {
+        return want.to_vec();
+    }
+    let mut fixed = vec![false; want.len()];
+    loop {
+        let open = fixed.iter().filter(|f| !**f).count().max(1) as f32;
+        let left = room
+            - want
+                .iter()
+                .zip(&fixed)
+                .filter(|(_, f)| **f)
+                .map(|(w, _)| w)
+                .sum::<f32>();
+        let share = (left / open).max(min);
+        let mut changed = false;
+        for (c, w) in want.iter().enumerate() {
+            if !fixed[c] && *w <= share {
+                fixed[c] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            return want
+                .iter()
+                .zip(&fixed)
+                .map(|(w, f)| if *f { *w } else { share })
+                .collect();
+        }
+    }
 }
 
 /// Monospace block on the code ground; long lines scroll sideways instead of wrapping.
@@ -279,6 +470,33 @@ mod tests {
     }
 
     #[test]
+    fn tables() {
+        let md = "Structure:\n| Section | Status | Key \\| Content |\n|:--|:-:|--:|\n| Summary | ✓ | `ref` |\n| Overview | ✓ |\n\nafter\n| not | a table |";
+        let mut blocks = parse(md).into_iter();
+        assert_eq!(blocks.next(), Some(Block::Para("Structure:".into())));
+        let Some(Block::Table { head, align, rows }) = blocks.next() else {
+            panic!("no table");
+        };
+        assert_eq!(head, ["Section", "Status", "Key | Content"]);
+        assert_eq!(
+            align,
+            [egui::Align::LEFT, egui::Align::Center, egui::Align::RIGHT]
+        );
+        assert_eq!(
+            rows,
+            [
+                vec!["Summary".to_owned(), "✓".into(), "`ref`".into()],
+                vec!["Overview".to_owned(), "✓".into(), String::new()],
+            ]
+        );
+        // Pipes without a separator row under them stay text.
+        assert_eq!(
+            blocks.collect::<Vec<_>>(),
+            [Block::Para("after | not | a table |".into())]
+        );
+    }
+
+    #[test]
     fn streaming_fence_is_code_so_far() {
         assert_eq!(
             parse("see:\n```\nlet x = 1;"),
@@ -316,5 +534,45 @@ mod tests {
         h.run();
         drop(h);
         assert_eq!(parts, ["run ", "cargo test", " ", "now", " or `never"]);
+    }
+}
+
+#[cfg(test)]
+mod table_layout {
+    use egui_kittest::kittest::Queryable;
+
+    #[test]
+    fn rows_are_as_tall_as_their_wrapped_cells() {
+        let md = "| A | B |\n|--|--|\n| x | one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen |\n| y | short |";
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(420.0, 600.0))
+            .build_ui_state(
+                |ui, fonts: &mut bool| {
+                    if !*fonts {
+                        ui.ctx()
+                            .set_fonts(fastframe_fonts::FontSetup::default().definitions());
+                        *fonts = true;
+                        return;
+                    }
+                    super::show(ui, md, 1);
+                },
+                false,
+            );
+        h.run();
+        let long = h.get_by_label_contains("sixteen").rect();
+        let next = h.get_by_label("y").rect();
+        assert!(long.height() > 40.0, "it wraps: {long:?}");
+        assert!(
+            next.top() >= long.bottom(),
+            "the next row starts below it: {long:?} {next:?}"
+        );
+        assert!(long.right() <= 420.0, "fits the width: {long:?}");
+    }
+
+    #[test]
+    fn narrow_columns_keep_their_width() {
+        let w = super::fit_columns(&[80.0, 30.0, 900.0], 400.0, 60.0);
+        assert_eq!(w, [80.0, 30.0, 290.0]);
+        assert_eq!(super::fit_columns(&[50.0, 60.0], 400.0, 60.0), [50.0, 60.0]);
     }
 }
