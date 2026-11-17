@@ -821,7 +821,12 @@ mod tests {
             "---\ndescription: e\n---\n!`bash \"${CLAUDE_SKILL_DIR}/../../hooks/y.sh\" --keys a`\nLayer: $ARGUMENTS",
         );
         let out = expand_command(&sub, "/epics feature", &empty).unwrap();
-        let dir = root.join(".claude/skills/epics").display().to_string();
+        let dir = root
+            .join(".claude")
+            .join("skills")
+            .join("epics")
+            .display()
+            .to_string();
         assert!(
             out.contains(&format!("[Run first with bash and use its output here: `bash \"{dir}/../../hooks/y.sh\" --keys a`]")),
             "{out}"

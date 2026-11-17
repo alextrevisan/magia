@@ -4,7 +4,7 @@
 //! already in the tree via arboard), which covers XWayland programs such as Godot. Registered by the GUI
 //! only, so the CLI stays without zbus; there `bash` can save a picture and `read` shows it.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use magia_tools::{Tool, ToolCx, ToolOutput};
 use serde_json::{Value, json};
@@ -99,6 +99,7 @@ pub fn available() -> bool {
 mod imp {
     use super::*;
     use crate::portal;
+    use anyhow::Context;
     use zbus::zvariant::Value;
 
     /// The whole screen, through the portal (Wayland and X11; no dialog on GNOME/KDE).
