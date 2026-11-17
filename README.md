@@ -63,7 +63,13 @@ your system. Every CI run also uploads them as three artifacts (`magia-deb-amd64
 | Windows | `magia-<version>-windows-x86_64-setup.exe` | run it (no admin rights needed) |
 
 The Linux packages install `magia` and `magia-gui` in `/usr/bin`, plus a menu entry and an
-icon. The Windows installer adds Magia to the Start menu, can put the `magia` command on your
+icon. The `.rpm` is signed; import the signing key once so `dnf` accepts it:
+
+```bash
+sudo rpm --import https://raw.githubusercontent.com/alextrevisan/magia/master/packaging/RPM-GPG-KEY-magia
+```
+
+The Windows installer adds Magia to the Start menu, can put the `magia` command on your
 `PATH`, and comes with an uninstaller.
 
 **From source** you need **Rust 1.98 or newer** (`rustup` installs it in `~/.cargo/bin`):
@@ -356,7 +362,8 @@ cargo fmt --all
 
 CI (`.github/workflows/ci.yml`) runs all of the above on Linux, runs the tests on Windows too,
 and builds the packages: `packaging/linux-packages.sh` makes the `.deb` and `.rpm` (with
-`dpkg-deb` and `rpmbuild`), and `packaging/magia.iss` is the Inno Setup script for the Windows
+`dpkg-deb` and `rpmbuild`), `packaging/sign-rpm.sh` signs the `.rpm` with the
+`RPM_SIGNING_KEY` repository secret, and `packaging/magia.iss` is the Inno Setup script for the Windows
 installer. Pushing a `v*` tag publishes them as a GitHub
 release.
 

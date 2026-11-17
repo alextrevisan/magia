@@ -96,6 +96,18 @@ jobs:
         run: |
           sudo apt-get install -y rpm
           packaging/linux-packages.sh bin dist
+      # dnf refuses unsigned local packages when pkg_gpgcheck is on, so release RPMs must be signed.
+      # Branch and PR builds without the secret stay unsigned; a tag without it fails.
+      - name: Sign the .rpm
+        if: runner.os == 'Linux'
+        env:
+          RPM_SIGNING_KEY: ${{ secrets.RPM_SIGNING_KEY }}
+        run: |
+          if [ -z "$RPM_SIGNING_KEY" ]; then
+            case "$GITHUB_REF" in refs/tags/v*) echo "RPM_SIGNING_KEY secret is missing"; exit 1;; esac
+            echo "warning: RPM_SIGNING_KEY not set, the .rpm stays unsigned"; exit 0
+          fi
+          packaging/sign-rpm.sh dist/magia-*.rpm
       - name: Windows installer (Inno Setup)
         if: runner.os == 'Windows'
         shell: bash
