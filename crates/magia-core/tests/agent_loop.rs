@@ -1870,7 +1870,7 @@ async fn reaching_outside_the_project_asks_and_always_is_kept_with_the_session()
     use magia_core::FolderAnswer;
     let project = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
-    let ext = std::fs::canonicalize(other.path()).unwrap();
+    let ext = magia_store::canonical(other.path());
     std::fs::write(ext.join("a.txt"), "outside-a").unwrap();
     std::fs::write(ext.join("b.txt"), "outside-b").unwrap();
     let read = |f: &str| serde_json::json!({"file_path": ext.join(f)}).to_string();
@@ -1943,7 +1943,7 @@ async fn reaching_outside_the_project_asks_and_always_is_kept_with_the_session()
 async fn yolo_and_rules_skip_the_folder_question_and_subagents_cannot_ask() {
     let project = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
-    let ext = std::fs::canonicalize(other.path()).unwrap();
+    let ext = magia_store::canonical(other.path());
     std::fs::write(ext.join("a.txt"), "outside-a").unwrap();
     let read = serde_json::json!({"file_path": ext.join("a.txt")}).to_string();
     let nobody = || FolderApprover {
@@ -2004,7 +2004,7 @@ async fn always_deny_refuses_the_folder_for_the_session_without_asking_again() {
     use magia_core::FolderAnswer;
     let project = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
-    let ext = std::fs::canonicalize(other.path()).unwrap();
+    let ext = magia_store::canonical(other.path());
     std::fs::create_dir(ext.join("sub")).unwrap();
     std::fs::write(ext.join("sub/b.txt"), "b").unwrap();
     std::fs::write(ext.join("a.txt"), "a").unwrap();
@@ -2052,7 +2052,7 @@ async fn a_deny_is_for_one_call_and_reset_forgets_always_answers() {
     use magia_core::FolderAnswer;
     let project = tempfile::tempdir().unwrap();
     let other = tempfile::tempdir().unwrap();
-    let ext = std::fs::canonicalize(other.path()).unwrap();
+    let ext = magia_store::canonical(other.path());
     std::fs::write(ext.join("a.txt"), "outside-a").unwrap();
     let read = serde_json::json!({"file_path": ext.join("a.txt")}).to_string();
     let (url, server) = serve(vec![
@@ -2111,7 +2111,7 @@ async fn reference_folders_are_read_freely_but_writing_there_asks() {
     use magia_core::FolderAnswer;
     let project = tempfile::tempdir().unwrap();
     let refs = tempfile::tempdir().unwrap();
-    let r = std::fs::canonicalize(refs.path()).unwrap();
+    let r = magia_store::canonical(refs.path());
     std::fs::write(r.join("spec.md"), "the spec").unwrap();
     let (url, server) = serve(vec![
         tool_reply(&[

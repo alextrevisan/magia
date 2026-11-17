@@ -64,7 +64,7 @@ pub fn resolve(typed: &str, cwd: &Path) -> anyhow::Result<PathBuf> {
         _ => cwd.join(typed),
     };
     match std::fs::canonicalize(&path) {
-        Ok(p) if p.is_dir() => Ok(p),
+        Ok(p) if p.is_dir() => Ok(magia_types::plain_path(p)),
         Ok(_) => anyhow::bail!("not a folder: {}", path.display()),
         Err(e) => anyhow::bail!("{}: {e}", path.display()),
     }
@@ -169,7 +169,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("f.txt"), "").unwrap();
-        let base = std::fs::canonicalize(dir.path()).unwrap();
+        let base = magia_store::canonical(dir.path());
         assert_eq!(resolve("sub", &base).unwrap(), base.join("sub"));
         assert_eq!(resolve(" sub/.. ", &base).unwrap(), base);
         assert!(resolve("f.txt", &base).is_err());

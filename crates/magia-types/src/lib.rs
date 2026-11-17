@@ -2,6 +2,25 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
+
+/// Windows' canonicalize returns `\\?\C:\x` (and `\\?\UNC\host\share`); keep the plain form
+/// people know (`C:\x`, `\\host\share`), the one the current directory and rules use too.
+/// Elsewhere the path is returned unchanged.
+pub fn plain_path(p: PathBuf) -> PathBuf {
+    if cfg!(windows) { strip_verbatim(p) } else { p }
+}
+
+fn strip_verbatim(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy().into_owned();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => p,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -193,6 +212,16 @@ pub fn parse_arguments(raw: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn windows_verbatim_paths_become_plain() {
+        use std::path::PathBuf;
+        let s = |p: &str| super::strip_verbatim(PathBuf::from(p));
+        assert_eq!(s(r"\\?\C:\Users\a"), PathBuf::from(r"C:\Users\a"));
+        assert_eq!(s(r"\\?\UNC\host\share"), PathBuf::from(r"\\host\share"));
+        assert_eq!(s(r"\\?\Volume{x}\a"), PathBuf::from(r"\\?\Volume{x}\a"));
+        assert_eq!(s("/home/u"), PathBuf::from("/home/u"));
+    }
+
     use super::*;
     use serde_json::json;
 

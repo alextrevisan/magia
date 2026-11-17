@@ -63,11 +63,11 @@ pub fn folders(tool: &str, args: &Value, cwd: &Path, granted: &[PathBuf]) -> Vec
 /// The real location of `p` (symlinks followed). A path that does not exist yet is its
 /// folder's real location plus the name.
 fn real(p: &Path) -> PathBuf {
-    if let Ok(r) = std::fs::canonicalize(p) {
+    if let Ok(r) = canonical(p) {
         return r;
     }
     match (p.parent(), p.file_name()) {
-        (Some(dir), Some(name)) => std::fs::canonicalize(dir)
+        (Some(dir), Some(name)) => canonical(dir)
             .map(|d| d.join(name))
             .unwrap_or_else(|_| p.to_path_buf()),
         _ => p.to_path_buf(),
@@ -76,7 +76,13 @@ fn real(p: &Path) -> PathBuf {
 
 /// `cwd` itself may be a symlink or relative; compare the same way paths are resolved.
 fn normal(cwd: &Path) -> PathBuf {
-    std::fs::canonicalize(cwd).unwrap_or_else(|_| resolve(".", cwd))
+    canonical(cwd).unwrap_or_else(|_| resolve(".", cwd))
+}
+
+/// Symlinks resolved, in the plain form (`C:\x`, not `\\?\C:\x`) that the project folder,
+/// reference folders and the user's `external_directory` rules are written in.
+fn canonical(p: &Path) -> std::io::Result<PathBuf> {
+    std::fs::canonicalize(p).map(magia_types::plain_path)
 }
 
 fn shell_paths(cmd: &str, cwd: &Path) -> Vec<PathBuf> {
@@ -121,8 +127,8 @@ mod tests {
     fn file_tools_outside_the_project_name_their_folder() {
         let project = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
-        let cwd = std::fs::canonicalize(project.path()).unwrap();
-        let ext = std::fs::canonicalize(other.path()).unwrap();
+        let cwd = canonical(project.path()).unwrap();
+        let ext = canonical(other.path()).unwrap();
         std::fs::write(ext.join("notes.txt"), "x").unwrap();
         let read = |p: &Path| json!({"file_path": p.to_str().unwrap()});
         assert!(folders("read", &read(&cwd.join("src/a.rs")), &cwd, &[]).is_empty());
@@ -152,24 +158,17 @@ mod tests {
     fn shell_arguments_count_only_when_they_are_real_paths() {
         let project = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
-        let cwd = std::fs::canonicalize(project.path()).unwrap();
-        let ext = std::fs::canonicalize(other.path()).unwrap();
+        let cwd = canonical(project.path()).unwrap();
+        let ext = canonical(other.path()).unwrap();
         let bash = |c: String| folders("bash", &json!({ "command": c }), &cwd, &[]);
         assert!(bash("cargo test 2>/dev/null".into()).is_empty());
         assert!(bash("grep -r \"/api/v1/\" src".into()).is_empty());
         assert!(bash("/usr/bin/env ls".into()).is_empty());
-        assert_eq!(
-            bash(format!("cat {}/x.txt", ext.display())),
-            vec![ext.clone()]
-        );
-        assert_eq!(
-            bash(format!("cp a --target={}", ext.display())),
-            vec![ext.clone()]
-        );
-        assert_eq!(
-            bash(format!("echo hi > {}/out.log", ext.display())),
-            vec![ext.clone()]
-        );
+        // As written in a shell: forward slashes (Git Bash takes `C:/x` too, not `C:\x`).
+        let e = shell_path(&ext);
+        assert_eq!(bash(format!("cat {e}/x.txt")), vec![ext.clone()]);
+        assert_eq!(bash(format!("cp a --target={e}")), vec![ext.clone()]);
+        assert_eq!(bash(format!("echo hi > {e}/out.log")), vec![ext.clone()]);
         // Climbing out from inside a project folder counts too.
         std::fs::create_dir(cwd.join("src")).unwrap();
         std::fs::write(ext.join("secret"), "x").unwrap();
@@ -177,14 +176,22 @@ mod tests {
         assert_eq!(bash(format!("cat src/{rel}")), vec![ext.clone()]);
     }
 
-    /// `to` relative to `from`, through `..` (both absolute).
+    fn shell_path(p: &Path) -> String {
+        p.display().to_string().replace('\\', "/")
+    }
+
+    /// `to` relative to `from`, through `..` up to the root (both absolute, same drive).
     fn pathdiff(to: &Path, from: &Path) -> String {
-        let ups = from.components().count() - 1;
-        format!(
-            "{}{}",
-            "../".repeat(ups),
-            to.strip_prefix("/").unwrap().display()
-        )
+        use std::path::Component::Normal;
+        let names = |p: &Path| {
+            p.components()
+                .filter_map(|c| match c {
+                    Normal(n) => Some(n.to_string_lossy().into_owned()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        format!("{}{}", "../".repeat(names(from).len()), names(to).join("/"))
     }
 
     #[cfg(unix)]
@@ -192,8 +199,8 @@ mod tests {
     fn a_symlink_in_the_project_counts_where_it_points() {
         let project = tempfile::tempdir().unwrap();
         let other = tempfile::tempdir().unwrap();
-        let cwd = std::fs::canonicalize(project.path()).unwrap();
-        let ext = std::fs::canonicalize(other.path()).unwrap();
+        let cwd = canonical(project.path()).unwrap();
+        let ext = canonical(other.path()).unwrap();
         std::fs::write(ext.join("id_key"), "x").unwrap();
         std::os::unix::fs::symlink(&ext, cwd.join("docs")).unwrap();
         let read = json!({"file_path": cwd.join("docs/id_key").to_str().unwrap()});
