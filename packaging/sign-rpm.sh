@@ -13,6 +13,11 @@ export GNUPGHOME="$work/gnupg"
 mkdir -m 700 "$GNUPGHOME"
 printf '%s\n' "$RPM_SIGNING_KEY" | gpg --batch --quiet --import
 fpr="$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr/ {print $10; exit}')"
+if [ -z "$fpr" ]; then
+  echo "RPM_SIGNING_KEY holds no private key: it must be the whole" >&2
+  echo "-----BEGIN PGP PRIVATE KEY BLOCK----- ... -----END PGP PRIVATE KEY BLOCK----- text" >&2
+  exit 1
+fi
 
 # Ubuntu's rpm macros call /usr/bin/gpg2, which is not installed there.
 rpmsign --define "_gpg_name $fpr" --define "__gpg $(command -v gpg)" --addsign "$@"
