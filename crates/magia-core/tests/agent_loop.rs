@@ -1873,7 +1873,7 @@ async fn reaching_outside_the_project_asks_and_always_is_kept_with_the_session()
     let ext = std::fs::canonicalize(other.path()).unwrap();
     std::fs::write(ext.join("a.txt"), "outside-a").unwrap();
     std::fs::write(ext.join("b.txt"), "outside-b").unwrap();
-    let read = |f: &str| format!(r#"{{"file_path":"{}"}}"#, ext.join(f).display());
+    let read = |f: &str| serde_json::json!({"file_path": ext.join(f)}).to_string();
     let (url, _s) = serve(vec![
         tool_reply(&[("r1", "read", &read("a.txt"))]), // denied
         text_reply("ok"),
@@ -1945,7 +1945,7 @@ async fn yolo_and_rules_skip_the_folder_question_and_subagents_cannot_ask() {
     let other = tempfile::tempdir().unwrap();
     let ext = std::fs::canonicalize(other.path()).unwrap();
     std::fs::write(ext.join("a.txt"), "outside-a").unwrap();
-    let read = format!(r#"{{"file_path":"{}"}}"#, ext.join("a.txt").display());
+    let read = serde_json::json!({"file_path": ext.join("a.txt")}).to_string();
     let nobody = || FolderApprover {
         answers: Default::default(), // any question would panic
         asked: Default::default(),
@@ -2008,7 +2008,7 @@ async fn always_deny_refuses_the_folder_for_the_session_without_asking_again() {
     std::fs::create_dir(ext.join("sub")).unwrap();
     std::fs::write(ext.join("sub/b.txt"), "b").unwrap();
     std::fs::write(ext.join("a.txt"), "a").unwrap();
-    let read = |f: &str| format!(r#"{{"file_path":"{}"}}"#, ext.join(f).display());
+    let read = |f: &str| serde_json::json!({"file_path": ext.join(f)}).to_string();
     let (url, _s) = serve(vec![
         tool_reply(&[("r1", "read", &read("a.txt"))]), // always deny
         tool_reply(&[("r2", "read", &read("sub/b.txt"))]), // inside it: refused, no question
@@ -2054,7 +2054,7 @@ async fn a_deny_is_for_one_call_and_reset_forgets_always_answers() {
     let other = tempfile::tempdir().unwrap();
     let ext = std::fs::canonicalize(other.path()).unwrap();
     std::fs::write(ext.join("a.txt"), "outside-a").unwrap();
-    let read = format!(r#"{{"file_path":"{}"}}"#, ext.join("a.txt").display());
+    let read = serde_json::json!({"file_path": ext.join("a.txt")}).to_string();
     let (url, server) = serve(vec![
         tool_reply(&[("r1", "read", &read)]), // deny once
         text_reply("you denied it"),
@@ -2118,21 +2118,18 @@ async fn reference_folders_are_read_freely_but_writing_there_asks() {
             (
                 "r1",
                 "read",
-                &format!(r#"{{"file_path":"{}"}}"#, r.join("spec.md").display()),
+                &serde_json::json!({"file_path": r.join("spec.md")}).to_string(),
             ),
             (
                 "g1",
                 "grep",
-                &format!(r#"{{"pattern":"spec","path":"{}"}}"#, r.display()),
+                &serde_json::json!({"pattern": "spec", "path": r}).to_string(),
             ),
         ]),
         tool_reply(&[(
             "w1",
             "write",
-            &format!(
-                r#"{{"file_path":"{}","content":"x"}}"#,
-                r.join("new.md").display()
-            ),
+            &serde_json::json!({"file_path": r.join("new.md"), "content": "x"}).to_string(),
         )]),
         text_reply("done"),
     ])
@@ -2163,7 +2160,8 @@ async fn reference_folders_are_read_freely_but_writing_there_asks() {
     assert!(!r.join("new.md").exists());
     let bodies = server.await.unwrap();
     assert!(
-        bodies[0].contains("Reference folders") && bodies[0].contains(&r.display().to_string())
+        bodies[0].contains("Reference folders")
+            && bodies[0].contains(serde_json::to_string(&r).unwrap().trim_matches('"'))
     );
 }
 
